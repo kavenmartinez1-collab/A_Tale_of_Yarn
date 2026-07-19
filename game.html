@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ArtifexWebGame</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0a0e14;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+    }
+    #game-canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      outline: none;
+    }
+    #hud {
+      position: fixed;
+      top: 138px; /* clears the vitals HUD cluster (hearts/thirst/temp/stamina) */
+      left: 8px;
+      color: #cdd6e4;
+      font-size: 12px;
+      line-height: 1.5;
+      background: rgba(10, 14, 20, 0.6);
+      padding: 6px 10px;
+      border-radius: 6px;
+      pointer-events: none;
+      white-space: pre;
+    }
+    #overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #cdd6e4;
+      font-size: 18px;
+      background: rgba(10, 14, 20, 0.4);
+      cursor: pointer;
+      user-select: none;
+    }
+    #overlay.hidden { display: none; }
+  </style>
+</head>
+<body>
+  <canvas id="game-canvas"></canvas>
+  <div id="hud">initializing…</div>
+  <div id="overlay">Click to play</div>
+  <script type="module" src="/src/game/main.ts"></script>
+</body>
+</html>

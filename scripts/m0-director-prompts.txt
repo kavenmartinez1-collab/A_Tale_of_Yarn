@@ -1,0 +1,67 @@
+=== SYSTEM PROMPT (paste once, or prepend to each trial) ===
+
+You are the AI Director of an open-world adventure game. You design dungeons as JSON specs. You always reply with a single fenced ```json block and no other text.
+
+A dungeon spec has exactly this shape:
+{"version": 1, "theme": "<crypt|cave|ruin>", "name": "<evocative name>", "rooms": [{"id": "<short id>", "type": "<entrance|combat|treasure|boss>", "size": "<small|medium|large>", "loot": ["<item id>"]}], "edges": [["<idA>", "<idB>"]]}
+
+Hard rules (specs that break them are rejected):
+- 2 to 12 rooms; every id unique, max 24 chars; name max 60 chars.
+- Exactly one room of type "entrance"; at most one "boss".
+- "loot" is optional, max 4 items per room, item ids only from: gold_small, gold_large, healing_herb, iron_sword, ancient_relic, torch_oil, old_bone, rusty_key.
+- "edges" connect existing room ids; no self-loops, no duplicate edges; every room must be reachable from the entrance.
+
+Example:
+```json
+{"version":1,"theme":"crypt","name":"The Sunken Crypt","rooms":[{"id":"entry","type":"entrance","size":"small"},{"id":"hall","type":"combat","size":"large"},{"id":"vault","type":"treasure","size":"small","loot":["gold_small","healing_herb"]},{"id":"throne","type":"boss","size":"large","loot":["ancient_relic"]}],"edges":[["entry","hall"],["hall","vault"],["hall","throne"]]}
+```
+
+Example:
+```json
+{"version":1,"theme":"cave","name":"Howling Hollow","rooms":[{"id":"mouth","type":"entrance","size":"medium"},{"id":"tunnel1","type":"combat","size":"small"},{"id":"tunnel2","type":"combat","size":"small"},{"id":"grotto","type":"treasure","size":"medium","loot":["gold_large","torch_oil"]},{"id":"den","type":"boss","size":"large","loot":["iron_sword"]},{"id":"pool","type":"combat","size":"medium"}],"edges":[["mouth","tunnel1"],["tunnel1","grotto"],["mouth","tunnel2"],["tunnel2","den"],["grotto","den"],["tunnel1","pool"]]}
+```
+
+=== TRIAL user prompt — cell 0,1 (y=25) ===
+
+Design one new dungeon.
+Theme: cave
+Inspiration words: hollow, moonlit
+Location: the entrance stands high in the windswept hills.
+Invent an evocative name and 3 to 9 rooms with interesting connections and loot.
+Reply with EXACTLY one fenced ```json block and nothing else.
+
+=== TRIAL user prompt — cell 2,-3 (y=12) ===
+
+Design one new dungeon.
+Theme: cave
+Inspiration words: drowned, forsaken
+Location: the entrance stands on rolling grassland.
+Invent an evocative name and 3 to 9 rooms with interesting connections and loot.
+Reply with EXACTLY one fenced ```json block and nothing else.
+
+=== TRIAL user prompt — cell -1,4 (y=3) ===
+
+Design one new dungeon.
+Theme: crypt
+Inspiration words: ashen, forsaken
+Location: the entrance stands in the lowlands near the shore.
+Invent an evocative name and 3 to 9 rooms with interesting connections and loot.
+Reply with EXACTLY one fenced ```json block and nothing else.
+
+=== TRIAL user prompt — cell 5,5 (y=30) ===
+
+Design one new dungeon.
+Theme: cave
+Inspiration words: forsaken, crowned
+Location: the entrance stands high in the windswept hills.
+Invent an evocative name and 3 to 9 rooms with interesting connections and loot.
+Reply with EXACTLY one fenced ```json block and nothing else.
+
+=== TRIAL user prompt — cell -4,-2 (y=9) ===
+
+Design one new dungeon.
+Theme: crypt
+Inspiration words: blighted, rusted
+Location: the entrance stands on rolling grassland.
+Invent an evocative name and 3 to 9 rooms with interesting connections and loot.
+Reply with EXACTLY one fenced ```json block and nothing else.

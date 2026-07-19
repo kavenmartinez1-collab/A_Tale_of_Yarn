@@ -1,0 +1,32 @@
+{
+  "name": "artifex-webgpu",
+  "version": "0.1.0",
+  "description": "Artifex WebGPU Inference Engine — browser-based LLM inference for any GPU",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"vite\" \"tsx server/dev-server.ts\"",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "server": "tsx server/dev-server.ts",
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.8.1",
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/ws": "^8.18.1",
+    "@webgpu/types": "^0.1.52",
+    "concurrently": "^9.1.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  }
+}

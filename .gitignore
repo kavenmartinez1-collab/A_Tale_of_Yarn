@@ -1,0 +1,70 @@
+.tmp-cjs/
+# local debug artifacts (parity captures, eval-callback dumps, ground-truth notes)
+.parity-*.json
+.eval-callback-*.log
+.greedy35b.json
+.l0-reference.md
+
+# machine-local model directory config (absolute paths — never commit)
+model-dirs.local.json
+
+# vision parity golden (16MB, regenerate via scripts/gen_vision_fixture.py)
+test-fixtures/vision-qwen3vl-golden.json
+test-fixtures/vision-gemma4-golden.json
+
+# repo-local model drop dir — keep the README, ignore the weights
+models/*
+!models/README.md
+
+# build + runtime artifacts (standalone repo)
+dist/
+metrics.jsonl
+node_modules/
+
+# playwright headed/e2e run artifacts (traces, screenshots, error-context)
+test-results/
+playwright-report/
+
+# successor-legible engineering log (local only for now)
+docs/ENGINEERING_LOG.md
+
+# FLUX.2 parity fixture dumps (hundreds of MB, regenerate via scripts/gen_flux2_fixture.py)
+scripts/flux2_fixture/
+
+# Piper VITS parity fixture dumps (regenerate via scripts/gen_piper_fixture.py)
+scripts/piper_fixture/
+
+# Whisper STT parity fixture dumps (regenerate via scripts/gen_whisper_fixture.py)
+scripts/whisper_fixture/
+
+# espeak-ng WASM build: keep the recipe (build.sh, espeak_bridge.c), ignore the
+# heavy toolchain/source/build trees. Built artifacts in src/audio/espeak/ are
+# committed, so a fresh checkout does not need to rebuild.
+scripts/espeak-build/emsdk/
+scripts/espeak-build/espeak-ng/
+scripts/espeak-build/build-espeak/
+scripts/espeak-build/espeak-ng-data/
+
+# bench evidence dumps (A/B toggles, smoke/greedy responses, page logs) — local only
+scripts/ab_*.txt
+scripts/c4_*.txt
+scripts/c5_*.txt
+scripts/mtp_*.txt
+scripts/q2ks_*.txt
+scripts/qwen36_*.txt
+scripts/smoke_*.txt
+scripts/*_log.txt
+scripts/iq2xxs_llamacpp_parity.txt
+
+# game visual-QA screenshots + live gameplay captures (shoot-game.mts, F8/F9)
+scripts/shots/
+
+# FLUX.2 debug evidence dumps (generated images, TE embedding dumps) — local only
+scripts/out-*.png
+scripts/*_embeds_webgpu.bin
+scripts/*_ids_webgpu.json
+
+# local run logs, python bytecode, debug dumps — never commit
+scripts/*.log
+__pycache__/
+debug-output.json

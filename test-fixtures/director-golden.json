@@ -1,0 +1,46 @@
+{
+  "comment": "Golden inputs for scripts/test-director.mts. <SPEC> in transcript text is replaced with JSON.stringify(validSpec) by the test harness.",
+  "goldenPromptBrief": { "seed": 305419896, "dcx": 3, "dcz": -5, "entranceY": 12 },
+  "validSpec": {
+    "version": 1,
+    "theme": "cave",
+    "name": "Test Hollow",
+    "rooms": [
+      { "id": "in", "type": "entrance", "size": "small" },
+      { "id": "deep", "type": "treasure", "size": "medium", "loot": ["gold_small"] }
+    ],
+    "edges": [["in", "deep"]]
+  },
+  "noEntranceSpec": {
+    "version": 1,
+    "theme": "cave",
+    "name": "Broken Hollow",
+    "rooms": [
+      { "id": "a", "type": "combat", "size": "small" },
+      { "id": "b", "type": "combat", "size": "small" }
+    ],
+    "edges": [["a", "b"]]
+  },
+  "transcripts": {
+    "validFirst": [
+      { "text": "```json\n<SPEC>\n```", "stopReason": "eos" }
+    ],
+    "badJsonThenFixed": [
+      { "text": "```json\n{\"version\": 1, \"theme\": \"cave\",\n```", "stopReason": "eos" },
+      { "text": "Apologies.\n```json\n<SPEC>\n```", "stopReason": "eos" }
+    ],
+    "schemaErrorsThenFixed": [
+      { "text": "```json\n<NO_ENTRANCE_SPEC>\n```", "stopReason": "eos" },
+      { "text": "```json\n<SPEC>\n```", "stopReason": "eos" }
+    ],
+    "tripleFail": [
+      { "text": "I cannot design dungeons.", "stopReason": "eos" },
+      { "text": "Still no.", "stopReason": "eos" },
+      { "text": "Nope.", "stopReason": "eos" }
+    ],
+    "maxLengthThenFixed": [
+      { "text": "```json\n<SPEC>\n```", "stopReason": "max_length" },
+      { "text": "```json\n<SPEC>\n```", "stopReason": "eos" }
+    ]
+  }
+}

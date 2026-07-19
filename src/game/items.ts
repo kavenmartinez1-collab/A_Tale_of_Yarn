@@ -1,0 +1,185 @@
+/**
+ * Item definitions — the single registry for everything that can sit in an
+ * inventory slot. Superset of the Director's KNOWN_ITEMS (dungeon loot) plus
+ * game-only items: spawn-kit tools, gathered materials, food, armor, and crafted gear.
+ *
+ * `held` names the mesh archetype drawn in the character's right hand when
+ * equipped (D-M3). `tool` marks what resource nodes the item can harvest
+ * (E-M2). `stack` is the max per slot (1 = unstackable).
+ *
+ * Phase-E additions:
+ * `edible`      — hearts*2 healed on eat (instant, BOTW-style).
+ * `drinkable`   — thirst points restored on drink/fill.
+ * `warmth`      — temperature contribution (BOTW max-not-sum) when worn/held.
+ * `armor`       — equip slot + defense rating (handled by inventory armor slots).
+ * `fuel`        — seconds of campfire burn when used as fuel.
+ * `throwable`   — can be thrown as a simple arc projectile.
+ * `effectClass` — timed effect applied on consumption (potions / dishes).
+ */
+
+export type ItemKind = 'weapon' | 'tool' | 'material' | 'consumable' | 'loot' | 'armor' | 'container';
+export type HeldKind = 'sword' | 'axe' | 'pickaxe' | 'bow' | 'staff';
+export type ToolKind = 'axe' | 'pickaxe';
+export type ArmorSlot = 'head' | 'body' | 'legs';
+export type EffectClass = 'heal' | 'warm' | 'cool' | 'stamina';
+
+export interface ItemDef {
+  name: string;
+  kind: ItemKind;
+  /** Icon / held-mesh tint, linear RGB. */
+  color: [number, number, number];
+  /** Max per slot. */
+  stack: number;
+  /** What this item can harvest (E-M2 gathering). */
+  tool?: ToolKind;
+  /** Right-hand mesh archetype when equipped (D-M3). */
+  held?: HeldKind;
+  /** Hearts*2 healed on eat (instant, BOTW-style). */
+  edible?: { heal: number };
+  /** Thirst points restored on drink/use. Empty/full state tracked in Phase H. */
+  drinkable?: { quench: number };
+  /** Temperature contribution (BOTW max-not-sum) when worn/held. */
+  warmth?: number;
+  /** Equip slot and defense rating (used by inventory armor system). */
+  armor?: { slot: ArmorSlot; defense: number };
+  /** Seconds of campfire burn when used as fuel (Phase H). */
+  fuel?: number;
+  /** Can be thrown as a simple arc projectile (Phase H). */
+  throwable?: boolean;
+  /** Timed effect applied on consumption — potions and dishes. */
+  effectClass?: EffectClass;
+}
+
+export const ITEM_DEFS = {
+  // --- Director loot (KNOWN_ITEMS in dungeon-spec.ts) ----------------------
+  gold_small:    { name: 'Gold Coins',    kind: 'loot',      color: [0.85, 0.68, 0.21], stack: 99 },
+  gold_large:    { name: 'Gold Pile',     kind: 'loot',      color: [0.92, 0.75, 0.25], stack: 99 },
+  healing_herb:  { name: 'Healing Herb',  kind: 'consumable', color: [0.35, 0.65, 0.30], stack: 20, edible: { heal: 2 } },
+  iron_sword:    { name: 'Iron Sword',    kind: 'weapon',    color: [0.70, 0.72, 0.76], stack: 1,  held: 'sword' },
+  ancient_relic: { name: 'Ancient Relic', kind: 'loot',      color: [0.55, 0.45, 0.75], stack: 1  },
+  torch_oil:     { name: 'Torch Oil',     kind: 'loot',      color: [0.60, 0.50, 0.25], stack: 20 },
+  old_bone:      { name: 'Old Bone',      kind: 'loot',      color: [0.85, 0.82, 0.72], stack: 20 },
+  rusty_key:     { name: 'Rusty Key',     kind: 'loot',      color: [0.55, 0.38, 0.25], stack: 1  },
+  iron_axe:      { name: 'Iron Axe',      kind: 'tool',      color: [0.66, 0.68, 0.72], stack: 1,  tool: 'axe',      held: 'axe'     },
+  hunter_bow:    { name: 'Hunter Bow',    kind: 'weapon',    color: [0.48, 0.34, 0.20], stack: 1,  held: 'bow'     },
+  oak_staff:     { name: 'Oak Staff',     kind: 'weapon',    color: [0.52, 0.38, 0.22], stack: 1,  held: 'staff'   },
+
+  // --- Spawn-kit tools (game-only, not Director loot) ----------------------
+  bronze_axe:      { name: 'Bronze Axe',      kind: 'tool',  color: [0.72, 0.50, 0.30], stack: 1, tool: 'axe',      held: 'axe'     },
+  bronze_pickaxe:  { name: 'Bronze Pickaxe',   kind: 'tool',  color: [0.70, 0.48, 0.28], stack: 1, tool: 'pickaxe',  held: 'pickaxe' },
+  iron_pickaxe:    { name: 'Iron Pickaxe',     kind: 'tool',  color: [0.66, 0.68, 0.72], stack: 1, tool: 'pickaxe',  held: 'pickaxe' },
+
+  // --- Gathered materials (E-M1/2) -----------------------------------------
+  logs:    { name: 'Logs',      kind: 'material',   color: [0.45, 0.31, 0.18], stack: 99, fuel: 120 },
+  stone:   { name: 'Stone',     kind: 'material',   color: [0.55, 0.54, 0.56], stack: 99, throwable: true },
+  ore:     { name: 'Iron Ore',  kind: 'material',   color: [0.45, 0.35, 0.30], stack: 99 },
+  berries: { name: 'Berries',   kind: 'consumable', color: [0.60, 0.15, 0.25], stack: 99, edible: { heal: 1 } },
+
+  // --- Crafted (E-M3) -------------------------------------------------------
+  meal: { name: 'Berry Meal', kind: 'consumable', color: [0.70, 0.30, 0.35], stack: 20, edible: { heal: 4 } },
+
+  // --- Plants / gathered (Phase E) -----------------------------------------
+  plant_fiber:  { name: 'Plant Fiber',  kind: 'material',   color: [0.45, 0.60, 0.25], stack: 99 },
+  flax:         { name: 'Flax',         kind: 'material',   color: [0.55, 0.70, 0.40], stack: 99 },
+  reeds:        { name: 'Reeds',        kind: 'material',   color: [0.50, 0.55, 0.25], stack: 99 },
+  gourd:        { name: 'Gourd',        kind: 'material',   color: [0.55, 0.65, 0.20], stack: 99 },
+  cactus_flesh: { name: 'Cactus Flesh', kind: 'consumable', color: [0.35, 0.68, 0.35], stack: 20, edible: { heal: 1 }, drinkable: { quench: 15 } },
+  warming_herb: { name: 'Warming Herb', kind: 'material',   color: [0.80, 0.50, 0.15], stack: 99 },
+  cooling_herb: { name: 'Cooling Herb', kind: 'material',   color: [0.30, 0.70, 0.75], stack: 99 },
+  mushroom:     { name: 'Mushroom',     kind: 'consumable', color: [0.72, 0.52, 0.35], stack: 20, edible: { heal: 1 } },
+
+  // --- Ores / minerals (Phase E) -------------------------------------------
+  coal:       { name: 'Coal',       kind: 'material', color: [0.20, 0.20, 0.22], stack: 99, fuel: 240 },
+  copper_ore: { name: 'Copper Ore', kind: 'material', color: [0.72, 0.40, 0.25], stack: 99 },
+  tin_ore:    { name: 'Tin Ore',    kind: 'material', color: [0.65, 0.65, 0.60], stack: 99 },
+
+  // --- Animal drops (Phase E) -----------------------------------------------
+  hide:           { name: 'Hide',           kind: 'material', color: [0.58, 0.42, 0.28], stack: 99 },
+  wool:           { name: 'Wool',           kind: 'material', color: [0.90, 0.88, 0.85], stack: 99 },
+  feather:        { name: 'Feather',        kind: 'material', color: [0.92, 0.90, 0.88], stack: 99 },
+  bone:           { name: 'Bone',           kind: 'material', color: [0.88, 0.85, 0.75], stack: 99 },
+  meat_raw:       { name: 'Raw Meat',       kind: 'material', color: [0.78, 0.30, 0.28], stack: 20 },
+  egg_bird:       { name: 'Bird Egg',       kind: 'material', color: [0.92, 0.88, 0.78], stack: 1  },
+  egg_dragon:     { name: 'Dragon Egg',     kind: 'material', color: [0.65, 0.20, 0.20], stack: 1  },
+  egg_griffin:    { name: 'Griffin Egg',    kind: 'material', color: [0.80, 0.72, 0.35], stack: 1  },
+  dragon_scale:   { name: 'Dragon Scale',   kind: 'loot',     color: [0.20, 0.55, 0.30], stack: 20 },
+  griffin_feather:{ name: 'Griffin Feather',kind: 'material', color: [0.88, 0.80, 0.45], stack: 20 },
+
+  // --- Processed materials (Phase E) ----------------------------------------
+  sticks:       { name: 'Sticks',        kind: 'material', color: [0.48, 0.34, 0.20], stack: 99, fuel: 30 },
+  planks:       { name: 'Planks',        kind: 'material', color: [0.62, 0.46, 0.28], stack: 99, fuel: 90 },
+  thread:       { name: 'Thread',        kind: 'material', color: [0.85, 0.82, 0.78], stack: 99 },
+  bow_string:   { name: 'Bow String',    kind: 'material', color: [0.88, 0.85, 0.80], stack: 99 },
+  rope:         { name: 'Rope',          kind: 'material', color: [0.62, 0.52, 0.35], stack: 99 },
+  arrow_shaft:  { name: 'Arrow Shaft',   kind: 'material', color: [0.52, 0.38, 0.22], stack: 99 },
+  copper_ingot: { name: 'Copper Ingot',  kind: 'material', color: [0.75, 0.42, 0.22], stack: 99 },
+  tin_ingot:    { name: 'Tin Ingot',     kind: 'material', color: [0.68, 0.68, 0.62], stack: 99 },
+  bronze_ingot: { name: 'Bronze Ingot',  kind: 'material', color: [0.72, 0.50, 0.28], stack: 99 },
+  iron_ingot:   { name: 'Iron Ingot',    kind: 'material', color: [0.68, 0.70, 0.74], stack: 99 },
+  leather:      { name: 'Leather',       kind: 'material', color: [0.55, 0.38, 0.22], stack: 99 },
+  wool_yarn:    { name: 'Wool Yarn',     kind: 'material', color: [0.88, 0.85, 0.82], stack: 99 },
+  bone_needle:  { name: 'Bone Needle',   kind: 'material', color: [0.90, 0.88, 0.78], stack: 99 },
+  meat_cooked:  { name: 'Cooked Meat',   kind: 'consumable', color: [0.65, 0.35, 0.18], stack: 20, edible: { heal: 4 } },
+
+  // --- Containers (Phase E) -------------------------------------------------
+  /** quench value reflects full state; empty/full tracking arrives Phase H. */
+  gourd_bottle: { name: 'Gourd Bottle',  kind: 'container', color: [0.55, 0.65, 0.20], stack: 1, drinkable: { quench: 30 } },
+  gourd_bowl:   { name: 'Gourd Bowl',    kind: 'container', color: [0.52, 0.62, 0.18], stack: 1 },
+  waterskin:    { name: 'Waterskin',     kind: 'container', color: [0.52, 0.36, 0.20], stack: 1, drinkable: { quench: 50 } },
+  iron_flask:   { name: 'Iron Flask',    kind: 'container', color: [0.66, 0.68, 0.72], stack: 1, drinkable: { quench: 80 } },
+  cooking_pot:  { name: 'Cooking Pot',   kind: 'container', color: [0.30, 0.30, 0.32], stack: 1 },
+
+  // --- Full containers (Phase H) — swapped in/out at fresh water -----------
+  /** Filled gourd bottle: quench 35, reverts to gourd_bottle on drink. */
+  gourd_bottle_full: { name: 'Gourd Bottle (Full)', kind: 'container', color: [0.35, 0.55, 0.72], stack: 1, drinkable: { quench: 35 } },
+  /** Filled waterskin: quench 55, reverts to waterskin on drink. */
+  waterskin_full:    { name: 'Waterskin (Full)',    kind: 'container', color: [0.32, 0.50, 0.68], stack: 1, drinkable: { quench: 55 } },
+  /** Filled iron flask: quench 80, reverts to iron_flask on drink. */
+  iron_flask_full:   { name: 'Iron Flask (Full)',   kind: 'container', color: [0.40, 0.55, 0.78], stack: 1, drinkable: { quench: 80 } },
+
+  // --- Fire / shelter (Phase E) ---------------------------------------------
+  fire_starter: { name: 'Fire Starter',  kind: 'tool',      color: [0.55, 0.38, 0.22], stack: 20 },
+  torch:        { name: 'Torch',         kind: 'tool',      color: [0.75, 0.55, 0.20], stack: 20, warmth: 0.3, fuel: 60 },
+  campfire_kit: { name: 'Campfire Kit',  kind: 'material',  color: [0.45, 0.31, 0.18], stack: 5  },
+  fiber_tent:   { name: 'Fiber Tent',    kind: 'material',  color: [0.55, 0.60, 0.40], stack: 1,  warmth: 0.5 },
+  wool_tent:    { name: 'Wool Tent',     kind: 'material',  color: [0.75, 0.72, 0.65], stack: 1,  warmth: 0.8 },
+  hide_tent:    { name: 'Hide Tent',     kind: 'material',  color: [0.58, 0.42, 0.28], stack: 1,  warmth: 1.1 },
+
+  // --- Weapons (Phase E) ----------------------------------------------------
+  arrow:        { name: 'Arrow',         kind: 'weapon',  color: [0.52, 0.38, 0.22], stack: 99 },
+  bronze_sword: { name: 'Bronze Sword',  kind: 'weapon',  color: [0.72, 0.50, 0.28], stack: 1,  held: 'sword' },
+  spear:        { name: 'Spear',         kind: 'weapon',  color: [0.60, 0.45, 0.25], stack: 1,  held: 'staff' },
+  composite_bow:{ name: 'Composite Bow', kind: 'weapon',  color: [0.42, 0.30, 0.18], stack: 1,  held: 'bow'  },
+
+  // --- Armor: fiber tier (defense 1/1/1, warmth 0.1) -----------------------
+  fiber_hood:     { name: 'Fiber Hood',     kind: 'armor', color: [0.55, 0.60, 0.40], stack: 1, warmth: 0.1, armor: { slot: 'head', defense: 1 } },
+  fiber_tunic:    { name: 'Fiber Tunic',    kind: 'armor', color: [0.52, 0.58, 0.38], stack: 1, warmth: 0.1, armor: { slot: 'body', defense: 1 } },
+  fiber_leggings: { name: 'Fiber Leggings', kind: 'armor', color: [0.50, 0.56, 0.36], stack: 1, warmth: 0.1, armor: { slot: 'legs', defense: 1 } },
+
+  // --- Armor: leather tier (defense 2/3/2, warmth 0.2) ---------------------
+  leather_cap:     { name: 'Leather Cap',     kind: 'armor', color: [0.55, 0.38, 0.22], stack: 1, warmth: 0.2, armor: { slot: 'head', defense: 2 } },
+  leather_tunic:   { name: 'Leather Tunic',   kind: 'armor', color: [0.52, 0.36, 0.20], stack: 1, warmth: 0.2, armor: { slot: 'body', defense: 3 } },
+  leather_leggings:{ name: 'Leather Leggings',kind: 'armor', color: [0.50, 0.34, 0.18], stack: 1, warmth: 0.2, armor: { slot: 'legs', defense: 2 } },
+
+  // --- Armor: iron tier (defense 4/6/4, warmth 0) --------------------------
+  iron_helm:  { name: 'Iron Helm',  kind: 'armor', color: [0.68, 0.70, 0.74], stack: 1, warmth: 0, armor: { slot: 'head', defense: 4 } },
+  iron_chest: { name: 'Iron Chest', kind: 'armor', color: [0.66, 0.68, 0.72], stack: 1, warmth: 0, armor: { slot: 'body', defense: 6 } },
+  iron_legs:  { name: 'Iron Legs',  kind: 'armor', color: [0.65, 0.67, 0.71], stack: 1, warmth: 0, armor: { slot: 'legs', defense: 4 } },
+
+  // --- Consumables with effectClass (Phase E) -------------------------------
+  healing_potion: { name: 'Healing Potion', kind: 'consumable', color: [0.75, 0.20, 0.25], stack: 20, edible: { heal: 8 }, effectClass: 'heal' },
+  warming_potion: { name: 'Warming Potion', kind: 'consumable', color: [0.85, 0.45, 0.15], stack: 20, effectClass: 'warm' },
+  cooling_potion: { name: 'Cooling Potion', kind: 'consumable', color: [0.25, 0.60, 0.85], stack: 20, effectClass: 'cool' },
+  stamina_potion: { name: 'Stamina Potion', kind: 'consumable', color: [0.30, 0.75, 0.40], stack: 20, effectClass: 'stamina' },
+  hearty_stew:    { name: 'Hearty Stew',    kind: 'consumable', color: [0.65, 0.35, 0.18], stack: 20, edible: { heal: 10 }, effectClass: 'heal' },
+} as const satisfies Record<string, ItemDef>;
+
+export type GameItemId = keyof typeof ITEM_DEFS;
+
+export function isGameItemId(x: string): x is GameItemId {
+  return Object.prototype.hasOwnProperty.call(ITEM_DEFS, x);
+}
+
+export function itemDef(id: GameItemId): ItemDef {
+  return ITEM_DEFS[id];
+}

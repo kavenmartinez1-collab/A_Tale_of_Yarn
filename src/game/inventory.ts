@@ -1,0 +1,304 @@
+/**
+ * Inventory model — pure, UI-free. 28 pack slots + 5 hotbar slots (keys 1–5)
+ * + 3 armor slots (head/body/legs), RuneScape-style. Stack-first add, slot
+ * moves (click-to-swap), equip = the selected hotbar slot. Persisted to
+ * localStorage under a versioned key; deserialize validates every field so
+ * corrupt saves fall back to a fresh spawn-kit inventory (bronze axe + pickaxe).
+ *
+ * v2 changes (Phase E):
+ * - Adds `armor: { head, body, legs }` equip slots.
+ * - `equipArmor` / `unequipArmor` move pieces between pack/hotbar and slots.
+ * - `totalDefense` / `totalWarmth` aggregate equipped armor stats.
+ * - v1→v2 migration: reads old key, injects empty armor object.
+ */
+
+import { ITEM_DEFS, isGameItemId, itemDef, type GameItemId } from './items';
+
+export const PACK_SIZE   = 28;
+export const HOTBAR_SIZE = 5;
+
+/** Current persistence key. */
+export const INVENTORY_KEY = 'artifex-inventory:v2';
+/** Legacy key used before Phase E — read for migration. */
+export const LEGACY_INVENTORY_KEY = 'artifex-inventory:v1';
+
+export type Slot = { id: GameItemId; count: number } | null;
+export type SlotArea = 'pack' | 'hotbar';
+export interface SlotRef {
+  area: SlotArea;
+  index: number;
+}
+
+export interface ArmorSlots {
+  head: Slot;
+  body: Slot;
+  legs: Slot;
+}
+
+export interface Inventory {
+  pack: Slot[];
+  hotbar: Slot[];
+  /** Selected hotbar index 0..4. */
+  selected: number;
+  /** Equipped armor pieces (count is always 1 when occupied). */
+  armor: ArmorSlots;
+}
+
+/** Fresh inventory with the spawn kit in hotbar slots 1–3. */
+export function createInventory(): Inventory {
+  const pack: Slot[] = new Array(PACK_SIZE).fill(null);
+  const hotbar: Slot[] = new Array(HOTBAR_SIZE).fill(null);
+  hotbar[0] = { id: 'bronze_axe', count: 1 };
+  hotbar[1] = { id: 'bronze_pickaxe', count: 1 };
+  hotbar[2] = { id: 'fire_starter', count: 1 };
+  return { pack, hotbar, selected: 0, armor: { head: null, body: null, legs: null } };
+}
+
+function slots(inv: Inventory, area: SlotArea): Slot[] {
+  return area === 'pack' ? inv.pack : inv.hotbar;
+}
+
+/**
+ * Add `count` of an item: tops up existing stacks first (pack then hotbar),
+ * then fills empty pack slots. Returns the leftover that did not fit.
+ */
+export function addItem(inv: Inventory, id: GameItemId, count = 1): number {
+  const max = itemDef(id).stack;
+  let left = count;
+  for (const area of ['pack', 'hotbar'] as const) {
+    const arr = slots(inv, area);
+    for (let i = 0; i < arr.length && left > 0; i++) {
+      const s = arr[i];
+      if (s !== null && s.id === id && s.count < max) {
+        const take = Math.min(max - s.count, left);
+        s.count += take;
+        left -= take;
+      }
+    }
+  }
+  for (let i = 0; i < inv.pack.length && left > 0; i++) {
+    if (inv.pack[i] === null) {
+      const take = Math.min(max, left);
+      inv.pack[i] = { id, count: take };
+      left -= take;
+    }
+  }
+  return left;
+}
+
+/** Remove up to `count` of an item (hotbar last). Returns how many were removed. */
+export function removeItem(inv: Inventory, id: GameItemId, count = 1): number {
+  let need = count;
+  for (const area of ['pack', 'hotbar'] as const) {
+    const arr = slots(inv, area);
+    for (let i = 0; i < arr.length && need > 0; i++) {
+      const s = arr[i];
+      if (s !== null && s.id === id) {
+        const take = Math.min(s.count, need);
+        s.count -= take;
+        need -= take;
+        if (s.count === 0) arr[i] = null;
+      }
+    }
+  }
+  return count - need;
+}
+
+/** Total count of an item across pack + hotbar. */
+export function countItem(inv: Inventory, id: GameItemId): number {
+  let n = 0;
+  for (const s of inv.pack)   if (s !== null && s.id === id) n += s.count;
+  for (const s of inv.hotbar) if (s !== null && s.id === id) n += s.count;
+  return n;
+}
+
+/** Swap (or merge same-item stacks) between two slots. */
+export function moveSlot(inv: Inventory, from: SlotRef, to: SlotRef): void {
+  const fa = slots(inv, from.area);
+  const ta = slots(inv, to.area);
+  const a = fa[from.index];
+  const b = ta[to.index];
+  if (from.area === to.area && from.index === to.index) return;
+  if (a !== null && b !== null && a.id === b.id) {
+    const max = itemDef(a.id).stack;
+    const take = Math.min(max - b.count, a.count);
+    b.count += take;
+    a.count -= take;
+    if (a.count === 0) fa[from.index] = null;
+    return;
+  }
+  fa[from.index] = b;
+  ta[to.index] = a;
+}
+
+/** The item in the selected hotbar slot, or null. */
+export function equipped(inv: Inventory): GameItemId | null {
+  return inv.hotbar[inv.selected]?.id ?? null;
+}
+
+// --- armor equip / unequip --------------------------------------------------
+
+/**
+ * Move an armor-kind item from pack/hotbar into its slot. If a piece is
+ * already in that slot, it is swapped back into the source slot. Returns
+ * false if the source ref is empty, the item is not armor-kind, or the swap
+ * target slot is occupied and there is nowhere to put the displaced piece.
+ */
+export function equipArmor(inv: Inventory, ref: SlotRef): boolean {
+  const arr = slots(inv, ref.area);
+  const src = arr[ref.index];
+  if (src === null) return false;
+  const def = itemDef(src.id);
+  if (!def.armor) return false;
+
+  const slotKey = def.armor.slot as 'head' | 'body' | 'legs';
+  const current = inv.armor[slotKey];
+
+  // Put the current piece back into the source slot.
+  arr[ref.index] = current; // may be null
+  inv.armor[slotKey] = { id: src.id, count: 1 };
+  return true;
+}
+
+/**
+ * Move the piece in the given armor slot back into the pack (first empty slot).
+ * Returns false when the slot is already empty or there is no room in the pack.
+ */
+export function unequipArmor(inv: Inventory, slotKey: 'head' | 'body' | 'legs'): boolean {
+  const piece = inv.armor[slotKey];
+  if (piece === null) return false;
+  const leftover = addItem(inv, piece.id, 1);
+  if (leftover > 0) return false; // no room
+  inv.armor[slotKey] = null;
+  return true;
+}
+
+/** Sum of defense values of all equipped armor pieces. */
+export function totalDefense(inv: Inventory): number {
+  let d = 0;
+  for (const key of ['head', 'body', 'legs'] as const) {
+    const s = inv.armor[key];
+    if (s !== null) d += itemDef(s.id).armor?.defense ?? 0;
+  }
+  return d;
+}
+
+/**
+ * Sum of warmth values of all equipped armor pieces.
+ * (Held-torch warmth and biome/fire contributions are handled separately
+ * in Phase G vitals — this covers armor-slot warmth only.)
+ */
+export function totalWarmth(inv: Inventory): number {
+  let w = 0;
+  for (const key of ['head', 'body', 'legs'] as const) {
+    const s = inv.armor[key];
+    if (s !== null) w += itemDef(s.id).warmth ?? 0;
+  }
+  return w;
+}
+
+// --- persistence ------------------------------------------------------------
+
+function validSlot(x: unknown): Slot | undefined {
+  if (x === null) return null;
+  if (typeof x !== 'object') return undefined;
+  const s = x as { id?: unknown; count?: unknown };
+  if (typeof s.id !== 'string' || !isGameItemId(s.id)) return undefined;
+  if (typeof s.count !== 'number' || !Number.isInteger(s.count)
+      || s.count < 1 || s.count > itemDef(s.id).stack) return undefined;
+  return { id: s.id, count: s.count };
+}
+
+function validArmorSlot(x: unknown): Slot | undefined {
+  if (x === null) return null;
+  if (typeof x !== 'object') return undefined;
+  const s = x as { id?: unknown; count?: unknown };
+  if (typeof s.id !== 'string' || !isGameItemId(s.id)) return undefined;
+  if (!itemDef(s.id).armor) return undefined; // must be armor kind
+  if (typeof s.count !== 'number' || s.count !== 1) return undefined;
+  return { id: s.id, count: 1 };
+}
+
+export function deserializeInventory(json: string): Inventory | null {
+  let x: unknown;
+  try {
+    x = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (typeof x !== 'object' || x === null) return null;
+  const o = x as { pack?: unknown; hotbar?: unknown; selected?: unknown; armor?: unknown };
+  if (!Array.isArray(o.pack)   || o.pack.length !== PACK_SIZE)   return null;
+  if (!Array.isArray(o.hotbar) || o.hotbar.length !== HOTBAR_SIZE) return null;
+  const pack: Slot[] = [];
+  for (const s of o.pack) {
+    const v = validSlot(s);
+    if (v === undefined) return null;
+    pack.push(v);
+  }
+  const hotbar: Slot[] = [];
+  for (const s of o.hotbar) {
+    const v = validSlot(s);
+    if (v === undefined) return null;
+    hotbar.push(v);
+  }
+  const selected = typeof o.selected === 'number'
+    && Number.isInteger(o.selected)
+    && o.selected >= 0 && o.selected < HOTBAR_SIZE ? o.selected : 0;
+
+  // Armor — present in v2, missing in migrated-v1 (handled by migrateV1).
+  let armor: ArmorSlots = { head: null, body: null, legs: null };
+  if (o.armor !== null && typeof o.armor === 'object') {
+    const a = o.armor as { head?: unknown; body?: unknown; legs?: unknown };
+    const head = validArmorSlot(a.head ?? null);
+    const body = validArmorSlot(a.body ?? null);
+    const legs = validArmorSlot(a.legs ?? null);
+    if (head === undefined || body === undefined || legs === undefined) return null;
+    armor = { head, body, legs };
+  }
+  return { pack, hotbar, selected, armor };
+}
+
+/**
+ * Migrate a v1 JSON string to a v2 Inventory (injects empty armor slots).
+ * Returns null on any parse/validation failure.
+ *
+ * Exported so node tests can exercise migration without touching localStorage.
+ */
+export function migrateV1(v1Json: string): Inventory | null {
+  let x: unknown;
+  try {
+    x = JSON.parse(v1Json);
+  } catch {
+    return null;
+  }
+  if (typeof x !== 'object' || x === null) return null;
+  // Inject empty armor and re-parse through full validation.
+  const patched = { ...(x as object), armor: { head: null, body: null, legs: null } };
+  return deserializeInventory(JSON.stringify(patched));
+}
+
+export function loadInventory(): Inventory {
+  try {
+    // 1. Try v2 key.
+    const raw = localStorage.getItem(INVENTORY_KEY);
+    if (raw !== null) {
+      const inv = deserializeInventory(raw);
+      if (inv !== null) return inv;
+    }
+    // 2. Try v1 key and migrate.
+    const v1Raw = localStorage.getItem(LEGACY_INVENTORY_KEY);
+    if (v1Raw !== null) {
+      const inv = migrateV1(v1Raw);
+      if (inv !== null) return inv;
+    }
+  } catch { /* storage unavailable */ }
+  // 3. Fresh spawn kit.
+  return createInventory();
+}
+
+export function saveInventory(inv: Inventory): void {
+  try {
+    localStorage.setItem(INVENTORY_KEY, JSON.stringify(inv));
+  } catch { /* storage unavailable */ }
+}
