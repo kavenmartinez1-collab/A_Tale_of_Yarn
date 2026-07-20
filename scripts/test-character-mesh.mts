@@ -219,7 +219,26 @@ check('golden female-full-iron hash',
 
 // ---- CHARACTER_MAX_VERTS budget checks --------------------------------------
 
-check('CHARACTER_MAX_VERTS bumped to 612', CHARACTER_MAX_VERTS === 612);
+// Rebaselined: 864 → 1188 to accommodate NPC accessories (skirt, hat, belt,
+// apron, boots = 7 extra boxes) + flowing hair (2 side panels).
+check('CHARACTER_MAX_VERTS bumped to 1188 (NPC accessories)',
+  CHARACTER_MAX_VERTS === 1188);
+
+// ---- dragonscale tier: bone horn/spike boxes --------------------------------
+const maleFullDragon = buildCharacterMesh(DEFAULT_CUSTOMIZATION, IDLE_POSE, null,
+  { armor: { head: 'dragon', body: 'dragon', legs: 'dragon' } });
+// Dragon adds 2 helm horns + 2 shoulder spikes + 3 dorsal spikes = 7 boxes
+// (252 verts) on top of the full-iron silhouette (helmet box shared).
+check('full dragonscale adds exactly 7 spike boxes over full iron',
+  (maleFullDragon.length - maleFullIron.length) / 6 === 7 * 36,
+  `extraVerts=${(maleFullDragon.length - maleFullIron.length) / 6}`);
+check('full dragonscale ≤ CHARACTER_MAX_VERTS',
+  maleFullDragon.length / 6 <= CHARACTER_MAX_VERTS,
+  `verts=${maleFullDragon.length / 6}`);
+check('dragonscale mesh has emerald scale tint',
+  hasColor(maleFullDragon, 0.14, 0.45, 0.26));
+check('dragonscale mesh has bone spike color',
+  hasColor(maleFullDragon, 0.85, 0.80, 0.68));
 check('female no-armor ≤ CHARACTER_MAX_VERTS',
   femaleIdle.length / 6 <= CHARACTER_MAX_VERTS,
   `verts=${femaleIdle.length / 6}`);

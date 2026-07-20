@@ -940,6 +940,11 @@ export const ICON_DRAWERS: Record<GameItemId, (ctx: Ctx) => void> = {
   iron_chest: (ctx) => { drawArmorBody(ctx, [0.66, 0.68, 0.72]); },
   iron_legs:  (ctx) => { drawArmorLegs(ctx, [0.65, 0.67, 0.71]); },
 
+  // Armor: dragonscale tier (top tier — emerald scale tint)
+  dragonscale_helm:  (ctx) => { drawArmorHead(ctx, [0.16, 0.48, 0.28]); },
+  dragonscale_chest: (ctx) => { drawArmorBody(ctx, [0.14, 0.45, 0.26]); },
+  dragonscale_legs:  (ctx) => { drawArmorLegs(ctx, [0.13, 0.42, 0.24]); },
+
   // Consumables with effectClass
   healing_potion: (ctx) => { drawPotion(ctx, [0.75, 0.20, 0.25], [1.0, 0.60, 0.65]); },
   warming_potion: (ctx) => { drawPotion(ctx, [0.85, 0.45, 0.15], [1.0, 0.80, 0.50]); },

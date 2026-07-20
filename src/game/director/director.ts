@@ -33,8 +33,13 @@ export const DIRECTOR_MODEL_ID = 'local/flux2-te-qwen3-4b-q4_k_m';
 export const DIRECTOR_GGUF_FILE = 'flux2-te-qwen3-4b-q4_k_m.gguf';
 
 /** Smaller prefill submissions while the game renders (existing engine hook;
- *  default 512 stalls the frame for the whole prompt). */
-const DIRECTOR_PREFILL_CHUNK = 128;
+ *  default 512 stalls the frame for the whole prompt). 64 keeps each GPU
+ *  submit short enough that frames stay interactive during background gen. */
+const DIRECTOR_PREFILL_CHUNK = 64;
+
+/** Breathing gap between background generation jobs — gives the renderer
+ *  exclusive GPU time so the game stays smooth (fixtures cover the wait). */
+const GEN_COOLDOWN_MS = 5000;
 
 const DCELL = 512; // keep in sync with dungeon-manager.ts
 
@@ -70,6 +75,8 @@ export class DungeonDirector implements SpecProvider {
   private readonly queued = new Set<string>();
   private busy = false;
   private failed = false;
+  private paused = false;
+  private cooldownUntil = 0;
   private loading = false;
   private loadNote = '';
   private dreamingName: string | null = null;
@@ -97,6 +104,17 @@ export class DungeonDirector implements SpecProvider {
   isReady(dcx: number, dcz: number): boolean {
     if (this.failed) return true;
     return this.store.load(this.seed, dcx, dcz) !== null;
+  }
+
+  /**
+   * Pause/resume background generation. While paused, doors still get
+   * deterministic fixtures instantly and jobs stay queued; generation resumes
+   * on unpause. Used to give NPC chat exclusive GPU time.
+   */
+  setPaused(paused: boolean): void {
+    if (this.paused === paused) return;
+    this.paused = paused;
+    if (!paused && this.queue.length > 0) void this.pump();
   }
 
   /** Player is waiting at this door — move its job to the queue front. */
@@ -172,7 +190,13 @@ export class DungeonDirector implements SpecProvider {
   }
 
   private async pump(): Promise<void> {
-    if (this.busy || this.failed) return;
+    if (this.busy || this.failed || this.paused) return;
+    // Cooldown between jobs: give the renderer exclusive GPU time.
+    const wait = this.cooldownUntil - Date.now();
+    if (wait > 0) {
+      setTimeout(() => void this.pump(), wait + 50);
+      return;
+    }
     const cell = this.queue.shift();
     if (cell === undefined) return;
     this.busy = true;
@@ -210,7 +234,8 @@ export class DungeonDirector implements SpecProvider {
       this.queued.delete(`${cell.dcx},${cell.dcz}`);
       this.dreamingName = null;
       this.busy = false;
-      if (!this.failed && this.queue.length > 0) void this.pump();
+      this.cooldownUntil = Date.now() + GEN_COOLDOWN_MS;
+      if (!this.failed && !this.paused && this.queue.length > 0) void this.pump();
     }
   }
 
@@ -242,21 +267,22 @@ export class DungeonDirector implements SpecProvider {
         onStatus: (msg) => { this.loadNote = msg; },
       });
       this.session = session;
+      // Private KV fork: the shared session's default KV is contended by the
+      // EcologyDirector — concurrent gens reset each other's cache and destroy
+      // buffers the other's in-flight submits still reference (GPU errors,
+      // garbage output). A fork isolates this consumer completely.
+      const ctx = session.forkKV !== undefined ? session.forkKV() : session;
       this.chat = async (messages) => {
-        const g = globalThis as Record<string, unknown>;
-        const prevChunk = g.__DEBUG_PREFILL_CHUNK__;
-        g.__DEBUG_PREFILL_CHUNK__ = DIRECTOR_PREFILL_CHUNK;
-        try {
-          const handle = session.chat(
-            messages, DIRECTOR_SAMPLING, undefined,
-            // emptyThink: Qwen3 opens <think> on its own and burns the whole
-            // token budget unless the empty think block is pre-filled.
-            { enableThinking: false, emptyThink: true });
-          const r = await handle.result;
-          return { text: r.text, stopReason: r.stopReason };
-        } finally {
-          g.__DEBUG_PREFILL_CHUNK__ = prevChunk;
-        }
+        const handle = ctx.chat(
+          messages, DIRECTOR_SAMPLING, undefined,
+          // emptyThink: Qwen3 opens <think> on its own and burns the whole
+          // token budget unless the empty think block is pre-filled.
+          // prefillChunk: small chunks keep frame hitches short for this
+          // background consumer WITHOUT leaking into concurrent NPC chat
+          // prefill (the old global override was racy across awaits).
+          { enableThinking: false, emptyThink: true, prefillChunk: DIRECTOR_PREFILL_CHUNK });
+        const r = await handle.result;
+        return { text: r.text, stopReason: r.stopReason };
       };
       return this.chat;
     } finally {

@@ -16,7 +16,8 @@ import { mulberry32 } from '../src/game/mesh-utils';
 
 /** Update ONLY on deliberate layout/mesh changes. */
 // Rebaked for Phase L1 (castle kind + new pad types: tower/wall/stable/gatehouse/jail).
-const GOLDEN_HASH: number | null = 0xc20a725b;
+// Old hash (pre visual pass v3: keep/stall/lamp + timber/crenel/banner detail): 0xc20a725b
+const GOLDEN_HASH: number | null = 0x28e82e84;
 
 let passed = 0;
 let failed = 0;
@@ -111,10 +112,10 @@ check('resolved name matches the layout',
   resolved.name === layoutSettlement('castle', 12345).name);
 
 const meshes = buildSettlementMeshes(resolved);
-check('settlement draws in at most 4 batches', meshes.length <= 4,
+check('settlement draws in at most 6 batches', meshes.length <= 6,
   `batches=${meshes.length}`);
-check('all four palettes used by a castle',
-  meshes.length === 4, meshes.map((m) => m.palette).join(','));
+check('all six palettes used by a castle (incl. torch + banner)',
+  meshes.length === 6, meshes.map((m) => m.palette).join(','));
 let triangles = true;
 let vertTotal = 0;
 for (const m of meshes) {

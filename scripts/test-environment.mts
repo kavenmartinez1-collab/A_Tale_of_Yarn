@@ -10,7 +10,8 @@
 import { envAt, DAY_LENGTH_S, type Environment } from '../src/game/environment';
 
 /** Update ONLY on deliberate environment-curve changes (see header). */
-const GOLDEN_HASH: number | null = 0x98239a49;
+// Old hash (pre blue-hour keys / purple dusk): 0x98239a49
+const GOLDEN_HASH: number | null = 0xb0dc84d9;
 
 let passed = 0;
 let failed = 0;

@@ -16,8 +16,8 @@ import { settlementSiteAt } from '../src/game/settlement/settlement-scatter';
 import { CHUNK_SIZE } from '../src/game/terrain/chunk-mesh';
 
 /** Update ONLY on deliberate scatter/heightfield changes. */
-// Rebaked for pond/lake shore nodes (reeds + gourd near inland standing water).
-const GOLDEN_HASH: number | null = 0x3478d122;
+// Rebaked for forced castle near spawn (settlement clearing moved).
+const GOLDEN_HASH: number | null = 0xa99c17d2;
 
 const WORLD_SEED = 1337;
 

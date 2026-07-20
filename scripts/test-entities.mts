@@ -72,14 +72,14 @@ const ALL_ITEM_IDS = new Set(Object.keys(ITEM_DEFS));
 // ---------------------------------------------------------------------------
 
 {
-  const expected9: Species[] = [
+  const expected11: Species[] = [
     'rabbit', 'deer', 'bird', 'horse', 'cow',
-    'donkey', 'dragon', 'griffin', 'sea_serpent',
+    'donkey', 'wolf', 'bear', 'dragon', 'griffin', 'sea_serpent',
   ];
   check(
-    'SPECIES_DEFS has exactly 9 species',
-    ALL_SPECIES.length === 9 &&
-      expected9.every((s) => s in SPECIES_DEFS),
+    'SPECIES_DEFS has exactly 11 species',
+    ALL_SPECIES.length === 11 &&
+      expected11.every((s) => s in SPECIES_DEFS),
   );
 }
 
@@ -368,7 +368,7 @@ check('ECELL is 512', ECELL === 512);
   const goldenHash = fnv32a(goldenJson);
 
   // Baked hash (computed on first run, then hardcoded):
-  const GOLDEN_HASH = 0xecdf9bc9;
+  const GOLDEN_HASH = 0x7d751885; // rebaselined: wolf/bear biome expansion (desert/beach/jungle pressure)
 
   check(
     `FNV-32 golden hash == 0x${GOLDEN_HASH.toString(16).padStart(8, '0')}`,

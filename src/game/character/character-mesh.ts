@@ -24,7 +24,7 @@ export type Color3 = [number, number, number];
 // Armor types
 // ---------------------------------------------------------------------------
 
-export type ArmorTier = 'fiber' | 'leather' | 'iron';
+export type ArmorTier = 'fiber' | 'leather' | 'iron' | 'dragon';
 
 /** Per-slot armor worn by the character. All slots optional. */
 export interface ArmorOptions {
@@ -38,7 +38,11 @@ const ARMOR_TINT: Record<ArmorTier, Color3> = {
   fiber:   [0.72, 0.62, 0.38],
   leather: [0.45, 0.30, 0.16],
   iron:    [0.62, 0.65, 0.70],
+  dragon:  [0.14, 0.45, 0.26], // dark emerald dragonscale
 };
+
+/** Bone-pale accent for dragonscale horns/spikes. */
+const DRAGON_BONE: Color3 = [0.85, 0.80, 0.68];
 
 /** Extra options for buildCharacterMesh (all optional, additive). */
 export interface CharacterOptions {
@@ -54,15 +58,31 @@ export interface HeldItem {
   color: Color3;
 }
 
+/** NPC accessory slots — purely additive geometry, ignored if absent. */
+export interface NpcAccessories {
+  /** Skirt/dress overlay (color); replaces pants visually for women. */
+  skirt?: Color3;
+  /** Wide-brim hat (straw, merchant beret, etc.). */
+  hat?: Color3;
+  /** Belt stripe across the waist. */
+  belt?: Color3;
+  /** Front apron panel (farmer look). */
+  apron?: Color3;
+  /** Boot color (short box at ankle level). */
+  boots?: Color3;
+}
+
 export interface CharacterCustomization {
   skinTone: Color3;
   shirtColor: Color3;
   pantsColor: Color3;
-  /** 0 = bald, 1 = crop, 2 = long. */
+  /** 0 = bald, 1 = crop, 2 = long, 3 = flowing (wider long + side panels). */
   hairStyle: number;
   hairColor: Color3;
   /** Body shape variant (persisted with customization). Default 'male'. */
   body?: 'male' | 'female';
+  /** Optional NPC accessories (skirt, hat, belt, apron, boots). */
+  accessories?: NpcAccessories;
 }
 
 /** Sensible RuneScape-ish default (B-M3 lets the player change it). */
@@ -375,6 +395,59 @@ export function buildCharacterMesh(
     parts.push(part(custom.hairColor, torsoRots,
       -0.17, panelBot, 0.13, 0.17, capTop, 0.19));
   }
+  if (custom.hairStyle >= 3) {
+    // "Flowing" hair: two side panels + front bangs that frame the face,
+    // giving a wider, more feminine silhouette clearly distinct from the crop.
+    const sideBot = isFemale ? shoulderY - 0.06 : torsoTop + 0.04;
+    const sideTop = isFemale ? headTop * (1.66 / 1.62) : headTop * (1.66 / 1.62);
+    // Left side panel — hangs from the cap down past the shoulders
+    parts.push(part(custom.hairColor, torsoRots,
+      -0.22, sideBot, -0.08, -0.14, sideTop, 0.12));
+    // Right side panel
+    parts.push(part(custom.hairColor, torsoRots,
+       0.14, sideBot, -0.08,  0.22, sideTop, 0.12));
+  }
+
+  // ---- NPC Accessories (purely additive — no change when absent) ----
+  const acc = custom.accessories;
+  if (acc) {
+    // Skirt: a flared trapezoid-like box covering the upper legs, creating
+    // a dress silhouette. Wider than the torso to read as a skirt at a glance.
+    if (acc.skirt) {
+      const skirtTop = hipY + 0.04;
+      const skirtBot = hipY * 0.28; // hangs below mid-thigh
+      const skirtW = isFemale ? legO + 0.06 : legO + 0.03;
+      parts.push(part(acc.skirt, [], -skirtW, skirtBot, -0.16, skirtW, skirtTop, 0.16));
+    }
+    // Belt: thin stripe across the waist (rides the torso).
+    if (acc.belt) {
+      const beltBot = hipY;
+      const beltTop = hipY + 0.05;
+      parts.push(part(acc.belt, torsoRots, -(tW + 0.01), beltBot, -0.14, tW + 0.01, beltTop, 0.14));
+    }
+    // Apron: front panel hanging from waist (farmer look).
+    if (acc.apron) {
+      const apronTop = hipY + 0.12;
+      const apronBot = hipY * 0.35;
+      const apronW = tW * 0.7;
+      parts.push(part(acc.apron, [], -apronW, apronBot, -0.145, apronW, apronTop, -0.12));
+    }
+    // Hat: wide-brim disc + crown on top of the head.
+    if (acc.hat) {
+      // Brim: flat wide disc at the top of the head
+      const brimY = headTop + 0.01;
+      parts.push(part(acc.hat, torsoRots,
+        -0.24, brimY, -0.24, 0.24, brimY + 0.04, 0.24));
+      // Crown: raised center block
+      parts.push(part(acc.hat, torsoRots,
+        -0.12, brimY + 0.04, -0.12, 0.12, brimY + 0.14, 0.12));
+    }
+    // Boots: short boxes at the base of each leg.
+    if (acc.boots) {
+      parts.push(part(acc.boots, [pitch(legPitch, hipY)], -legO, 0, -0.12, -legI, 0.14, 0.12));
+      parts.push(part(acc.boots, [pitch(-legPitch, hipY)],  legI, 0, -0.12,  legO, 0.14, 0.12));
+    }
+  }
 
   // Helmet: box slightly larger than the head, only when armor.head is set.
   // Adds exactly 36 verts (one box).
@@ -384,6 +457,30 @@ export function buildCharacterMesh(
     // Helmet is 0.025 larger on all sides.
     parts.push(part(helmTint, torsoRots,
       -0.175, torsoTop - 0.01, -0.175, 0.175, headTop + 0.03, 0.175));
+  }
+
+  // Dragonscale extras: bone horns on the helm, shoulder spikes and a dorsal
+  // ridge on the chest. Only added for the dragon tier (golden-hash safe).
+  if (armor?.head === 'dragon') {
+    // Two swept-back horns on the helmet crown (back = +Z at yaw 0).
+    parts.push(part(DRAGON_BONE, torsoRots,
+      -0.15, headTop + 0.02, 0.00, -0.07, headTop + 0.18, 0.10));
+    parts.push(part(DRAGON_BONE, torsoRots,
+       0.07, headTop + 0.02, 0.00,  0.15, headTop + 0.18, 0.10));
+  }
+  if (armor?.body === 'dragon') {
+    // Shoulder spikes just outside the torso top corners.
+    parts.push(part(DRAGON_BONE, torsoRots,
+      -tW - 0.03, torsoTop - 0.03, -0.06, -tW + 0.05, torsoTop + 0.12, 0.06));
+    parts.push(part(DRAGON_BONE, torsoRots,
+       tW - 0.05, torsoTop - 0.03, -0.06,  tW + 0.03, torsoTop + 0.12, 0.06));
+    // Dorsal ridge: three shrinking spikes down the spine (back = +Z).
+    parts.push(part(DRAGON_BONE, torsoRots,
+      -0.04, torsoTop - 0.10, 0.13, 0.04, torsoTop + 0.02, 0.20));
+    parts.push(part(DRAGON_BONE, torsoRots,
+      -0.035, torsoTop - 0.24, 0.13, 0.035, torsoTop - 0.14, 0.19));
+    parts.push(part(DRAGON_BONE, torsoRots,
+      -0.03, torsoTop - 0.37, 0.13, 0.03, torsoTop - 0.28, 0.18));
   }
 
   // Held item rides the full right-forearm chain (elbow + shoulder + torso).
@@ -440,7 +537,9 @@ export function buildCharacterMesh(
 
 /**
  * Largest vertex count possible.
- * 12 body boxes + 1 helmet box + 4 held boxes = 17 boxes × 36 verts = 612.
- * (Previous value was 576 before helmet was added.)
+ * 10 body boxes + 4 hair boxes (cap + back + 2 side) + 7 accessory boxes
+ * (skirt + belt + apron + hat brim + hat crown + 2 boots) + 1 helmet box
+ * + 7 dragonscale spike boxes + 4 held-item boxes = 33 boxes × 36 = 1188.
+ * (Previous values: 864 pre-NPC-accessories.)
  */
-export const CHARACTER_MAX_VERTS = 612;
+export const CHARACTER_MAX_VERTS = 1188;

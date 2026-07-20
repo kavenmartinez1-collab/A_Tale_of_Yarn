@@ -44,11 +44,21 @@ fn vnoise(p: vec2<f32>) -> f32 {
   return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
+// Gentle filmic-ish grade — keep identical to the scene shaders so the
+// horizon fog line still matches terrain exactly.
+fn grade(c: vec3<f32>) -> vec3<f32> {
+  let x = max(c, vec3<f32>(0.0));
+  let toned = x * (vec3<f32>(1.25) + x * 0.45)
+            / (vec3<f32>(1.0) + x * (vec3<f32>(0.90) + x * 0.45));
+  let l = dot(toned, vec3<f32>(0.2126, 0.7152, 0.0722));
+  return mix(vec3<f32>(l), toned, 1.10);
+}
+
 fn fbm(p: vec2<f32>) -> f32 {
   var v = 0.0;
   var amp = 0.5;
   var q = p;
-  for (var i = 0; i < 4; i = i + 1) {
+  for (var i = 0; i < 6; i = i + 1) {
     v += amp * vnoise(q);
     q = q * 2.03 + vec2<f32>(17.3, 9.1);
     amp *= 0.5;
@@ -82,12 +92,22 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   color += frame.sunColor * pow(max(sd, 0.0), 180.0) * 0.35;
 
   // Stars: hashed cell points on the sky dome, faded in by starVis.
+  // Two size classes: a dense field of faint stars + sparse bright ones.
   if (frame.starVis > 0.0 && dir.y > 0.0) {
     let cell = floor(dir * 220.0);
     let h = fract(sin(dot(cell, vec3<f32>(12.9898, 78.233, 37.719))) * 43758.5453);
-    let star = step(0.9982, h) * frame.starVis * smoothstep(0.0, 0.15, dir.y);
+    let horizonFade = frame.starVis * smoothstep(0.0, 0.15, dir.y);
+    let bright = step(0.9982, h);
+    let faint  = step(0.9930, h) * (1.0 - bright) * 0.35;
     let twinkle = 0.7 + 0.3 * sin(frame.time * 2.0 + h * 40.0);
-    color += vec3<f32>(0.9, 0.93, 1.0) * star * twinkle;
+    color += vec3<f32>(0.9, 0.93, 1.0) * (bright + faint) * horizonFade * twinkle;
+
+    // Moon: pale disc opposite the sun (same mirrored direction the scene
+    // shaders use for the night fill light), with a soft cool glow.
+    let moonDir = normalize(vec3<f32>(-frame.sunDir.x, abs(frame.sunDir.y), -frame.sunDir.z));
+    let md = dot(dir, moonDir);
+    color += vec3<f32>(0.82, 0.86, 0.95) * smoothstep(0.99955, 0.99985, md) * frame.starVis;
+    color += vec3<f32>(0.30, 0.35, 0.50) * pow(max(md, 0.0), 350.0) * 0.35 * frame.starVis;
   }
 
   // Clouds: FBM sampled on a virtual dome plane, drifting with time and
@@ -105,5 +125,5 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     color = mix(color, cloudCol, cov * 0.85);
   }
 
-  return vec4<f32>(color, 1.0);
+  return vec4<f32>(grade(color), 1.0);
 }

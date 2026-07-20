@@ -110,19 +110,29 @@ function guardWaypoints(pads: BuildingPad[], rng: () => number): NpcWaypoint[] {
       { x:  0, z: -r },
     ];
   }
-  // Shuffle and pick up to 4 pad centers as waypoints.
+  // Shuffle and pick up to 4 fort features, patrolling just outside each.
   const shuffled = [...patrol].sort(() => rng() - 0.5);
   const count = Math.min(4, Math.max(3, shuffled.length));
-  return shuffled.slice(0, count).map((p) => ({ x: p.x, z: p.z }));
+  return shuffled.slice(0, count).map((p) => doorSpot(p, rng, 2.0));
 }
 
-/** Generate idle waypoints for a non-guard: 2 points near the assigned pad. */
+/**
+ * A spot just outside the pad's door face (local -Z rotated by yaw), so NPCs
+ * stand in front of their building instead of inside its mesh.
+ */
+function doorSpot(
+  pad: BuildingPad, rng: () => number, margin = 1.6,
+): NpcWaypoint {
+  const dx = Math.sin(pad.yaw);
+  const dz = -Math.cos(pad.yaw);
+  const dist = pad.d / 2 + margin;
+  const jitter = () => (rng() - 0.5) * 2.4;
+  return { x: pad.x + dx * dist + jitter(), z: pad.z + dz * dist + jitter() };
+}
+
+/** Generate idle waypoints for a non-guard: 2 points by the pad's door. */
 function idleWaypoints(pad: BuildingPad, rng: () => number): NpcWaypoint[] {
-  const jitter = () => (rng() - 0.5) * 4;
-  return [
-    { x: pad.x + jitter(), z: pad.z + jitter() },
-    { x: pad.x + jitter(), z: pad.z + jitter() },
-  ];
+  return [doorSpot(pad, rng), doorSpot(pad, rng, 2.8)];
 }
 
 // ---------------------------------------------------------------------------
@@ -136,11 +146,16 @@ function assignPad(role: NpcRole, pads: BuildingPad[], rng: () => number): Build
       preferred = pads.filter((p) => p.type === 'barn' || p.type === 'stable');
       break;
     case 'merchant':
-      preferred = pads.filter((p) => p.type === 'house' || p.type === 'barn');
+      // Market stalls first, then houses/barns.
+      preferred = pads.filter((p) => p.type === 'stall');
+      if (preferred.length === 0) {
+        preferred = pads.filter((p) => p.type === 'house' || p.type === 'barn');
+      }
       break;
     case 'guard':
       preferred = pads.filter((p) =>
-        p.type === 'gatehouse' || p.type === 'tower' || p.type === 'jail');
+        p.type === 'gatehouse' || p.type === 'tower' || p.type === 'jail' ||
+        p.type === 'keep');
       break;
     case 'villager':
     default:
@@ -148,7 +163,8 @@ function assignPad(role: NpcRole, pads: BuildingPad[], rng: () => number): Build
       break;
   }
   if (preferred.length === 0) {
-    preferred = pads.filter((p) => p.type !== 'signpost' && p.type !== 'fence');
+    preferred = pads.filter((p) =>
+      p.type !== 'signpost' && p.type !== 'fence' && p.type !== 'lamp');
   }
   if (preferred.length === 0) return null;
   return preferred[Math.floor(rng() * preferred.length)];
@@ -181,9 +197,9 @@ export function spawnSettlementNpcs(
   for (const { role, count } of plan) {
     for (let i = 0; i < count; i++) {
       const pad = assignPad(role, layout.pads, rng);
-      const jitter = () => (rng() - 0.5) * 3;
-      const x = pad !== null ? pad.x + jitter() : (rng() - 0.5) * 10;
-      const z = pad !== null ? pad.z + jitter() : (rng() - 0.5) * 10;
+      const spot = pad !== null ? doorSpot(pad, rng) : null;
+      const x = spot !== null ? spot.x : (rng() - 0.5) * 10;
+      const z = spot !== null ? spot.z : (rng() - 0.5) * 10;
 
       const waypoints =
         role === 'guard'

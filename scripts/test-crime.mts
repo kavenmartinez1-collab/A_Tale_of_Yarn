@@ -54,6 +54,7 @@ check('BOUNTY_AMOUNTS assault == 200',           BOUNTY_AMOUNTS.assault         
 check('BOUNTY_AMOUNTS murder == 1000',           BOUNTY_AMOUNTS.murder            === 1000);
 check('BOUNTY_AMOUNTS kill_owned_animal == 30',  BOUNTY_AMOUNTS.kill_owned_animal === 30);
 check('BOUNTY_AMOUNTS escape_jail == 100',       BOUNTY_AMOUNTS.escape_jail       === 100);
+check('BOUNTY_AMOUNTS threat == 15',             BOUNTY_AMOUNTS.threat            === 15);
 
 // ---------------------------------------------------------------------------
 // 2. Constants exported

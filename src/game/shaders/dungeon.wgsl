@@ -11,6 +11,12 @@
 //   (w % 100) selects the palette: 0 stone, 1 wood, 2 torch glow (emissive),
 //   3 portal glow (emissive), 4 thatch roof, 5 plaster wall (settlement
 //   buildings), 6 bush leaf, 7 berry red (resource nodes) — 4..7 are lit.
+//   Building-interior additions (all lit): 8 rich furniture wood, 9 warm
+//   fabric/blanket red, 10 hearth firebrick, 11 wool/linen off-white.
+// - lights.count.y is a "cozy interior" flag: 0 = dungeon (faint 0.10 ambient,
+//   dark dense fog), 1 = settlement building (warm lifted ambient + lighter
+//   warmer fog). All other lights buffers are zero-filled, so this only
+//   activates for building-interior draws.
 
 // Keep in sync with the packing in renderer.ts (same 240-byte Frame).
 struct Frame {
@@ -95,10 +101,42 @@ fn texFactor(palIndex: f32, wp: vec3<f32>, detail: f32) -> f32 {
   } else if (palIndex < 6.5) {  // bush leaves: clumps + dither
     f = (vnoise(wp.xz * 1.6 + vec2<f32>(wp.y * 1.1, 0.0)) - 0.5) * 0.35
       + (g - 0.5) * 0.15;
-  } else {                      // berries: subtle speckle
+  } else if (palIndex < 7.5) {  // berries: subtle speckle
     f = (g - 0.5) * 0.10;
+  } else if (palIndex < 8.5) {  // furniture wood: plank grain
+    f = (vnoise(vec2<f32>((wp.x + wp.z) * 3.0, wp.y * 0.7)) - 0.5) * 0.30;
+  } else if (palIndex < 9.5) {  // fabric: fine weave mottle
+    f = (vnoise(wp.xz * 5.0 + vec2<f32>(wp.y * 5.0, 0.0)) - 0.5) * 0.16;
+  } else if (palIndex < 10.5) { // firebrick: courses + speckle
+    f = (vnoise(vec2<f32>((wp.x + wp.z) * 1.3, wp.y * 1.6)) - 0.5) * 0.24
+      + (g - 0.5) * 0.10;
+  } else {                      // wool/linen: soft mottle
+    f = (vnoise(wp.xz * 3.0 + vec2<f32>(wp.y * 3.0, 0.0)) - 0.5) * 0.10;
   }
   return 1.0 + detail * f;
+}
+
+// --- shared stylized lighting helpers (keep identical across scene shaders) --
+
+// Hemispheric ambient (cool sky above, warm bounce below) + half-Lambert sun
+// + a weak cool moon fill at night (starVis-gated, mirrored sun direction).
+fn sceneLight(albedo: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+  let up = n.y * 0.5 + 0.5;
+  let ambTint = mix(vec3<f32>(1.06, 0.98, 0.88), vec3<f32>(0.86, 0.96, 1.14), up);
+  let diff = dot(n, frame.sunDir) * 0.5 + 0.5;
+  let sun = (0.26 * diff + 0.62 * diff * diff) * frame.sunColor;
+  let moonDir = normalize(vec3<f32>(-frame.sunDir.x, abs(frame.sunDir.y), -frame.sunDir.z));
+  let moon = max(dot(n, moonDir), 0.0) * frame.starVis * vec3<f32>(0.05, 0.06, 0.10);
+  return albedo * (frame.ambient * ambTint + sun + moon);
+}
+
+// Gentle filmic-ish grade: lifts shadows, rolls off highlights, +10% sat.
+fn grade(c: vec3<f32>) -> vec3<f32> {
+  let x = max(c, vec3<f32>(0.0));
+  let toned = x * (vec3<f32>(1.25) + x * 0.45)
+            / (vec3<f32>(1.0) + x * (vec3<f32>(0.90) + x * 0.45));
+  let l = dot(toned, vec3<f32>(0.2126, 0.7152, 0.0722));
+  return mix(vec3<f32>(l), toned, 1.10);
 }
 
 fn palette(index: f32) -> vec3<f32> {
@@ -109,7 +147,11 @@ fn palette(index: f32) -> vec3<f32> {
   if (index < 4.5) { return vec3<f32>(0.66, 0.54, 0.26); } // thatch roof
   if (index < 5.5) { return vec3<f32>(0.80, 0.76, 0.68); } // plaster wall
   if (index < 6.5) { return vec3<f32>(0.30, 0.48, 0.20); } // bush leaf
-  return vec3<f32>(0.62, 0.16, 0.22);                      // berry red
+  if (index < 7.5) { return vec3<f32>(0.62, 0.16, 0.22); } // berry red
+  if (index < 8.5) { return vec3<f32>(0.34, 0.22, 0.12); } // furniture wood
+  if (index < 9.5) { return vec3<f32>(0.55, 0.18, 0.16); } // fabric/blanket red
+  if (index < 10.5) { return vec3<f32>(0.30, 0.28, 0.27); } // hearth firebrick
+  return vec3<f32>(0.78, 0.72, 0.62);                      // wool/linen
 }
 
 @fragment
@@ -137,8 +179,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   var color: vec3<f32>;
   if (surface) {
     // Entrance structures stand in daylight: same look as terrain objects.
-    let diff = dot(n, frame.sunDir) * 0.5 + 0.5;
-    color = albedo * (frame.ambient + (0.30 * diff + 0.55 * diff * diff) * frame.sunColor);
+    color = sceneLight(albedo, n);
   } else {
     let count = u32(lights.count.x);
     if (count == 0u) {
@@ -147,7 +188,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
       let diff = dot(n, frame.sunDir) * 0.5 + 0.5;
       color = albedo * (0.55 + 0.45 * diff);
     } else {
-      var lit = vec3<f32>(0.10, 0.10, 0.11); // faint interior ambient
+      // Base ambient: faint for dungeons; warm and lifted for settlement
+      // building interiors (lights.count.y = cozy flag, 0 elsewhere).
+      var lit = mix(vec3<f32>(0.10, 0.10, 0.11), vec3<f32>(0.34, 0.30, 0.26),
+                    clamp(lights.count.y, 0.0, 1.0));
       for (var i = 0u; i < count; i = i + 1u) {
         let light = lights.lights[i];
         let toLight = light.pos.xyz - in.worldPos;
@@ -163,7 +207,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   }
 
   // Exponential distance fog (dark + dense inside, set per-frame by main).
-  let fog = 1.0 - exp(-frame.fogDensity * dist);
-  color = mix(color, frame.fogColor, fog);
-  return vec4<f32>(color, 1.0);
+  // Cozy building interiors thin the fog and warm its tint (cozy = 0 for
+  // dungeons, surface structures, and every other lights-buffer user).
+  let cozy = clamp(lights.count.y, 0.0, 1.0);
+  let fogDensity = frame.fogDensity * mix(1.0, 0.35, cozy);
+  let fogCol = mix(frame.fogColor, vec3<f32>(0.16, 0.12, 0.08), cozy);
+  let fog = 1.0 - exp(-fogDensity * dist);
+  color = mix(color, fogCol, fog);
+  return vec4<f32>(grade(color), 1.0);
 }

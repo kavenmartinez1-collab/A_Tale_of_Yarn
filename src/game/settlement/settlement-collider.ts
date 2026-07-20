@@ -43,6 +43,7 @@ export function buildSettlementSolids(s: ResolvedSettlement): SettlementSolids {
     switch (pad.type) {
       case 'house':
       case 'barn':
+      case 'keep':
         blockers.push(foot);
         platforms.push({
           x0: foot.x0 - SKIRT_MARGIN, z0: foot.z0 - SKIRT_MARGIN,
@@ -52,6 +53,7 @@ export function buildSettlementSolids(s: ResolvedSettlement): SettlementSolids {
         break;
       case 'well':
       case 'fence':
+      case 'stall':
         blockers.push(foot);
         break;
       case 'ruin':
@@ -59,7 +61,8 @@ export function buildSettlementSolids(s: ResolvedSettlement): SettlementSolids {
         else platforms.push(foot); // rubble: step onto it
         break;
       case 'signpost':
-        break; // a pole — not worth blocking
+      case 'lamp':
+        break; // poles — not worth blocking
       case 'tower':
       case 'wall':
         blockers.push(foot);

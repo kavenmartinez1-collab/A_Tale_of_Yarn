@@ -27,7 +27,7 @@ import type { PlayerController } from '../controller';
 import { LIGHTS_BUFFER_SIZE, type DungeonDraw, type Renderer } from '../renderer';
 import type { DungeonSpec, ItemId } from './dungeon-spec';
 import { DUNGEON_FIXTURES } from './dungeon-fixtures';
-import { layoutDungeon, mix32, type DungeonLayout } from './dungeon-layout';
+import { layoutDungeon, mix32, type DungeonLayout, type PlacedRoom } from './dungeon-layout';
 import { buildInteriorMesh } from './dungeon-mesh';
 import {
   buildChestMesh, buildEntranceGlowMesh, buildEntranceStoneMesh,
@@ -35,9 +35,21 @@ import {
 } from './dungeon-props';
 import { DungeonCollider } from './dungeon-collider';
 import { DCELL, entranceSiteAt } from './entrance-site';
+import { SPECIES_DEFS } from '../entities/entity-types';
+import type { EntityState } from '../entities/entity-manager';
+import { stepAnimal, onEntityDamaged } from '../entities/animal-ai';
+import { mulberry32 } from '../mesh-utils';
 
 const INTERACT_DIST = 3;    // E-key reach (m, XZ)
 const EXIT_OFFSET = 1.5;    // how far outside the entrance you reappear (m)
+
+// --- dungeon enemy constants -----------------------------------------------
+const DUNGEON_ENEMY_SPECIES = 'wolf' as const;
+/** Min/max enemies spawned per dungeon (2–5). */
+const DUNGEON_ENEMY_MIN = 2;
+const DUNGEON_ENEMY_MAX = 5;
+/** Room types that receive enemies. */
+const DUNGEON_COMBAT_ROOM_TYPES = new Set(['combat', 'boss']);
 // Surface arches render within this range (m). MUST stay inside the terrain
 // stream radius (LOAD_RADIUS 6 × 64 = 384 m guaranteed) or arches float in
 // the sky over unloaded ground; 360 leaves margin for async chunk gen.
@@ -81,6 +93,73 @@ interface ResidentChest {
   opened: boolean;
 }
 
+/**
+ * A dungeon enemy: an EntityState placed in a combat/boss room.
+ * Uses the same fields and AI path as overworld entities, but lives
+ * inside the dungeon origin-space.
+ */
+export type DungeonEnemy = EntityState & {
+  /** Room rect (in layout cell coords) used to clamp movement. */
+  roomX: number;
+  roomZ: number;
+  roomW: number;
+  roomD: number;
+};
+
+/** Spawn 2–5 wolf enemies in combat/boss rooms deterministically. */
+function spawnDungeonEnemies(
+  layout: DungeonLayout,
+  origin: Vec3,
+  seed: number,
+  dcx: number,
+  dcz: number,
+): DungeonEnemy[] {
+  const rng = mulberry32(mix32(seed ^ 0xd00f, dcx, dcz));
+  const enemies: DungeonEnemy[] = [];
+
+  // Collect eligible rooms (combat + boss), shuffle order.
+  const combatRooms: PlacedRoom[] = layout.rooms.filter(
+    (r) => DUNGEON_COMBAT_ROOM_TYPES.has(r.type));
+  if (combatRooms.length === 0) return enemies;
+
+  const total = DUNGEON_ENEMY_MIN + Math.floor(rng() * (DUNGEON_ENEMY_MAX - DUNGEON_ENEMY_MIN + 1));
+  const def = SPECIES_DEFS[DUNGEON_ENEMY_SPECIES];
+
+  for (let i = 0; i < total; i++) {
+    const room = combatRooms[Math.floor(rng() * combatRooms.length)];
+    // Place within the inner 80% of the room, away from walls.
+    const margin = 1;
+    const fx = room.x + margin + rng() * Math.max(0, room.w - 2 * margin);
+    const fz = room.z + margin + rng() * Math.max(0, room.d - 2 * margin);
+    const wx = origin[0] + fx;
+    const wy = origin[1]; // dungeon floor
+    const wz = origin[2] + fz;
+    const id = `dungeon:${dcx},${dcz}:e${i}`;
+
+    const enemy: DungeonEnemy = {
+      id,
+      species: DUNGEON_ENEMY_SPECIES,
+      x: wx, y: wy, z: wz,
+      yaw: rng() * Math.PI * 2,
+      hp: def.hp,
+      mode: 'idle',
+      walkPhase: 0,
+      colorVariant: (rng() * 4) | 0,
+      homeX: wx,
+      homeZ: wz,
+      stateTimer: rng() * 3,
+      fleeTimer: 0,
+      // Room bounds in world coords (for moveXZ clamping).
+      roomX: origin[0] + room.x,
+      roomZ: origin[2] + room.z,
+      roomW: room.w,
+      roomD: room.d,
+    };
+    enemies.push(enemy);
+  }
+  return enemies;
+}
+
 interface Resident {
   entrance: Entrance;
   layout: DungeonLayout;
@@ -89,6 +168,8 @@ interface Resident {
   draws: DungeonDraw[];
   chests: ResidentChest[];
   buffers: GPUBuffer[];
+  /** Enemies active in this dungeon; emptied when all are killed. */
+  enemies: DungeonEnemy[];
 }
 
 interface EntranceProps {
@@ -130,6 +211,85 @@ export class DungeonManager {
 
   get interactPrompt(): string | null {
     return this.prompt?.label ?? null;
+  }
+
+  /** Live enemies inside the current dungeon; empty when outside or all killed. */
+  dungeonEnemies(): DungeonEnemy[] {
+    return this.resident?.enemies ?? [];
+  }
+
+  /**
+   * Advance all dungeon enemy AIs by dtS seconds.
+   * Call from main.ts when dungeonManager.isInside.
+   * Enemies are clamped to their room bounds so they can't escape through walls.
+   */
+  tickEnemies(
+    dtS: number,
+    playerX: number,
+    playerZ: number,
+    onAttackPlayer: (damage: number) => void,
+  ): void {
+    const res = this.resident;
+    if (res === null) return;
+    const enemies = res.enemies;
+    const def = SPECIES_DEFS[DUNGEON_ENEMY_SPECIES];
+    const rngBase = mulberry32(0xdead1234);
+
+    for (const e of enemies) {
+      if (e.mode === 'dead') continue;
+      const playerDist = Math.hypot(e.x - playerX, e.z - playerZ);
+      const rng = mulberry32(((e.walkPhase * 1000) | 0) ^ e.id.charCodeAt(8));
+
+      // moveXZ clamps movement to the enemy's room rect in world coords.
+      const roomX0 = e.roomX + 0.5;
+      const roomZ0 = e.roomZ + 0.5;
+      const roomX1 = e.roomX + e.roomW - 0.5;
+      const roomZ1 = e.roomZ + e.roomD - 0.5;
+      const moveXZ = (ex: number, ez: number, dx: number, dz: number, _r: number): [number, number] => {
+        const nx = Math.max(roomX0, Math.min(roomX1, ex + dx));
+        const nz = Math.max(roomZ0, Math.min(roomZ1, ez + dz));
+        return [nx, nz];
+      };
+
+      // Flat dungeon floor: heightAt always returns the dungeon y-origin.
+      const floorY = res.origin[1];
+      const heightAt = (_x: number, _z: number) => floorY;
+
+      stepAnimal(e, dtS, {
+        playerX,
+        playerZ,
+        playerDist,
+        rng,
+        heightAt,
+        moveXZ,
+        speciesDef: def,
+        onAttackPlayer,
+      });
+
+      // Clamp y to floor (stepAnimal may set it via heightAt, but belt+suspenders).
+      e.y = floorY;
+    }
+
+    void rngBase; // suppress unused-var lint
+  }
+
+  /**
+   * Apply damage to a dungeon enemy by id.
+   * Returns true if the entity was found and alive.
+   */
+  attackDungeonEnemy(id: string, damage: number, simTime: number): boolean {
+    const res = this.resident;
+    if (res === null) return false;
+    const e = res.enemies.find((en) => en.id === id);
+    if (!e || e.mode === 'dead') return false;
+    e.hp = Math.max(0, e.hp - damage);
+    if (e.hp <= 0) {
+      e.mode = 'dead';
+      e.deadAtS = simTime;
+    } else {
+      onEntityDamaged(e);
+    }
+    return true;
   }
 
   /** Number of discovered (cached, present) entrances so far. */
@@ -431,7 +591,8 @@ export class DungeonManager {
     });
 
     const collider = new DungeonCollider(layout, origin);
-    this.resident = { entrance: e, layout, collider, origin, draws, chests, buffers };
+    const enemies = spawnDungeonEnemies(layout, origin, this.seed, e.dcx, e.dcz);
+    this.resident = { entrance: e, layout, collider, origin, draws, chests, buffers, enemies };
 
     this.controller.world = collider;
     this.controller.pos = [
@@ -446,6 +607,8 @@ export class DungeonManager {
   private exit(): void {
     if (this.resident === null) return;
     const e = this.resident.entrance;
+    // Clear enemy state on exit — re-entry will respawn fresh enemies.
+    this.resident.enemies = [];
     for (const b of this.resident.buffers) b.destroy();
     this.resident = null;
 

@@ -49,6 +49,16 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
   return out;
 }
 
+// Gentle filmic-ish grade — keep identical to the scene shaders so the water
+// blends seamlessly against graded terrain and sky.
+fn grade(c: vec3<f32>) -> vec3<f32> {
+  let x = max(c, vec3<f32>(0.0));
+  let toned = x * (vec3<f32>(1.25) + x * 0.45)
+            / (vec3<f32>(1.0) + x * (vec3<f32>(0.90) + x * 0.45));
+  let l = dot(toned, vec3<f32>(0.2126, 0.7152, 0.0722));
+  return mix(vec3<f32>(l), toned, 1.10);
+}
+
 // Directional wave field — four sine trains at different scales/speeds.
 // Cheap, tileless, and gives a coherent normal for fresnel + sun glint.
 fn waveH(p: vec2<f32>, t: f32) -> f32 {
@@ -89,6 +99,14 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   // Water body: deep in the troughs, brighter on the crests.
   var color = mix(deep, shallow, clamp(0.5 + 0.45 * h0, 0.0, 1.0));
 
+  // Crest foam: broken up by a drifting interference pattern, faded with
+  // distance so the far sea stays clean.
+  let fnoise = sin(p.x * 1.71 + t * 1.1) * sin(p.y * 1.37 - t * 0.9);
+  let foam = smoothstep(0.55, 0.95, h0)
+           * clamp(0.5 + 0.5 * fnoise, 0.0, 1.0)
+           * exp(-dist * 0.010);
+  color = mix(color, vec3<f32>(0.88, 0.93, 0.95), foam * 0.55);
+
   // Fresnel: grazing angles mirror the sky, looking down shows the body.
   let cosV = max(dot(-dir, n), 0.0);
   let fres = 0.03 + 0.97 * pow(1.0 - cosV, 5.0);
@@ -112,5 +130,5 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   color = mix(color, frame.fogColor, fog);
   alpha = mix(alpha, 1.0, fog);
 
-  return vec4<f32>(color, alpha);
+  return vec4<f32>(grade(color), alpha);
 }

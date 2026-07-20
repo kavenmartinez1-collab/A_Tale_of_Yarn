@@ -13,11 +13,12 @@ import { mulberry32 } from '../mesh-utils';
 import type { SettlementKind, SettlementSite } from './settlement-scatter';
 
 /** Bump when layout logic changes materially (golden hash will change). */
-export const LAYOUT_VERSION = 2;
+export const LAYOUT_VERSION = 3;
 
 export type PadType =
   | 'house' | 'barn' | 'ruin' | 'well' | 'fence' | 'signpost'
-  | 'tower' | 'wall' | 'stable' | 'gatehouse' | 'jail';
+  | 'tower' | 'wall' | 'stable' | 'gatehouse' | 'jail'
+  | 'keep' | 'stall' | 'lamp';
 
 export interface BuildingPad {
   type: PadType;
@@ -177,6 +178,8 @@ export function layoutSettlement(
       x: Math.cos(as3) * 20, z: Math.sin(as3) * 20,
       yaw: faceCenter(as3), w: 5, d: 3.5, h: 2.6,
     });
+    // Torch lamp by the well.
+    pads.push({ type: 'lamp', x: 2.2, z: -2.2, yaw: 0, w: 0.3, d: 0.3, h: 2.6 });
   } else if (kind === 'town') {
     pads.push({ type: 'well', x: 0, z: 0, yaw: 0, w: 1.5, d: 1.5, h: 0.8 });
     ringHouses(pads, rng, 4, 12, 4.0);
@@ -194,6 +197,20 @@ export function layoutSettlement(
       x: Math.cos(aj) * 28, z: Math.sin(aj) * 28,
       yaw: faceCenter(aj), w: 5, d: 4, h: 3,
     });
+    // Market stalls ringing the well plaza.
+    const stallCount = 2 + Math.floor(rng() * 2);
+    const sa0 = rng() * Math.PI * 2;
+    for (let i = 0; i < stallCount; i++) {
+      const a2 = sa0 + (i / stallCount) * Math.PI * 2 + (rng() - 0.5) * 0.4;
+      pads.push({
+        type: 'stall',
+        x: Math.cos(a2) * 6.5, z: Math.sin(a2) * 6.5,
+        yaw: faceCenter(a2), w: 2.6, d: 2.2, h: 2.2,
+      });
+    }
+    // Torch lamps lighting the plaza.
+    pads.push({ type: 'lamp', x: 2.5, z: 2.5, yaw: 0, w: 0.3, d: 0.3, h: 2.6 });
+    pads.push({ type: 'lamp', x: -2.5, z: -2.5, yaw: 0, w: 0.3, d: 0.3, h: 2.6 });
   } else {
     // castle
     // Corner towers at ~±32 m on both axes.
@@ -228,12 +245,15 @@ export function layoutSettlement(
       x: 0, z: -towerDist,
       yaw: 0, w: 8, d: 6, h: 7,
     });
-    // Keep (main hall) in the center.
+    // Keep (fortified main hall) in the center.
     pads.push({
-      type: 'house',
+      type: 'keep',
       x: 0, z: 4,
-      yaw: 0, w: 10, d: 8, h: 5,
+      yaw: 0, w: 10, d: 8, h: 6,
     });
+    // Torch lamps flanking the keep entrance path.
+    pads.push({ type: 'lamp', x: -3, z: -3, yaw: 0, w: 0.3, d: 0.3, h: 2.6 });
+    pads.push({ type: 'lamp', x: 3, z: -3, yaw: 0, w: 0.3, d: 0.3, h: 2.6 });
     // Jail in the south-east corner of the courtyard.
     pads.push({
       type: 'jail',

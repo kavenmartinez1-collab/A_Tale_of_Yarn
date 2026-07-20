@@ -46,8 +46,19 @@ export const DROP_TABLE: Record<Species, DropRow[]> = {
   donkey: [
     { id: 'hide', min: 1, max: 2, chance: 1.0 },
   ],
+  wolf: [
+    { id: 'hide',     min: 1, max: 2, chance: 1.0  },
+    { id: 'meat_raw', min: 1, max: 1, chance: 1.0  },
+    { id: 'bone',     min: 1, max: 1, chance: 0.35 },
+  ],
+  bear: [
+    { id: 'hide',     min: 2, max: 3, chance: 1.0 },
+    { id: 'meat_raw', min: 2, max: 3, chance: 1.0 },
+    { id: 'bone',     min: 1, max: 2, chance: 0.6 },
+  ],
   dragon: [
-    { id: 'dragon_scale', min: 2, max: 4, chance: 1.0  },
+    // 3-6 scales: a full dragonscale armor set (13 scales) ≈ 2-3 dragons.
+    { id: 'dragon_scale', min: 3, max: 6, chance: 1.0  },
     { id: 'bone',         min: 1, max: 2, chance: 1.0  },
     { id: 'egg_dragon',   min: 1, max: 1, chance: 0.15 },
   ],

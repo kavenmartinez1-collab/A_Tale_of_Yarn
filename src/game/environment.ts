@@ -57,22 +57,42 @@ const DAY: Omit<Key, 't'> = {
 const DUSK: Omit<Key, 't'> = {
   sunColor: [0.95, 0.50, 0.30],
   ambient: 0.20,
-  skyZenith: [0.20, 0.22, 0.45],
+  skyZenith: [0.24, 0.18, 0.46],
   fogColor: [0.88, 0.52, 0.35],
   fogDensity: 0.0024,
   starVis: 0,
 };
+// Blue hour: the deep indigo band between night and the warm dawn/dusk keys.
+// First stars fade in/out here rather than popping at the night boundary.
+const BLUE_DAWN: Omit<Key, 't'> = {
+  sunColor: [0.24, 0.24, 0.38],
+  ambient: 0.18,
+  skyZenith: [0.07, 0.10, 0.24],
+  fogColor: [0.28, 0.30, 0.48],
+  fogDensity: 0.0021,
+  starVis: 0.35,
+};
+const BLUE_DUSK: Omit<Key, 't'> = {
+  sunColor: [0.30, 0.24, 0.40],
+  ambient: 0.18,
+  skyZenith: [0.10, 0.09, 0.26],
+  fogColor: [0.34, 0.28, 0.48],
+  fogDensity: 0.0021,
+  starVis: 0.35,
+};
 
 // First and last key share values so the wrap at tod 0/1 is continuous.
 const KEYS: Key[] = [
-  { t: 0.00, ...NIGHT },
-  { t: 0.21, ...NIGHT },
-  { t: 0.26, ...DAWN },
-  { t: 0.33, ...DAY },
-  { t: 0.67, ...DAY },
-  { t: 0.74, ...DUSK },
-  { t: 0.79, ...NIGHT },
-  { t: 1.00, ...NIGHT },
+  { t: 0.00,  ...NIGHT },
+  { t: 0.21,  ...NIGHT },
+  { t: 0.235, ...BLUE_DAWN },
+  { t: 0.26,  ...DAWN },
+  { t: 0.33,  ...DAY },
+  { t: 0.67,  ...DAY },
+  { t: 0.74,  ...DUSK },
+  { t: 0.765, ...BLUE_DUSK },
+  { t: 0.79,  ...NIGHT },
+  { t: 1.00,  ...NIGHT },
 ];
 
 function lerp(a: number, b: number, t: number): number {

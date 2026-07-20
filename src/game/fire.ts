@@ -54,20 +54,39 @@ export interface PlacedFire {
   litUntilNow: number;
 }
 
-/** Burning tree record for Phase I (lightning). */
+/** Seconds a burning bush stays alight (bushes are quick tinder). */
+export const BUSH_BURN_S = 18;
+/** Lit campfires/forges ignite vegetation within this radius (m). */
+export const FIRE_IGNITE_RADIUS = 3;
+/** A held torch ignites vegetation you brush right against (m). */
+export const TORCH_IGNITE_RADIUS = 1.6;
+/** Burning vegetation creeps to neighbours within this radius (m). */
+export const FIRE_SPREAD_RADIUS = 4;
+/** Per-tick chance a burning item spreads (fire crawls, not explodes). */
+export const FIRE_SPREAD_CHANCE = 0.35;
+/** Hard cap on simultaneous burning vegetation (perf + no forest wipes). */
+export const MAX_BURNING = 40;
+
+/**
+ * Burning vegetation record (trees and bushes). Originally Phase I lightning;
+ * now also fed by dragon breath, campfire/torch proximity, and spread.
+ */
 export interface BurningTree {
   x: number;
   y: number;
   z: number;
-  /** Sim time (seconds) at which the tree stops burning. */
+  /** Sim time (seconds) at which the vegetation stops burning. */
   untilS: number;
+  /** Flame shape hint — defaults to 'tree'. */
+  kind?: 'tree' | 'bush';
 }
 
-/** Module-level burning-tree registry. Phase I feeds this. */
+/** Module-level burning-vegetation registry. */
 const burningTrees: BurningTree[] = [];
 
-/** Register a burning tree (called by Phase I lightning). */
+/** Register burning vegetation. Silently ignored past MAX_BURNING. */
 export function addBurningTree(t: BurningTree): void {
+  if (burningTrees.length >= MAX_BURNING) return;
   burningTrees.push(t);
 }
 

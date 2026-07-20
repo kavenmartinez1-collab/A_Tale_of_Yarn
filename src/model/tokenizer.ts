@@ -52,6 +52,25 @@ export interface TokenizerConfig {
  * Downloads tokenizer.json, tokenizer_config.json, and special_tokens_map.json.
  * These are small files (~2-5 MB total) and are cached by the browser.
  */
+/**
+ * Base repo whose tokenizer matches a model family, inferred from the repo
+ * name. Tokenizers are shared across sizes/quants within a family.
+ * Order matters: 'qwen3.6' also contains 'qwen3'. Qwen3.6 uses a NEW
+ * 248320-token vocab (EOS 248046) — the Qwen3/3.5 tokenizers are NOT
+ * compatible (vocab ~151936) and produce garbage encode/decode.
+ */
+function baseTokenizerRepo(modelId: string): string | null {
+  const name = modelId.toLowerCase();
+  if (name.includes('qwen3.6')) return 'Qwen/Qwen3.6-35B-A3B';
+  if (name.includes('qwen3.5')) return 'Qwen/Qwen3.5-9B';
+  if (name.includes('qwen3')) return 'Qwen/Qwen3-8B';
+  if (name.includes('qwen2.5')) return 'Qwen/Qwen2.5-0.5B-Instruct';
+  // Gemma 4 family shares one tokenizer; google/ repos are gated (401),
+  // the unsloth mirror ships tokenizer.json ungated.
+  if (name.includes('gemma4') || name.includes('gemma-4')) return 'unsloth/gemma-4-e4b-it';
+  return null;
+}
+
 export async function createTokenizer(config: TokenizerConfig): Promise<Tokenizer> {
   let { modelId } = config;
   let localTokenizer: PreTrainedTokenizer | null = null;
@@ -60,22 +79,21 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
   // tokenizer — fall back to base model. The tokenizer is the same across
   // quantization variants of a family.
   const isLocalAlias = (id: string) => id.startsWith('local/') || id.startsWith('ollama/');
-  if (isLocalAlias(modelId)) {
-    // Preferred: the model dir ships its own tokenizer files (e.g. Gemma 4
-    // GGUF + tokenizer.json downloaded together) — construct directly from
-    // the dev-server cache, no HF Hub round-trip (mirrors the D0 node test).
-    // (Ollama aliases 404 here — blobs don't carry tokenizer.json.)
-    try {
-      const [tjResp, tcResp] = await Promise.all([
-        fetch(`/api/hf-cache/${modelId}/raw/main/tokenizer.json`),
-        fetch(`/api/hf-cache/${modelId}/raw/main/tokenizer_config.json`),
-      ]);
-      if (tjResp.ok && tcResp.ok) {
-        localTokenizer = new PreTrainedTokenizer(await tjResp.json(), await tcResp.json());
-        console.log(`[Tokenizer] Loaded from local model dir: ${modelId}`);
-      }
-    } catch { /* fall through to base-model heuristics */ }
-  }
+  // Preferred for ANY repo: the local model dir / HF cache ships its own
+  // tokenizer files (e.g. a GGUF + tokenizer.json placed together) —
+  // construct directly from the dev-server cache, no HF Hub round-trip
+  // (mirrors the D0 node test). 404s fall through to the heuristics below.
+  // (Ollama aliases 404 here — blobs don't carry tokenizer.json.)
+  try {
+    const [tjResp, tcResp] = await Promise.all([
+      fetch(`/api/hf-cache/${modelId}/raw/main/tokenizer.json`),
+      fetch(`/api/hf-cache/${modelId}/raw/main/tokenizer_config.json`),
+    ]);
+    if (tjResp.ok && tcResp.ok) {
+      localTokenizer = new PreTrainedTokenizer(await tjResp.json(), await tcResp.json());
+      console.log(`[Tokenizer] Loaded from local model dir: ${modelId}`);
+    }
+  } catch { /* fall through to base-model heuristics */ }
   if (!localTokenizer && isLocalAlias(modelId)) {
     // Try to find the base model from the tokenizer_config.json served by local cache
     try {
@@ -91,22 +109,12 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
     } catch {}
     // If still unresolved, try a generic fallback based on known name patterns
     if (isLocalAlias(modelId)) {
-      const name = modelId.toLowerCase();
-      // Order matters: 'qwen3.6' also contains 'qwen3'. Qwen3.6 uses a NEW
-      // 248320-token vocab (EOS 248046) — the Qwen3/3.5 tokenizers are NOT
-      // compatible (vocab ~151936) and produce garbage encode/decode.
-      if (name.includes('qwen3.6')) modelId = 'Qwen/Qwen3.6-35B-A3B';
-      else if (name.includes('qwen3.5')) modelId = 'Qwen/Qwen3.5-9B';
-      else if (name.includes('qwen3')) modelId = 'Qwen/Qwen3-8B';
-      else if (name.includes('qwen2.5')) modelId = 'Qwen/Qwen2.5-0.5B-Instruct';
-      // Gemma 4 family shares one tokenizer; google/ repos are gated (401),
-      // the unsloth mirror ships tokenizer.json ungated.
-      else if (name.includes('gemma4') || name.includes('gemma-4')) modelId = 'unsloth/gemma-4-e4b-it';
+      modelId = baseTokenizerRepo(modelId) ?? modelId;
       console.log(`[Tokenizer] Local model fallback, using tokenizer from: ${modelId}`);
     }
   }
 
-  const hfTokenizer = localTokenizer ?? await AutoTokenizer.from_pretrained(modelId, {
+  const fromPretrained = (id: string) => AutoTokenizer.from_pretrained(id, {
     progress_callback: config.onProgress
       ? (progress: any) => {
           if (progress && typeof progress.loaded === 'number') {
@@ -115,6 +123,19 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
         }
       : undefined,
   });
+  let hfTokenizer = localTokenizer;
+  if (!hfTokenizer) {
+    try {
+      hfTokenizer = await fromPretrained(modelId);
+    } catch (err) {
+      // GGUF-only repos (e.g. bartowski/*-GGUF) ship no tokenizer files —
+      // retry with the base-family tokenizer inferred from the repo name.
+      const base = baseTokenizerRepo(modelId);
+      if (base === null || base === modelId) throw err;
+      console.warn(`[Tokenizer] ${modelId} has no tokenizer files — falling back to ${base}`);
+      hfTokenizer = await fromPretrained(base);
+    }
+  }
 
   // Extract special token IDs
   const bosTokenId = hfTokenizer.bos_token_id ?? null;
@@ -205,9 +226,14 @@ function isSingleToken(tokenizer: Tokenizer, s: string): boolean {
 export function applyChatTemplate(
   tokenizer: Tokenizer,
   messages: Array<{ role: string; content: string }>,
-  options?: { enableThinking?: boolean; emptyThink?: boolean },
+  options?: { enableThinking?: boolean; emptyThink?: boolean; addGenerationPrompt?: boolean },
 ): number[] {
   const enableThinking = options?.enableThinking ?? true;
+  // addGenerationPrompt=false renders the messages WITHOUT the trailing
+  // assistant preamble. Used for KV warm-prefill: the resulting token ids are
+  // a strict prefix of any future prompt that appends more turns, so the
+  // prefilled cache is reusable as a pure extension.
+  const addGenPrompt = options?.addGenerationPrompt ?? true;
   // Qwen3 hybrid-thinking checkpoints open <think> on their own unless the
   // generation prompt pre-fills an EMPTY think block (the official Qwen3
   // enable_thinking=false behavior). Opt-in via emptyThink because the bare
@@ -237,7 +263,7 @@ export function applyChatTemplate(
       + `{% endif %}{% endfor %}`
       + `{% if add_generation_prompt %}{{ '<|turn>model\\n' }}{% endif %}`;
     const result = (tokenizer.inner as any).apply_chat_template(msgs, {
-      add_generation_prompt: true,
+      add_generation_prompt: addGenPrompt,
       tokenize: true,
       return_tensor: false,
       chat_template: tpl,
@@ -256,11 +282,20 @@ export function applyChatTemplate(
       ? `<|im_start|>assistant\n<think>\n\n</think>\n\n`
       : `<|im_start|>assistant\n`;
 
+  // KV-cache prefix stability: with emptyThink, the model generated its reply
+  // AFTER a `<think>\n\n</think>\n\n` preamble, so those tokens sit in the KV
+  // cache before the reply. Re-render assistant HISTORY turns with the same
+  // block, or every multi-turn prompt diverges from the cache a few tokens
+  // before its end and pays a full re-prefill.
+  const histThink = emptyThink
+    ? `{% if message['role'] == 'assistant' %}{{ '<think>\\n\\n</think>\\n\\n' }}{% endif %}`
+    : '';
+
   // Try the HF tokenizer's apply_chat_template with our explicit template
   try {
-    const chatml = `{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '${genPrompt}' }}{% endif %}`;
+    const chatml = `{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n'}}${histThink}{{ message['content'] + '<|im_end|>\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '${genPrompt}' }}{% endif %}`;
     const result = (tokenizer.inner as any).apply_chat_template(messages, {
-      add_generation_prompt: true,
+      add_generation_prompt: addGenPrompt,
       tokenize: true,
       return_tensor: false,
       chat_template: chatml,
@@ -276,12 +311,15 @@ export function applyChatTemplate(
   // Fallback: encode with ChatML format (won't handle special tokens perfectly)
   const parts: string[] = [];
   for (const msg of messages) {
-    parts.push(`<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`);
+    const think = emptyThink && msg.role === 'assistant' ? '<think>\n\n</think>\n\n' : '';
+    parts.push(`<|im_start|>${msg.role}\n${think}${msg.content}<|im_end|>\n`);
   }
-  parts.push(enableThinking
-    ? '<|im_start|>assistant\n<think>\n'
-    : emptyThink
-      ? '<|im_start|>assistant\n<think>\n\n</think>\n\n'
-      : '<|im_start|>assistant\n');
+  if (addGenPrompt) {
+    parts.push(enableThinking
+      ? '<|im_start|>assistant\n<think>\n'
+      : emptyThink
+        ? '<|im_start|>assistant\n<think>\n\n</think>\n\n'
+        : '<|im_start|>assistant\n');
+  }
   return tokenizer.encode(parts.join(''));
 }

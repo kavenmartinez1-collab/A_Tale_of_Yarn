@@ -15,6 +15,8 @@ export type Species =
   | 'horse'
   | 'cow'
   | 'donkey'
+  | 'wolf'
+  | 'bear'
   | 'dragon'
   | 'griffin'
   | 'sea_serpent';
@@ -37,6 +39,8 @@ export interface SpeciesDef {
   favoriteFood?: GameItemId;
   /** Attacks the player on sight. */
   aggro: boolean;
+  /** Melee damage per hit (aggro species). Defaults to max(1, round(size)). */
+  attackDmg?: number;
   /** Biomes where this species may spawn. */
   biomes: Biome[];
   /** Spawns in ocean water (h < -8). */
@@ -111,6 +115,30 @@ export const SPECIES_DEFS: Record<Species, SpeciesDef> = {
     aggro: false,
     biomes: ['desert', 'plains', 'beach'],
   },
+  wolf: {
+    name: 'Wolf',
+    size: 0.9,
+    speed: 6.5, // faster than player walk (6), slower than sprint (10)
+    hp: 12,
+    rare: false,
+    mountable: false,
+    aggro: true,
+    attackDmg: 2,
+    // Added desert/beach so hostile pressure exists outside forest biomes.
+    biomes: ['forest', 'dense_forest', 'mountain_forest', 'plains', 'desert', 'beach'],
+  },
+  bear: {
+    name: 'Bear',
+    size: 1.8,
+    speed: 5.5,
+    hp: 35,
+    rare: false,
+    mountable: false,
+    aggro: true,
+    attackDmg: 4,
+    // Added jungle so dense tropical zones also have a strong predator.
+    biomes: ['forest', 'dense_forest', 'mountain_forest', 'jungle'],
+  },
   dragon: {
     name: 'Dragon',
     size: 3.5,
@@ -121,6 +149,7 @@ export const SPECIES_DEFS: Record<Species, SpeciesDef> = {
     mountable: true,
     favoriteFood: 'meat_cooked',
     aggro: true,
+    attackDmg: 5,
     biomes: ['alpine', 'mountain_forest'],
   },
   griffin: {
@@ -133,6 +162,7 @@ export const SPECIES_DEFS: Record<Species, SpeciesDef> = {
     mountable: true,
     favoriteFood: 'meat_raw',
     aggro: true,
+    attackDmg: 3,
     // mountain_forest added so the demo seed has a reachable wild griffin
     // (alpine-only left the nearest one ~24 km from spawn).
     biomes: ['alpine', 'mountain_forest'],
@@ -145,6 +175,7 @@ export const SPECIES_DEFS: Record<Species, SpeciesDef> = {
     rare: true,
     mountable: false,
     aggro: true,
+    attackDmg: 4,
     biomes: ['ocean'],
     water: true,
   },

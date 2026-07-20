@@ -229,5 +229,80 @@ check('iron_pickaxe recipe uses iron_ingot',
 check('iron_sword recipe uses iron_ingot',
   recipe('iron_sword').inputs.some(([id]) => id === 'iron_ingot'));
 
+// ---- hunter_bow recipe uses bow_string (Fix 3) ------------------------------
+check('hunter_bow recipe uses bow_string (not healing_herb)',
+  recipe('hunter_bow').inputs.some(([id]) => id === 'bow_string'));
+check('hunter_bow recipe does NOT use healing_herb',
+  !recipe('hunter_bow').inputs.some(([id]) => id === 'healing_herb'));
+{
+  // Functional craft test: logs + bow_string → hunter_bow
+  const inv = createInventory();
+  addItem(inv, 'logs', 2);
+  addItem(inv, 'bow_string', 1);
+  check('hunter_bow crafts with logs + bow_string',
+    craft(inv, recipe('hunter_bow'), bareCtx) && countItem(inv, 'hunter_bow') === 1);
+}
+
+// ---- Bronze tool recipes exist (Fix 2) --------------------------------------
+{
+  const bronzeAxeR = RECIPES.find((r) => r.output === 'bronze_axe');
+  check('bronze_axe recipe exists', bronzeAxeR !== undefined);
+  check('bronze_axe recipe uses bronze_ingot',
+    bronzeAxeR?.inputs.some(([id]) => id === 'bronze_ingot') === true);
+  check('bronze_axe recipe station is forge',
+    bronzeAxeR?.station === 'forge');
+
+  const bronzePickR = RECIPES.find((r) => r.output === 'bronze_pickaxe');
+  check('bronze_pickaxe recipe exists', bronzePickR !== undefined);
+  check('bronze_pickaxe recipe uses bronze_ingot',
+    bronzePickR?.inputs.some(([id]) => id === 'bronze_ingot') === true);
+  check('bronze_pickaxe recipe station is forge',
+    bronzePickR?.station === 'forge');
+
+  // Functional craft test for bronze_axe.
+  // createInventory() seeds hotbar[0] with 1 bronze_axe, so after crafting +1 the total is 2.
+  const inv = createInventory();
+  addItem(inv, 'bronze_ingot', 2);
+  addItem(inv, 'sticks', 1);
+  const beforeAxe = countItem(inv, 'bronze_axe'); // 1 (spawn-kit)
+  check('bronze_axe crafts with bronze_ingot + sticks',
+    craft(inv, bronzeAxeR!, fullCtx) && countItem(inv, 'bronze_axe') === beforeAxe + 1);
+}
+
+// ---- torch_oil is a recipe input (Fix 4) ------------------------------------
+check('torch_oil appears as a recipe input',
+  RECIPES.some((r) => r.inputs.some(([id]) => id === 'torch_oil')));
+{
+  // Functional: sticks + torch_oil → torch
+  const torchOilRecipe = RECIPES.find(
+    (r) => r.output === 'torch' && r.inputs.some(([id]) => id === 'torch_oil'),
+  );
+  check('torch_oil torch recipe exists', torchOilRecipe !== undefined);
+  if (torchOilRecipe !== undefined) {
+    const inv = createInventory();
+    addItem(inv, 'sticks', 1);
+    addItem(inv, 'torch_oil', 1);
+    check('torch crafts with sticks + torch_oil',
+      craft(inv, torchOilRecipe, bareCtx) && countItem(inv, 'torch') >= 1);
+  }
+}
+
+// ---- old_bone is a recipe input (Fix 4) -------------------------------------
+check('old_bone appears as a recipe input',
+  RECIPES.some((r) => r.inputs.some(([id]) => id === 'old_bone')));
+{
+  // Functional: old_bone → bone_needle
+  const oldBoneRecipe = RECIPES.find(
+    (r) => r.output === 'bone_needle' && r.inputs.some(([id]) => id === 'old_bone'),
+  );
+  check('old_bone → bone_needle recipe exists', oldBoneRecipe !== undefined);
+  if (oldBoneRecipe !== undefined) {
+    const inv = createInventory();
+    addItem(inv, 'old_bone', 1);
+    check('bone_needle crafts from old_bone',
+      craft(inv, oldBoneRecipe, bareCtx) && countItem(inv, 'bone_needle') === 1);
+  }
+}
+
 console.log(`${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

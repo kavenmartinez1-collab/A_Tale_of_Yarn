@@ -73,6 +73,13 @@ export interface EntityState {
    * Persists on the entity object for the lifetime of the entity.
    */
   stamina?: number;
+  /**
+   * Owned entity told to stay put (right-click toggle). While true the
+   * entity sits where it was left instead of following the player.
+   */
+  staying?: boolean;
+  /** Eased sit amount 0..1 (0 = standing, 1 = fully sat). Drives draw-time sink. */
+  sit?: number;
 }
 
 /** Serialized record for the killed registry. */

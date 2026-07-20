@@ -3,7 +3,8 @@
  * + 3 armor slots (head/body/legs), RuneScape-style. Stack-first add, slot
  * moves (click-to-swap), equip = the selected hotbar slot. Persisted to
  * localStorage under a versioned key; deserialize validates every field so
- * corrupt saves fall back to a fresh spawn-kit inventory (bronze axe + pickaxe).
+ * corrupt saves fall back to a fresh starter-kit inventory (full toolset,
+ * iron armor, consumables, gold + tradable stock — createStarterInventory).
  *
  * v2 changes (Phase E):
  * - Adds `armor: { head, body, legs }` equip slots.
@@ -52,6 +53,64 @@ export function createInventory(): Inventory {
   hotbar[1] = { id: 'bronze_pickaxe', count: 1 };
   hotbar[2] = { id: 'fire_starter', count: 1 };
   return { pack, hotbar, selected: 0, armor: { head: null, body: null, legs: null } };
+}
+
+/**
+ * Rich new-game kit: full iron toolset + bow, iron armor equipped,
+ * consumables, camp gear, and a deep stock of gold and tradable goods.
+ * Used for fresh spawns (new game / first boot); createInventory() stays
+ * minimal so unit tests keep a near-empty baseline.
+ */
+export function createStarterInventory(): Inventory {
+  const inv = createInventory();
+  inv.hotbar[0] = { id: 'iron_sword',    count: 1 };
+  inv.hotbar[1] = { id: 'iron_axe',      count: 1 };
+  inv.hotbar[2] = { id: 'iron_pickaxe',  count: 1 };
+  inv.hotbar[3] = { id: 'composite_bow', count: 1 };
+  inv.hotbar[4] = { id: 'torch',         count: 20 };
+  inv.armor = {
+    head: { id: 'iron_helm',  count: 1 },
+    body: { id: 'iron_chest', count: 1 },
+    legs: { id: 'iron_legs',  count: 1 },
+  };
+  const kit: { id: GameItemId; count: number }[] = [
+    // Currency — enough to buy out any trader.
+    { id: 'gold_small',     count: 99 },
+    { id: 'gold_small',     count: 99 },
+    // Combat / survival.
+    { id: 'arrow',          count: 99 },
+    { id: 'healing_potion', count: 20 },
+    { id: 'stamina_potion', count: 20 },
+    { id: 'warming_potion', count: 10 },
+    { id: 'cooling_potion', count: 10 },
+    { id: 'meat_cooked',    count: 20 },
+    { id: 'berries',        count: 99 },
+    { id: 'healing_herb',   count: 20 },
+    { id: 'waterskin_full', count: 1 },
+    // Camp gear.
+    { id: 'fire_starter',   count: 20 },
+    { id: 'campfire_kit',   count: 5 },
+    { id: 'logs',           count: 99 },
+    { id: 'sticks',         count: 99 },
+    { id: 'rope',           count: 20 },
+    { id: 'hide_tent',      count: 1 },
+    { id: 'cooking_pot',    count: 1 },
+    // Tradable stock (everything sellable at good prices, incl. top-value
+    // dragon scales) plus crafting metals.
+    { id: 'dragon_scale',   count: 20 },
+    { id: 'iron_ingot',     count: 99 },
+    { id: 'bronze_ingot',   count: 50 },
+    { id: 'leather',        count: 99 },
+    { id: 'hide',           count: 99 },
+    { id: 'coal',           count: 99 },
+    { id: 'flax',           count: 50 },
+    { id: 'wool',           count: 50 },
+  ];
+  // Direct slot fill (one stack per slot; addItem would merge gold stacks).
+  for (let i = 0; i < kit.length && i < PACK_SIZE; i++) {
+    inv.pack[i] = { id: kit[i].id, count: kit[i].count };
+  }
+  return inv;
 }
 
 function slots(inv: Inventory, area: SlotArea): Slot[] {
@@ -293,8 +352,8 @@ export function loadInventory(): Inventory {
       if (inv !== null) return inv;
     }
   } catch { /* storage unavailable */ }
-  // 3. Fresh spawn kit.
-  return createInventory();
+  // 3. Fresh spawn — full starter kit (new game or first boot).
+  return createStarterInventory();
 }
 
 export function saveInventory(inv: Inventory): void {

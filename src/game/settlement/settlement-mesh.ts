@@ -1,8 +1,8 @@
 /**
  * Settlement meshes — world-space triangle soups batched by dungeon-pipeline
- * palette (stone 0, wood 1, thatch 4, plaster 5), so a whole settlement draws
- * in ≤ 4 calls with the surface material mode (100 + palette) and zeroed
- * lights, exactly like dungeon entrance arches.
+ * palette (stone 0, wood 1, torch 2, thatch 4, plaster 5, berry 7), so a whole
+ * settlement draws in ≤ 6 calls with the surface material mode (100 + palette)
+ * and zeroed lights, exactly like dungeon entrance arches.
  *
  * Buildings sit on the resolved pad height (highest footprint corner) with a
  * stone platform skirt extending below to hide slope gaps — heightAt stays
@@ -15,16 +15,24 @@ import type { ResolvedPad, ResolvedSettlement } from './settlement-layout';
 /** Palette indices (dungeon.wgsl): keep in sync with the shader table. */
 export const PAL_STONE = 0;
 export const PAL_WOOD = 1;
+export const PAL_TORCH = 2;   // emissive — lamps/braziers glow at night
 export const PAL_THATCH = 4;
 export const PAL_PLASTER = 5;
+export const PAL_BERRY = 7;   // dark crimson — banners/market goods
+
+const ALL_PALETTES = [
+  PAL_STONE, PAL_WOOD, PAL_TORCH, PAL_THATCH, PAL_PLASTER, PAL_BERRY,
+] as const;
 
 const SKIRT_DEPTH = 2.5; // platform skirt below the pad (m)
 
-interface Buckets {
-  [PAL_STONE]: number[];
-  [PAL_WOOD]: number[];
-  [PAL_THATCH]: number[];
-  [PAL_PLASTER]: number[];
+type Buckets = Record<(typeof ALL_PALETTES)[number], number[]>;
+
+function emptyBuckets(): Buckets {
+  return {
+    [PAL_STONE]: [], [PAL_WOOD]: [], [PAL_TORCH]: [],
+    [PAL_THATCH]: [], [PAL_PLASTER]: [], [PAL_BERRY]: [],
+  };
 }
 
 function tri(verts: number[], a: P3, b: P3, c: P3): void {
@@ -56,8 +64,32 @@ function buildPad(pad: ResolvedPad, b: Buckets): void {
     case 'house': {
       box(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3);
       box(b[PAL_PLASTER], -hw, 0.08, -hd, hw, h, hd);
+      // Timber frame: corner posts proud of the plaster.
+      for (const sx of [-1, 1]) {
+        for (const sz of [-1, 1]) {
+          box(b[PAL_WOOD],
+            sx * hw - 0.12, 0.08, sz * hd - 0.12,
+            sx * hw + 0.12, h, sz * hd + 0.12);
+        }
+      }
+      // Horizontal beams across the front and back faces (top + waist).
+      for (const sz of [-1, 1]) {
+        const z0 = sz * hd - (sz < 0 ? 0.06 : -0.02);
+        const z1 = sz * hd + (sz < 0 ? 0.02 : 0.06);
+        box(b[PAL_WOOD], -hw - 0.04, h - 0.26, z0, hw + 0.04, h - 0.06, z1);
+        box(b[PAL_WOOD], -hw - 0.04, h * 0.45, z0, hw + 0.04, h * 0.45 + 0.16, z1);
+      }
       box(b[PAL_WOOD], -0.45, 0.08, -hd - 0.06, 0.45, 1.7, -hd + 0.02); // door
-      roof(b[PAL_THATCH], b[PAL_PLASTER], pad.w, pad.d, h, pad.d * 0.45, 0.3);
+      // Shuttered windows flanking the door.
+      for (const sx of [-1, 1]) {
+        box(b[PAL_WOOD],
+          sx * hw * 0.55 - 0.3, 1.05, -hd - 0.04,
+          sx * hw * 0.55 + 0.3, 1.65, -hd + 0.02);
+      }
+      // Stone chimney rising past the roof ridge on the back-right corner.
+      const rise = pad.d * 0.45;
+      box(b[PAL_STONE], hw - 0.75, h - 0.2, hd - 0.95, hw - 0.15, h + rise + 0.35, hd - 0.35);
+      roof(b[PAL_THATCH], b[PAL_PLASTER], pad.w, pad.d, h, rise, 0.3);
       break;
     }
     case 'barn': {
@@ -102,19 +134,32 @@ function buildPad(pad: ResolvedPad, b: Buckets): void {
       break;
     }
     case 'tower': {
-      // Solid stone tower with crenellated parapet.
+      // Solid stone tower with overhanging crenellated cap + torch brazier.
       box(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3); // skirt
       box(b[PAL_STONE], -hw, 0.08, -hd, hw, h, hd); // shaft
-      // Arrow-slit window (negative space suggestion — just a dark plaster panel).
-      box(b[PAL_PLASTER], -0.12, h * 0.45, -hd - 0.02, 0.12, h * 0.65, -hd + 0.02);
-      // Crenels: 4 merlons across the top.
-      const mW = hw * 0.35;
-      const mGap = hw * 0.25;
-      for (let mi = -1; mi <= 1; mi += 2) {
-        box(b[PAL_STONE], mi * (mGap + mW / 2) - mW / 2, h, -hd, mi * (mGap + mW / 2) + mW / 2, h + 0.9, hd);
+      // Arrow slits on two faces at two heights (dark plaster insets).
+      for (const sy of [0.35, 0.6]) {
+        box(b[PAL_PLASTER], -0.12, h * sy, -hd - 0.03, 0.12, h * (sy + 0.14), -hd + 0.02);
+        box(b[PAL_PLASTER], hw - 0.02, h * sy, -0.12, hw + 0.03, h * (sy + 0.14), 0.12);
       }
-      box(b[PAL_STONE], -hw, h, -hd, -hw + 0.6, h + 0.9, hd);
-      box(b[PAL_STONE],  hw - 0.6, h, -hd,  hw, h + 0.9, hd);
+      // Overhanging cap slab (machicolation suggestion).
+      box(b[PAL_STONE], -hw - 0.25, h - 0.15, -hd - 0.25, hw + 0.25, h + 0.05, hd + 0.25);
+      // Merlons around the cap rim: corners + mid-edges.
+      const mHalf = 0.32;
+      const cx = hw - 0.1;
+      const cz = hd - 0.1;
+      const merlonPts: [number, number][] = [
+        [-cx, -cz], [cx, -cz], [-cx, cz], [cx, cz],  // corners
+        [0, -cz], [0, cz], [-cx, 0], [cx, 0],        // mid-edges
+      ];
+      for (const [mx, mz] of merlonPts) {
+        box(b[PAL_STONE],
+          mx - mHalf, h + 0.05, mz - mHalf,
+          mx + mHalf, h + 0.9, mz + mHalf);
+      }
+      // Torch brazier at the center of the platform.
+      box(b[PAL_WOOD], -0.09, h + 0.05, -0.09, 0.09, h + 1.0, 0.09);
+      box(b[PAL_TORCH], -0.18, h + 1.0, -0.18, 0.18, h + 1.35, 0.18);
       break;
     }
     case 'wall': {
@@ -123,8 +168,13 @@ function buildPad(pad: ResolvedPad, b: Buckets): void {
       box(b[PAL_STONE], -hw, 0.08, -hd, hw, h, hd); // main body
       // Walkway floor on top.
       box(b[PAL_STONE], -hw, h, -hd, hw, h + 0.1, hd);
-      // Low parapet on outer face (-z side).
-      box(b[PAL_STONE], -hw, h + 0.1, -hd, hw, h + 0.7, -hd + 0.3);
+      // Low parapet on outer face (-z side) topped with crenellated merlons.
+      box(b[PAL_STONE], -hw, h + 0.1, -hd, hw, h + 0.5, -hd + 0.3);
+      const merlons = Math.max(2, Math.round(pad.w / 2.2));
+      for (let mi = 0; mi < merlons; mi++) {
+        const mx = -hw + ((mi + 0.5) / merlons) * pad.w;
+        box(b[PAL_STONE], mx - 0.35, h + 0.5, -hd, mx + 0.35, h + 1.1, -hd + 0.3);
+      }
       break;
     }
     case 'stable': {
@@ -154,8 +204,22 @@ function buildPad(pad: ResolvedPad, b: Buckets): void {
       box(b[PAL_STONE],  2.2, 0.08, -hd,  hw, h, hd);
       // Arch lintel (over the passage).
       box(b[PAL_STONE], -2.2, 2.4, -hd, 2.2, h, hd);
-      // Portcullis / door suggestion (wood plank across bottom of passage).
-      box(b[PAL_WOOD], -2.0, 0.08, -hd - 0.06, 2.0, 2.2, -hd + 0.06);
+      // Raised portcullis: vertical wood bars hanging in the arch mouth.
+      for (let pi = 0; pi < 4; pi++) {
+        const px2 = -1.5 + pi;
+        box(b[PAL_WOOD], px2 - 0.09, 1.6, -hd - 0.05, px2 + 0.09, 2.55, -hd + 0.03);
+      }
+      box(b[PAL_WOOD], -2.0, 2.35, -hd - 0.05, 2.0, 2.6, -hd + 0.03); // header bar
+      // Crimson banners hung on the outer face of each pier.
+      for (const sxb of [-1, 1]) {
+        box(b[PAL_BERRY],
+          sxb * (hw - 0.9) - 0.45, h - 3.4, -hd - 0.08,
+          sxb * (hw - 0.9) + 0.45, h - 0.6, -hd - 0.02);
+      }
+      // Torches flanking the gate.
+      for (const sxt of [-1, 1]) {
+        box(b[PAL_TORCH], sxt * 2.6 - 0.12, 2.6, -hd - 0.16, sxt * 2.6 + 0.12, 2.95, -hd - 0.02);
+      }
       // Battlements.
       const bw2 = 1.0;
       const bgap2 = 1.4;
@@ -179,25 +243,94 @@ function buildPad(pad: ResolvedPad, b: Buckets): void {
       box(b[PAL_STONE], -hw - 0.15, h, -hd - 0.15, hw + 0.15, h + 0.3, hd + 0.15);
       break;
     }
+    case 'keep': {
+      // Fortified great hall: crenellated block with corner turrets + banner.
+      box(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3); // skirt
+      box(b[PAL_STONE], -hw, 0.08, -hd, hw, h, hd); // main block
+      // Overhanging cap slab.
+      box(b[PAL_STONE], -hw - 0.3, h - 0.15, -hd - 0.3, hw + 0.3, h + 0.1, hd + 0.3);
+      // Merlons around the roof rim.
+      const kx = Math.max(2, Math.round(pad.w / 1.8));
+      const kz = Math.max(2, Math.round(pad.d / 1.8));
+      for (let i = 0; i < kx; i++) {
+        const mx = -hw + ((i + 0.5) / kx) * pad.w;
+        box(b[PAL_STONE], mx - 0.35, h + 0.1, -hd - 0.3, mx + 0.35, h + 0.85, -hd + 0.25);
+        box(b[PAL_STONE], mx - 0.35, h + 0.1, hd - 0.25, mx + 0.35, h + 0.85, hd + 0.3);
+      }
+      for (let i = 0; i < kz; i++) {
+        const mz = -hd + ((i + 0.5) / kz) * pad.d;
+        box(b[PAL_STONE], -hw - 0.3, h + 0.1, mz - 0.35, -hw + 0.25, h + 0.85, mz + 0.35);
+        box(b[PAL_STONE], hw - 0.25, h + 0.1, mz - 0.35, hw + 0.3, h + 0.85, mz + 0.35);
+      }
+      // Corner turrets rising above the roofline.
+      for (const sx of [-1, 1]) {
+        for (const sz of [-1, 1]) {
+          box(b[PAL_STONE],
+            sx * hw - 0.7, 0.08, sz * hd - 0.7,
+            sx * hw + 0.7, h + 1.7, sz * hd + 0.7);
+          box(b[PAL_STONE],
+            sx * hw - 0.85, h + 1.7, sz * hd - 0.85,
+            sx * hw + 0.85, h + 2.0, sz * hd + 0.85); // turret cap
+        }
+      }
+      // Tall double door on the -z face.
+      box(b[PAL_WOOD], -0.9, 0.08, -hd - 0.08, 0.9, 2.6, -hd + 0.02);
+      // Window insets: two rows on the front face.
+      for (const wy of [h * 0.42, h * 0.68]) {
+        for (const sx of [-1, 1]) {
+          box(b[PAL_PLASTER],
+            sx * hw * 0.5 - 0.28, wy, -hd - 0.04,
+            sx * hw * 0.5 + 0.28, wy + 0.7, -hd + 0.02);
+        }
+      }
+      // Crimson banner above the door.
+      box(b[PAL_BERRY], -0.6, h - 2.2, -hd - 0.1, 0.6, h - 0.3, -hd - 0.03);
+      // Torches flanking the entrance.
+      for (const sxt of [-1, 1]) {
+        box(b[PAL_TORCH], sxt * 1.4 - 0.12, 2.2, -hd - 0.16, sxt * 1.4 + 0.12, 2.55, -hd - 0.02);
+      }
+      break;
+    }
+    case 'stall': {
+      // Market stall: wood posts, thatch canopy, counter, crimson goods.
+      for (const sx of [-1, 1]) {
+        for (const sz of [-1, 1]) {
+          box(b[PAL_WOOD],
+            sx * (hw - 0.1) - 0.07, -0.5, sz * (hd - 0.1) - 0.07,
+            sx * (hw - 0.1) + 0.07, h, sz * (hd - 0.1) + 0.07);
+        }
+      }
+      // Canopy: main slab + lower front lip for a sloped look.
+      box(b[PAL_THATCH], -hw - 0.25, h, -hd - 0.15, hw + 0.25, h + 0.12, hd + 0.15);
+      box(b[PAL_THATCH], -hw - 0.25, h - 0.25, -hd - 0.55, hw + 0.25, h - 0.13, -hd - 0.1);
+      // Counter across the front.
+      box(b[PAL_WOOD], -hw + 0.1, 0.75, -hd - 0.05, hw - 0.1, 0.95, -hd + 0.45);
+      // Goods crate on the counter.
+      box(b[PAL_BERRY], -0.5, 0.95, -hd + 0.02, 0.1, 1.25, -hd + 0.38);
+      break;
+    }
+    case 'lamp': {
+      // Torch lamp post: pole + arm + glowing lantern.
+      box(b[PAL_WOOD], -0.07, -1, -0.07, 0.07, h, 0.07);
+      box(b[PAL_WOOD], -0.05, h - 0.1, -0.38, 0.05, h, 0.05);
+      box(b[PAL_TORCH], -0.1, h - 0.42, -0.44, 0.1, h - 0.1, -0.24);
+      break;
+    }
   }
 }
 
-/** One settlement → up to 4 world-space soups, keyed by palette index. */
+/** One settlement → up to 6 world-space soups, keyed by palette index. */
 export function buildSettlementMeshes(
   s: ResolvedSettlement,
 ): { palette: number; verts: Float32Array<ArrayBuffer> }[] {
-  const buckets: Buckets = {
-    [PAL_STONE]: [], [PAL_WOOD]: [], [PAL_THATCH]: [], [PAL_PLASTER]: [],
-  };
+  const buckets: Buckets = emptyBuckets();
   for (const pad of s.pads) {
-    const local: Buckets = {
-      [PAL_STONE]: [], [PAL_WOOD]: [], [PAL_THATCH]: [], [PAL_PLASTER]: [],
-    };
+    const local: Buckets = emptyBuckets();
     buildPad(pad, local);
     // Rotate by yaw (quantized 90° steps) then translate to world.
     const ys = Math.sin(pad.yaw);
     const yc = Math.cos(pad.yaw);
-    for (const key of [PAL_STONE, PAL_WOOD, PAL_THATCH, PAL_PLASTER] as const) {
+    for (const key of ALL_PALETTES) {
       const src = local[key];
       const dst = buckets[key];
       for (let i = 0; i < src.length; i += 3) {
@@ -213,7 +346,7 @@ export function buildSettlementMeshes(
     }
   }
   const out: { palette: number; verts: Float32Array<ArrayBuffer> }[] = [];
-  for (const key of [PAL_STONE, PAL_WOOD, PAL_THATCH, PAL_PLASTER] as const) {
+  for (const key of ALL_PALETTES) {
     if (buckets[key].length > 0) {
       out.push({ palette: key, verts: new Float32Array(buckets[key]) });
     }

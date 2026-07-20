@@ -213,6 +213,32 @@ export class ResourceManager {
   }
 
   /**
+   * Returns unharvested berry-bush positions within `radius` m of (x, z).
+   * Mirrors nearbyTreeRefs (3×3 chunk scan) — used by fire spread.
+   */
+  nearbyBushRefs(
+    x: number, z: number, radius: number, now: number,
+  ): { x: number; y: number; z: number; scale: number }[] {
+    const pcx = Math.floor(x / CHUNK_SIZE);
+    const pcz = Math.floor(z / CHUNK_SIZE);
+    const r2 = radius * radius;
+    const out: { x: number; y: number; z: number; scale: number }[] = [];
+    for (let dz = -1; dz <= 1; dz++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const cx = pcx + dx;
+        const cz = pcz + dz;
+        this.resources(cx, cz).forEach((r, i) => {
+          if (r.type !== 'bush') return;
+          if (this.registry.isHarvested(`${cx},${cz}:r${i}`, now)) return;
+          const d2 = (r.x - x) ** 2 + (r.z - z) ** 2;
+          if (d2 <= r2) out.push({ x: r.x, y: r.y, z: r.z, scale: r.scale });
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
    * Nearest standing node within `reach` m (XZ) of pos, or null. `rings`
    * widens the chunk scan (debug/e2e); `type` filters the node kind.
    */

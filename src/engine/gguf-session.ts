@@ -11,7 +11,10 @@
 
 import { initWebGPU, type GPUContext } from './gpu-device';
 import { createForwardPassEngine, MAX_ATTN_SEQ_LEN } from './forward-pass';
-import { generate, createKVSession, type SamplingConfig, type OnTokenCallback } from './generate';
+import {
+  generate, createKVSession, type SamplingConfig, type OnTokenCallback,
+  type GenerationHandle, type GenerationResult,
+} from './generate';
 import { loadGGUFModel, type LoadedGGUFModel } from '../model/gguf-loader';
 import { unloadModel, type LoadedModel } from '../model/weight-loader';
 import { createTokenizer, applyChatTemplate } from '../model/tokenizer';
@@ -19,7 +22,7 @@ import { descriptorFromGGUF, applyRopeFreqFactors } from '../model/model-descrip
 import { ggufArchitecture } from '../model/gguf';
 import { createGGUFLocator, type TensorRole } from '../model/tensor-locator';
 import { estimateVRAM } from '../model/model-config';
-import type { InferenceSession } from './inference';
+import type { InferenceSession, ForkedChatContext } from './inference';
 
 export interface GGUFSessionConfig {
   /** Repo id served by hf-hub (e.g. 'local/flux2-te-qwen3-4b-q4_k_m'). */
@@ -31,7 +34,62 @@ export interface GGUFSessionConfig {
   onStatus?: (message: string) => void;
 }
 
-export async function createGGUFInferenceSession(
+/**
+ * Shared-session cache: multiple consumers (DungeonDirector, EcologyDirector,
+ * NPC chat) load the SAME GGUF repo on the SAME device. Without dedup each one
+ * uploads its own ~3 GB copy of the weights plus a full KV cache — enough to
+ * exhaust an 8 GB adapter and lose the device. Sessions created with a caller
+ * -provided `gpu` are cached by repo+file and refcounted; the underlying model
+ * is unloaded only when every handle has been destroyed. Sessions that request
+ * their own fresh device stay uncached (standalone/CLI usage).
+ */
+interface SharedEntry {
+  promise: Promise<InferenceSession>;
+  device: GPUDevice;
+  refs: number;
+}
+const _sharedSessions = new Map<string, SharedEntry>();
+
+function shareHandle(base: InferenceSession, key: string): InferenceSession {
+  let released = false;
+  return {
+    ...base,
+    destroy: () => {
+      if (released) return;
+      released = true;
+      const entry = _sharedSessions.get(key);
+      if (entry && --entry.refs <= 0) {
+        _sharedSessions.delete(key);
+        base.destroy();
+      }
+    },
+  };
+}
+
+export function createGGUFInferenceSession(
+  cfg: GGUFSessionConfig,
+): Promise<InferenceSession> {
+  // No shared device → no dedup (fresh device per session, old behavior).
+  if (!cfg.gpu) return buildGGUFSession(cfg);
+
+  const key = `${cfg.repo}::${cfg.ggufFile}`;
+  const existing = _sharedSessions.get(key);
+  if (existing && existing.device === cfg.gpu.device) {
+    existing.refs++;
+    return existing.promise.then((s) => shareHandle(s, key));
+  }
+
+  const promise = buildGGUFSession(cfg);
+  const entry: SharedEntry = { promise, device: cfg.gpu.device, refs: 1 };
+  _sharedSessions.set(key, entry);
+  // A failed load must not poison the cache — allow retry.
+  promise.catch(() => {
+    if (_sharedSessions.get(key) === entry) _sharedSessions.delete(key);
+  });
+  return promise.then((s) => shareHandle(s, key));
+}
+
+async function buildGGUFSession(
   cfg: GGUFSessionConfig,
 ): Promise<InferenceSession> {
   const status = cfg.onStatus ?? (() => {});
@@ -145,13 +203,67 @@ export async function createGGUFInferenceSession(
   };
 
   let m: LoadedGGUFModel | null = model;
+
+  // ── Generation serialization ──────────────────────────────────────────
+  // One generation at a time per engine: concurrent generate() calls share
+  // the engine's intermediate/logit buffers, so interleaved forward passes
+  // read each other's logits — token streams cross-contaminate (observed as
+  // garbage/mixed replies when a director gen overlapped NPC chat). Every
+  // consumer of this session (default KV and all forks) queues here.
+  let genChain: Promise<unknown> = Promise.resolve();
+  const chainGen = (start: () => GenerationHandle): GenerationHandle => {
+    let inner: GenerationHandle | null = null;
+    let abortEarly = false;
+    const prior = genChain;
+    const result: Promise<GenerationResult> = (async () => {
+      await prior.catch(() => { /* a failed prior gen doesn't block us */ });
+      if (abortEarly) {
+        // Aborted while queued — never touched the GPU.
+        return {
+          text: '', tokenIds: [], numTokens: 0, promptTokens: 0,
+          totalMs: 0, tokensPerSecond: 0, stopReason: 'aborted' as const,
+        };
+      }
+      inner = start();
+      return inner.result;
+    })();
+    genChain = result.catch(() => { /* keep the chain alive on failure */ });
+    return {
+      result,
+      abort: () => { abortEarly = true; inner?.abort(); },
+    };
+  };
+
+  // Fork: a private KV session over the SAME weights/engine. Dedup'd shared
+  // sessions (Director + Ecology + NPC chat) otherwise fight over one KV
+  // cache — every consumer switch is a full ~1000-token re-prefill. Forks
+  // allocate their GPU cache lazily on first use.
+  const forkKV = (): ForkedChatContext => {
+    const kv = createKVSession(
+      Math.min(config.maxPositionEmbeddings || 8192, 8192, MAX_ATTN_SEQ_LEN));
+    return {
+      chat: (messages, sampling, onToken, opts) => chainGen(() => {
+        const tokenIds = applyChatTemplate(tokenizer, messages, opts);
+        return generate(gpu.device, engine, tokenizer, tokenIds, sampling, onToken,
+          { kvSession: kv, prefillChunk: opts?.prefillChunk });
+      }),
+      resetKV: () => {
+        if (kv.kvCache) engine.destroyKVCache(kv.kvCache);
+        kv.kvCache = null;
+        kv.cachedTokenIds = [];
+      },
+    };
+  };
+
   return {
     run: (prompt: string, sampling?: SamplingConfig, onToken?: OnTokenCallback) =>
-      generate(gpu.device, engine, tokenizer, prompt, sampling, onToken),
-    chat: (messages, sampling, onToken, opts) => {
+      chainGen(() => generate(gpu.device, engine, tokenizer, prompt, sampling, onToken)),
+    chat: (messages, sampling, onToken, opts) => chainGen(() => {
       const tokenIds = applyChatTemplate(tokenizer, messages, opts);
-      return generate(gpu.device, engine, tokenizer, tokenIds, sampling, onToken, { kvSession });
-    },
+      return generate(gpu.device, engine, tokenizer, tokenIds, sampling, onToken,
+        { kvSession, prefillChunk: opts?.prefillChunk });
+    }),
+    forkKV,
     kvSession,
     resetKV,
     config,

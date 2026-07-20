@@ -15,8 +15,8 @@ import { settlementSiteAt } from '../src/game/settlement/settlement-scatter';
 import { CHUNK_SIZE } from '../src/game/terrain/chunk-mesh';
 
 /** Update ONLY on deliberate scatter/heightfield changes. */
-// Rebaked for Phase F2 (biome-gated tree density + kind).
-const GOLDEN_HASH: number | null = 0xf723019c;
+// Rebaked for forced castle near spawn (settlement clearing moved).
+const GOLDEN_HASH: number | null = 0xeefa419e;
 
 const WORLD_SEED = 1337;
 

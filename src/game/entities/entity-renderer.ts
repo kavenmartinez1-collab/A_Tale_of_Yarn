@@ -55,6 +55,12 @@ export class EntityRenderer {
   /** Pool of reusable GPU buffers (one per visible entity slot). */
   private pool: PoolEntry[] = [];
 
+  /**
+   * Per-frame jaw override for one entity (the mounted dragon breathing
+   * fire). Set by main.ts each tick; null = all jaws closed.
+   */
+  jawOverride: { id: string; jawOpen: number } | null = null;
+
   constructor(renderer: Renderer) {
     this.renderer = renderer;
   }
@@ -121,11 +127,34 @@ export class EntityRenderer {
         walkAmp = 0.3;
       }
 
+      // Owned stay/sit: sink toward the ground (belly rest) as sit eases 0->1.
+      const sit = e.sit ?? 0;
+      if (sit > 0 && e.mode !== 'dead') {
+        yOffset -= def.size * 0.45 * sit;
+        walkAmp *= 1 - sit;
+      }
+
       const pose: AnimalPose = {
         yaw: e.yaw,
         walkPhase,
         walkAmp,
       };
+
+      // Winged species beat their wings on a time-driven phase so they keep
+      // moving even at rest (slow idle beat, full beat when walking).
+      if (e.species === 'dragon' || e.species === 'griffin') {
+        if (e.mode !== 'dead') {
+          pose.flapPhase = simTime * (e.species === 'dragon' ? 2.4 : 3.4);
+          pose.flapAmp = walkAmp > 0 ? 1 : 0.35;
+        } else {
+          pose.flapAmp = 0;
+        }
+      }
+
+      // Fire-breath jaw (mounted dragon holding the attack key).
+      if (this.jawOverride !== null && this.jawOverride.id === e.id) {
+        pose.jawOpen = this.jawOverride.jawOpen;
+      }
 
       // Write mesh into scratch (reuse Float32Array — no allocation).
       const { count } = buildAnimalMesh(e.species, pose, this.scratch, e.colorVariant);

@@ -111,33 +111,34 @@ check('ANIMAL_MAX_VERTS >= actual max across all species',
   ANIMAL_MAX_VERTS >= actualMax,
   `constant=${ANIMAL_MAX_VERTS} actual=${actualMax}`);
 
-// ANIMAL_MAX_VERTS raised to 900 to accommodate the new dragon rig (25 boxes).
-check('ANIMAL_MAX_VERTS is 900 (new dragon budget)',
-  ANIMAL_MAX_VERTS === 900,
+// ANIMAL_MAX_VERTS raised to 1944 for the Ice-and-Fire dragon rig (54 boxes).
+// (Previously 1296 for the 36-box wyvern rig, 900 for the 25-box rig.)
+check('ANIMAL_MAX_VERTS is 1944 (Ice-and-Fire dragon budget)',
+  ANIMAL_MAX_VERTS === 1944,
   `got ${ANIMAL_MAX_VERTS}`);
 
 // ---------------------------------------------------------------------------
-// Dragon vert-count band check (new rig: 25 boxes = 900 verts)
+// Dragon vert-count band check (Ice-and-Fire rig: 54 boxes = 1944 verts)
 // ---------------------------------------------------------------------------
 
-check('dragon vert count is exactly 900 (25 boxes × 36)',
-  vertCounts['dragon'] === 900,
+check('dragon vert count is exactly 1944 (54 boxes × 36)',
+  vertCounts['dragon'] === 1944,
   `got ${vertCounts['dragon']}`);
 
-check('dragon vert count > old rig (576)',
-  vertCounts['dragon'] > 576,
+check('dragon vert count > old wyvern rig (1296)',
+  vertCounts['dragon'] > 1296,
   `got ${vertCounts['dragon']}`);
 
 // ---------------------------------------------------------------------------
 // Griffin vert-count check (upgraded: 17 boxes = 612 verts)
 // ---------------------------------------------------------------------------
 
-check('griffin vert count is exactly 612 (17 boxes × 36)',
-  vertCounts['griffin'] === 612,
+check('griffin vert count is exactly 792 (22 boxes × 36)',
+  vertCounts['griffin'] === 792,
   `got ${vertCounts['griffin']}`);
 
-check('griffin vert count > old rig (468)',
-  vertCounts['griffin'] > 468,
+check('griffin vert count > old rig (612)',
+  vertCounts['griffin'] > 612,
   `got ${vertCounts['griffin']}`);
 
 // ---------------------------------------------------------------------------
@@ -338,8 +339,13 @@ for (const sp of ALL_SPECIES) {
  * Update this constant ONLY when animal-mesh.ts changes deliberately.
  * Set to null to print the new hash for baking in.
  * Old hash (16-box dragon rig): 0x00a40ea3
+ * Old hash (pre horse/donkey head-assembly rework): 0x9fd62fc8
+ * Old hash (pre wyvern dragon / raised-wing griffin rework): 0x53599487
+ * Old hash (pre Ice-and-Fire dragon rig / flap-phase wings): 0xa054c2b4
+ * Old hash (pre jawOpen / neck-bob fire-breath rig): 0xd06500ae
+ * Old hash (pre bigger flight-capable dragon wings): 0xc41146e9
  */
-const GOLDEN_HASH: number | null = 0x9fd62fc8;
+const GOLDEN_HASH: number | null = 0x876223aa;
 
 // Concatenate all species meshes at a fixed canonical pose in ALL_SPECIES order.
 const CANONICAL_POSE: AnimalPose = { yaw: 0.5, walkPhase: 1.0, walkAmp: 0.8 };

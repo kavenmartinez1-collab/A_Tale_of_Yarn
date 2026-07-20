@@ -21,7 +21,7 @@
  */
 
 import { box } from './mesh-utils';
-import type { PlacedFire } from './fire';
+import { MAX_BURNING, type BurningTree, type PlacedFire } from './fire';
 import type { PlacedTent } from './shelter';
 
 // Palette ids fed to buildFireMeshes / buildTentMeshes (dungeon shader palette indices).
@@ -33,6 +33,99 @@ export const PAL_TENT_FIBER = 4;  // thatch (warm straw for fiber tent)
 export const PAL_TENT_WOOL  = 5;  // plaster off-white (wool tent)
 export const PAL_TENT_HIDE  = 6;  // leaf-green (closest available for hide tent)
 export const PAL_TENT_POLE  = 1;  // wood brown (reuse wood palette for poles)
+
+/** Deterministic 0..1 hash for breath-cone jitter. */
+function jitter01(a: number, b: number): number {
+  let h = (Math.imul(a, 0x9e3779b1) ^ Math.imul(b, 0x85ebca6b)) >>> 0;
+  h = Math.imul(h ^ (h >>> 15), 0xc2b2ae35) >>> 0;
+  return ((h ^ (h >>> 16)) >>> 0) / 0xffffffff;
+}
+
+/** Breath cone geometry: matches the damage cone in main.ts. */
+export const BREATH_RANGE = 20;       // m
+export const BREATH_HALF_ANGLE = 0.32; // rad (~18°)
+/** Max floats buildBreathMesh can emit (boxes × 36 verts × 3 floats). */
+export const BREATH_MAX_FLOATS = 34 * 36 * 3;
+
+/**
+ * Dragon fire-breath cone — jittered emissive boxes (palette PAL_FIRE_FLAME)
+ * from the mouth outward along a 3D aim direction. Rebuilt every frame while
+ * breathing; `t` drives the flicker/jitter animation.
+ */
+export function buildBreathMesh(
+  mouth: [number, number, number],
+  dir: [number, number, number],
+  t: number,
+): Float32Array<ArrayBuffer> {
+  const [mx, my, mz] = mouth;
+  const [dx, dy, dz] = dir;
+  // Two perpendicular axes spanning the cone cross-section.
+  const hl = Math.hypot(dx, dz) || 1;
+  const rx = -dz / hl;                 // horizontal right vector
+  const rz = dx / hl;
+  const ux = -dy * (dx / hl);          // approximate up vector (dir × right)
+  const uy = hl;
+  const uz = -dy * (dz / hl);
+  const frame = Math.floor(t * 20);    // re-jitter at 20 Hz
+  const verts: number[] = [];
+  const N = 32; // keeps flame density over the 20 m cone
+  for (let i = 0; i < N; i++) {
+    const f = (i + 0.5) / N;                       // 0 near mouth → 1 at range
+    const dist = 0.35 + f * (BREATH_RANGE - 0.35); // starts right at the jaws
+    const spread = Math.tan(BREATH_HALF_ANGLE) * dist * 0.85;
+    const ja = jitter01(i, frame) * 2 - 1;
+    const jb = jitter01(i + 101, frame) * 2 - 1;
+    const cx = mx + dx * dist + rx * ja * spread + ux * jb * spread;
+    const cy = my + dy * dist + uy * jb * spread * 0.6;
+    const cz = mz + dz * dist + rz * ja * spread + uz * jb * spread;
+    const size = 0.14 + f * 0.55 + jitter01(i + 202, frame) * 0.12;
+    box(verts, cx - size, cy - size, cz - size, cx + size, cy + size, cz + size);
+  }
+  return new Float32Array(verts);
+}
+
+/** Max floats buildBurningVegMesh can emit (items × boxes × 36 verts × 3). */
+export const BURNING_VEG_MAX_FLOATS = MAX_BURNING * 5 * 36 * 3;
+
+/**
+ * Flames for burning vegetation — jittered emissive boxes (PAL_FIRE_FLAME)
+ * up a tree's trunk/canopy or over a bush. Rebuilt every frame while anything
+ * burns; `t` drives the 20 Hz flicker.
+ */
+export function buildBurningVegMesh(
+  burning: readonly BurningTree[],
+  t: number,
+): Float32Array<ArrayBuffer> {
+  const frame = Math.floor(t * 20);
+  const verts: number[] = [];
+  const n = Math.min(burning.length, MAX_BURNING);
+  for (let i = 0; i < n; i++) {
+    const b = burning[i];
+    // Per-item hash seed from world position so flames don't move in lockstep.
+    const ph = (Math.floor(b.x * 7) ^ Math.floor(b.z * 13)) | 0;
+    if (b.kind === 'bush') {
+      for (let k = 0; k < 2; k++) {
+        const jx = (jitter01(ph + k, frame) * 2 - 1) * 0.25;
+        const jz = (jitter01(ph + k + 51, frame) * 2 - 1) * 0.25;
+        const size = 0.30 + jitter01(ph + k + 102, frame) * 0.15;
+        const cy = b.y + 0.35 + k * 0.55;
+        box(verts, b.x + jx - size, cy - size, b.z + jz - size,
+          b.x + jx + size, cy + size, b.z + jz + size);
+      }
+    } else {
+      // Tree: flame column up the trunk into the canopy.
+      for (let k = 0; k < 4; k++) {
+        const jx = (jitter01(ph + k, frame) * 2 - 1) * 0.55;
+        const jz = (jitter01(ph + k + 51, frame) * 2 - 1) * 0.55;
+        const size = 0.45 + k * 0.12 + jitter01(ph + k + 102, frame) * 0.20;
+        const cy = b.y + 1.2 + k * 1.15;
+        box(verts, b.x + jx - size, cy - size, b.z + jz - size,
+          b.x + jx + size, cy + size, b.z + jz + size);
+      }
+    }
+  }
+  return new Float32Array(verts);
+}
 
 /**
  * Build batched meshes for all placed fires (lit and unlit).

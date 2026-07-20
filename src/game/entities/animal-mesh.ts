@@ -30,6 +30,15 @@ export interface AnimalPose {
   walkAmp: number;
   /** Optional independent head yaw (radians). */
   headYaw?: number;
+  /**
+   * Optional wing-flap phase (radians, time-driven by the renderer so winged
+   * species beat even at rest). Falls back to walkPhase when absent.
+   */
+  flapPhase?: number;
+  /** 0 = wings still, 1 = full beat (falls back to walkAmp). */
+  flapAmp?: number;
+  /** 0 = mouth closed, 1 = jaw fully dropped (dragon fire breath). */
+  jawOpen?: number;
 }
 
 export const ANIMAL_IDLE_POSE: AnimalPose = {
@@ -64,11 +73,13 @@ function box(
 // Rotation helpers
 // ---------------------------------------------------------------------------
 
-/** Rotation descriptor: pitch (ax=0) or yaw/twist (ax=1). */
-interface Rot { ax: 0 | 1; a: number; p0: number; p1: number }
+/** Rotation descriptor: pitch (ax=0), yaw/twist (ax=1), or roll (ax=2). */
+interface Rot { ax: 0 | 1 | 2; a: number; p0: number; p1: number }
 
 const pitch  = (a: number, py: number, pz = 0): Rot => ({ ax: 0, a, p0: py, p1: pz });
 const twistY = (a: number, px = 0, pz = 0): Rot  => ({ ax: 1, a, p0: px, p1: pz });
+/** Roll about Z through (px, py) — raises/lowers wings at the shoulder. */
+const rollZ  = (a: number, px = 0, py = 0): Rot  => ({ ax: 2, a, p0: px, p1: py });
 
 // ---------------------------------------------------------------------------
 // Part
@@ -126,6 +137,8 @@ const BASE_COLORS: Record<Species, Color3> = {
   horse:      [0.45, 0.32, 0.20],
   cow:        [0.88, 0.85, 0.80],
   donkey:     [0.58, 0.52, 0.44],
+  wolf:       [0.45, 0.46, 0.50], // steel grey
+  bear:       [0.38, 0.26, 0.16], // dark brown
   dragon:     [0.65, 0.18, 0.18], // dark crimson body
   griffin:    [0.72, 0.60, 0.28],
   sea_serpent:[0.18, 0.52, 0.48],
@@ -139,6 +152,8 @@ const BELLY_COLORS: Record<Species, Color3> = {
   horse:      [0.55, 0.42, 0.30],
   cow:        [0.60, 0.35, 0.28], // brown patch
   donkey:     [0.72, 0.68, 0.58],
+  wolf:       [0.72, 0.73, 0.75], // light grey muzzle/underside
+  bear:       [0.48, 0.35, 0.22],
   dragon:     [0.45, 0.10, 0.10], // darker underbelly
   griffin:    [0.60, 0.48, 0.20],
   sea_serpent:[0.24, 0.68, 0.62],
@@ -152,6 +167,8 @@ const ACCENT_COLORS: Record<Species, Color3> = {
   horse:      [0.20, 0.15, 0.08],
   cow:        [0.20, 0.15, 0.08],
   donkey:     [0.22, 0.18, 0.12],
+  wolf:       [0.16, 0.16, 0.18], // near-black ears / tail tip
+  bear:       [0.16, 0.11, 0.07],
   dragon:     [0.20, 0.08, 0.06], // near-black horns / ridge / membrane
   griffin:    [0.88, 0.72, 0.18],
   sea_serpent:[0.10, 0.30, 0.28],
@@ -168,7 +185,7 @@ function assembleParts(parts: Part[], pose: AnimalPose): Float32Array {
   const yc = Math.cos(pose.yaw);
   let o = 0;
   for (const p of parts) {
-    const rs: { ax: 0|1; s: number; c: number; p0: number; p1: number }[] = [];
+    const rs: { ax: 0|1|2; s: number; c: number; p0: number; p1: number }[] = [];
     for (const r of p.rots) {
       if (r.a !== 0) {
         rs.push({ ax: r.ax, s: Math.sin(r.a), c: Math.cos(r.a), p0: r.p0, p1: r.p1 });
@@ -185,12 +202,18 @@ function assembleParts(parts: Part[], pose: AnimalPose): Float32Array {
           const dz = z - r.p1;
           y = r.p0 + dy * r.c - dz * r.s;
           z = r.p1 + dy * r.s + dz * r.c;
-        } else {
+        } else if (r.ax === 1) {
           // Twist about Y through (p0=pivotX, p1=pivotZ)
           const dx = x - r.p0;
           const dz = z - r.p1;
           x = r.p0 + dx * r.c - dz * r.s;
           z = r.p1 + dx * r.s + dz * r.c;
+        } else {
+          // Roll about Z through (p0=pivotX, p1=pivotY)
+          const dx = x - r.p0;
+          const dy = y - r.p1;
+          x = r.p0 + dx * r.c - dy * r.s;
+          y = r.p1 + dx * r.s + dy * r.c;
         }
       }
       // Whole-body yaw about the world origin
@@ -217,7 +240,9 @@ function assembleParts(parts: Part[], pose: AnimalPose): Float32Array {
 // Rabbit variant: squat body — same 9 boxes
 // Deer adds: antler_L_main, antler_L_branch, antler_R_main, antler_R_branch
 //   = 13 boxes = 468 verts
-// Horse/Donkey add: neck  = 10 boxes = 360 verts
+// Horse/Donkey use a dedicated head assembly: body, leaning neck, mane
+//   crest, skull, muzzle, ear×2, leg×4, hoof×4, hanging tail
+//   = 16 boxes = 576 verts
 // Cow adds: horn_L, horn_R  = 11 boxes = 396 verts
 // ---------------------------------------------------------------------------
 
@@ -236,24 +261,26 @@ function buildQuadruped(species: Species, pose: AnimalPose, variant: number): Pa
   const isHorse  = species === 'horse' || species === 'donkey';
   const isDeer   = species === 'deer';
   const isCow    = species === 'cow';
+  const isWolf   = species === 'wolf';
+  const isBear   = species === 'bear';
 
-  const legH  = isRabbit ? s * 0.40 : isHorse ? s * 0.58 : s * 0.50;
-  const bodyH = isRabbit ? s * 0.50 : isHorse ? s * 0.38 : s * 0.40;
-  const bodyW = isRabbit ? s * 0.30 : s * 0.28;
-  const bodyL = isRabbit ? s * 0.32 : isHorse ? s * 0.55 : s * 0.44;
+  const legH  = isRabbit ? s * 0.40 : isHorse ? s * 0.58 : isWolf ? s * 0.55 : isBear ? s * 0.40 : s * 0.50;
+  const bodyH = isRabbit ? s * 0.50 : isHorse ? s * 0.38 : isBear ? s * 0.55 : s * 0.40;
+  const bodyW = isRabbit ? s * 0.30 : isWolf ? s * 0.24 : isBear ? s * 0.36 : s * 0.28;
+  const bodyL = isRabbit ? s * 0.32 : isHorse ? s * 0.55 : isWolf ? s * 0.52 : isBear ? s * 0.50 : s * 0.44;
   const legR  = s * 0.10; // leg half-width
   const legGap = bodyW * 0.5; // lateral offset of legs from centre
 
   const hipY   = legH;          // bottom of torso
   const bodyTop = legH + bodyH; // top of torso
 
-  // Head size
-  const headW = isRabbit ? s * 0.28 : isHorse ? s * 0.22 : s * 0.24;
-  const headH = isRabbit ? s * 0.34 : isHorse ? s * 0.28 : s * 0.30;
-  const headD = isRabbit ? s * 0.26 : isHorse ? s * 0.36 : s * 0.28;
+  // Head size (generic quadrupeds; horse/donkey build their own assembly)
+  const headW = isRabbit ? s * 0.28 : s * 0.24;
+  const headH = isRabbit ? s * 0.34 : s * 0.30;
+  const headD = isRabbit ? s * 0.26 : s * 0.28;
 
   // Head placement: forward of body, on top of neck (or body for small animals)
-  const neckH  = isHorse ? s * 0.32 : s * 0.10; // extra neck lift
+  const neckH  = s * 0.10; // extra neck lift
   const headY  = bodyTop + neckH;                // bottom of head box
   const headFwd = isRabbit ? bodyL * 0.6 : bodyL + headD * 0.4; // front z (faces -Z)
 
@@ -282,76 +309,129 @@ function buildQuadruped(species: Species, pose: AnimalPose, variant: number): Pa
     -bodyW, hipY, -bodyL,
      bodyW, bodyTop, bodyL));
 
+  // --- Bear shoulder hump: the signature grizzly silhouette ---
+  if (isBear) {
+    parts.push(makePart(bodyC, noRots,
+      -bodyW * 0.75, bodyTop, -bodyL * 0.55,
+       bodyW * 0.75, bodyTop + s * 0.14, bodyL * 0.05));
+  }
+
   // --- Belly stripe (slightly inset, lighter color) ---
   // (rendered as a thin slab on the underside, visible from below)
   // Skipped for simplicity — the belly is just the base color
 
-  // --- Neck (horse / donkey only) ---
+  // --- Neck + head assembly ---
+  // Horse/donkey get a dedicated build: forward-leaning neck with a mane
+  // crest, a compact skull with a long lowered muzzle, and tall ears for
+  // the donkey. This is what visually separates them from deer/cow.
+  const isDonkey = species === 'donkey';
   if (isHorse) {
-    const neckW = s * 0.14;
-    const neckD = s * 0.16;
-    // Neck: runs from bodyTop up to headY, centred at front of body
-    parts.push(makePart(bodyC, noRots,
-      -neckW, bodyTop, -(bodyL * 0.6) - neckD,
-       neckW, headY,   -(bodyL * 0.6)));
-  }
+    const lean  = isDonkey ? 0.26 : 0.38;         // forward lean (radians)
+    const neckW = s * 0.13;
+    const neckD = s * 0.20;
+    const nH    = isDonkey ? s * 0.34 : s * 0.42; // neck length along its axis
+    const zc    = -(bodyL * 0.62);                // neck base centre
+    const neckRot: Rot[] = [pitch(-lean, bodyTop, zc)];
+    // Neck: rooted just below the torso top so the joint never shows
+    parts.push(makePart(bodyC, neckRot,
+      -neckW, bodyTop - s * 0.08, zc - neckD * 0.5,
+       neckW, bodyTop + nH,       zc + neckD * 0.5));
+    // Mane crest along the back edge of the neck
+    parts.push(makePart(accentC, neckRot,
+      -s * 0.035, bodyTop, zc + neckD * 0.5,
+       s * 0.035, bodyTop + nH + s * 0.05, zc + neckD * 0.5 + s * 0.06));
+    // Neck top after the lean — head hangs off this point
+    const nTopY = bodyTop + nH * Math.cos(lean);
+    const nTopZ = zc - nH * Math.sin(lean);
+    const hRots: Rot[] = headTwist !== 0 ? [twistY(headTwist, 0, nTopZ)] : noRots;
+    // Skull
+    parts.push(makePart(bodyC, hRots,
+      -s * 0.11, nTopY - s * 0.10, nTopZ - s * 0.16,
+       s * 0.11, nTopY + s * 0.14, nTopZ + s * 0.10));
+    // Muzzle: long, lower, forward — the defining horse profile
+    parts.push(makePart(bellyC, hRots,
+      -s * 0.075, nTopY - s * 0.08, nTopZ - s * 0.40,
+       s * 0.075, nTopY + s * 0.05, nTopZ - s * 0.14));
+    // Ears (donkey: tall; horse: small and alert)
+    const eH = isDonkey ? s * 0.26 : s * 0.14;
+    const eW = s * 0.05;
+    const eX = s * 0.07;
+    parts.push(makePart(accentC, hRots,
+      -eX - eW, nTopY + s * 0.14, nTopZ - eW,
+      -eX,      nTopY + s * 0.14 + eH, nTopZ + eW));
+    parts.push(makePart(accentC, hRots,
+       eX,      nTopY + s * 0.14, nTopZ - eW,
+       eX + eW, nTopY + s * 0.14 + eH, nTopZ + eW));
+  } else {
+    // --- Head (generic) ---
+    parts.push(makePart(bodyC, headRots,
+      -headW, headY, -headFwd,
+       headW, headY + headH, -(headFwd - headD)));
 
-  // --- Head ---
-  parts.push(makePart(bodyC, headRots,
-    -headW, headY, -headFwd,
-     headW, headY + headH, -(headFwd - headD)));
+    // --- Ears ---
+    const earW = isRabbit ? s * 0.08 : isBear ? s * 0.09 : s * 0.06;
+    const earH = isRabbit ? s * 0.38 : isDeer ? s * 0.18
+      : isWolf ? s * 0.16 : isBear ? s * 0.09 : s * 0.12;
+    const earD = s * 0.06;
+    const earX = headW * 0.55;
+    const earTopY = headY + headH;
+    const earFrontZ = -(headFwd - headD * 0.2);
+    parts.push(makePart(accentC, headRots,
+      -earX - earW, earTopY, earFrontZ - earD,
+      -earX,        earTopY + earH, earFrontZ));
+    parts.push(makePart(accentC, headRots,
+       earX,        earTopY, earFrontZ - earD,
+       earX + earW, earTopY + earH, earFrontZ));
 
-  // --- Ears ---
-  const earW = isRabbit ? s * 0.08 : s * 0.06;
-  const earH = isRabbit ? s * 0.38 : isDeer ? s * 0.18 : isHorse ? s * 0.14 : s * 0.12;
-  const earD = isRabbit ? s * 0.06 : s * 0.06;
-  const earX = headW * 0.55;
-  const earTopY = headY + headH;
-  const earFrontZ = -(headFwd - headD * 0.2);
-  parts.push(makePart(accentC, headRots,
-    -earX - earW, earTopY, earFrontZ - earD,
-    -earX,        earTopY + earH, earFrontZ));
-  parts.push(makePart(accentC, headRots,
-     earX,        earTopY, earFrontZ - earD,
-     earX + earW, earTopY + earH, earFrontZ));
+    // --- Deer antlers (2 sticks each side: main tine + branch) ---
+    if (isDeer) {
+      const antW = s * 0.04;
+      const antH = s * 0.32;
+      const antBranchH = s * 0.16;
+      const antX = headW * 0.6;
+      const antY0 = earTopY + earH * 0.2;
+      const antZ  = earFrontZ - earD * 0.5;
+      // Left
+      parts.push(makePart(accentC, headRots,
+        -antX - antW, antY0, antZ - antW,
+        -antX,        antY0 + antH, antZ + antW));
+      parts.push(makePart(accentC, headRots,
+        -antX - antW * 3, antY0 + antH * 0.5, antZ - antW,
+        -antX,             antY0 + antH * 0.5 + antBranchH, antZ + antW));
+      // Right
+      parts.push(makePart(accentC, headRots,
+         antX,        antY0, antZ - antW,
+         antX + antW, antY0 + antH, antZ + antW));
+      parts.push(makePart(accentC, headRots,
+         antX,        antY0 + antH * 0.5, antZ - antW,
+         antX + antW * 3, antY0 + antH * 0.5 + antBranchH, antZ + antW));
+    }
 
-  // --- Deer antlers (2 sticks each side: main tine + branch) ---
-  if (isDeer) {
-    const antW = s * 0.04;
-    const antH = s * 0.32;
-    const antBranchH = s * 0.16;
-    const antX = headW * 0.6;
-    const antY0 = earTopY + earH * 0.2;
-    const antZ  = earFrontZ - earD * 0.5;
-    // Left
-    parts.push(makePart(accentC, headRots,
-      -antX - antW, antY0, antZ - antW,
-      -antX,        antY0 + antH, antZ + antW));
-    parts.push(makePart(accentC, headRots,
-      -antX - antW * 3, antY0 + antH * 0.5, antZ - antW,
-      -antX,             antY0 + antH * 0.5 + antBranchH, antZ + antW));
-    // Right
-    parts.push(makePart(accentC, headRots,
-       antX,        antY0, antZ - antW,
-       antX + antW, antY0 + antH, antZ + antW));
-    parts.push(makePart(accentC, headRots,
-       antX,        antY0 + antH * 0.5, antZ - antW,
-       antX + antW * 3, antY0 + antH * 0.5 + antBranchH, antZ + antW));
-  }
+    // --- Wolf / bear snout: muzzle box protruding from the head front ---
+    if (isWolf || isBear) {
+      const snW = headW * 0.55;
+      const snH = headH * 0.45;
+      const snD = isWolf ? s * 0.26 : s * 0.20; // wolf: longer, pointier
+      const snY = headY + headH * 0.15;
+      parts.push(makePart(bellyC, headRots,
+        -snW, snY, -(headFwd + snD),
+         snW, snY + snH, -(headFwd - headD * 0.15)));
+    }
 
-  // --- Cow horn nubs ---
-  if (isCow) {
-    const hornW = s * 0.05;
-    const hornH = s * 0.12;
-    const hornX = headW * 0.70;
-    const hornY0 = headY + headH * 0.85;
-    const hornZ  = -(headFwd - headD * 0.5);
-    parts.push(makePart(accentC, headRots,
-      -hornX - hornW, hornY0, hornZ - hornW,
-      -hornX,         hornY0 + hornH, hornZ + hornW));
-    parts.push(makePart(accentC, headRots,
-       hornX,         hornY0, hornZ - hornW,
-       hornX + hornW, hornY0 + hornH, hornZ + hornW));
+    // --- Cow horn nubs ---
+    if (isCow) {
+      const hornW = s * 0.05;
+      const hornH = s * 0.12;
+      const hornX = headW * 0.70;
+      const hornY0 = headY + headH * 0.85;
+      const hornZ  = -(headFwd - headD * 0.5);
+      parts.push(makePart(accentC, headRots,
+        -hornX - hornW, hornY0, hornZ - hornW,
+        -hornX,         hornY0 + hornH, hornZ + hornW));
+      parts.push(makePart(accentC, headRots,
+         hornX,         hornY0, hornZ - hornW,
+         hornX + hornW, hornY0 + hornH, hornZ + hornW));
+    }
   }
 
   // --- Legs (4): FL=front-left, FR=front-right, BL=back-left, BR=back-right ---
@@ -360,35 +440,53 @@ function buildQuadruped(species: Species, pose: AnimalPose, variant: number): Pa
   const legFZ = -(bodyL * 0.65); // front leg longitudinal centre
   const legBZ =  (bodyL * 0.65); // back leg longitudinal centre
 
-  // Front-left (FL): pitches with legPF
-  parts.push(makePart(bodyC,
-    [pitch(legPF, legPivotY)],
-    -legGap - legR, 0, legFZ - legR,
-    -legGap + legR, legH, legFZ + legR));
-  // Front-right (FR): opposite diagonal to FL (back-right same)
-  parts.push(makePart(bodyC,
-    [pitch(-legPF, legPivotY)],
-     legGap - legR, 0, legFZ - legR,
-     legGap + legR, legH, legFZ + legR));
-  // Back-left (BL): in phase with FR
-  parts.push(makePart(bodyC,
-    [pitch(-legPB, legPivotY)],
-    -legGap - legR, 0, legBZ - legR,
-    -legGap + legR, legH, legBZ + legR));
-  // Back-right (BR): in phase with FL
-  parts.push(makePart(bodyC,
-    [pitch(legPB, legPivotY)],
-     legGap - legR, 0, legBZ - legR,
-     legGap + legR, legH, legBZ + legR));
+  // Horse/donkey legs end in dark hooves; other species' legs reach y=0.
+  const hoofH = isHorse ? s * 0.07 : 0;
+  const legDefs: [x: number, z: number, pitchA: number][] = [
+    [-legGap, legFZ,  legPF], // FL: pitches with legPF
+    [ legGap, legFZ, -legPF], // FR: opposite diagonal to FL
+    [-legGap, legBZ, -legPB], // BL: in phase with FR
+    [ legGap, legBZ,  legPB], // BR: in phase with FL
+  ];
+  for (const [lx, lz, la] of legDefs) {
+    const legRot: Rot[] = [pitch(la, legPivotY)];
+    parts.push(makePart(bodyC, legRot,
+      lx - legR, hoofH, lz - legR,
+      lx + legR, legH,  lz + legR));
+    if (isHorse) {
+      const hr = legR * 1.25;
+      parts.push(makePart(accentC, legRot,
+        lx - hr, 0, lz - hr,
+        lx + hr, hoofH, lz + hr));
+    }
+  }
 
-  // --- Tail nub ---
-  const tailW = isRabbit ? s * 0.12 : s * 0.06;
-  const tailH = isRabbit ? s * 0.12 : s * 0.16;
-  const tailD = isRabbit ? s * 0.08 : s * 0.12;
-  const tailY = isRabbit ? hipY + bodyH * 0.25 : hipY + bodyH * 0.70;
-  parts.push(makePart(bellyC, noRots,
-    -tailW, tailY, bodyL,
-     tailW, tailY + tailH, bodyL + tailD));
+  // --- Tail ---
+  if (isHorse) {
+    // Hanging tail: drops well below the hip line
+    parts.push(makePart(accentC, noRots,
+      -s * 0.05, hipY - s * 0.18, bodyL - s * 0.02,
+       s * 0.05, hipY + bodyH * 0.80, bodyL + s * 0.09));
+  } else if (isWolf) {
+    // Bushy tail angled up-and-back
+    const tRot: Rot[] = [pitch(-0.45, hipY + bodyH * 0.5, bodyL)];
+    parts.push(makePart(accentC, tRot,
+      -s * 0.07, hipY + bodyH * 0.30, bodyL,
+       s * 0.07, hipY + bodyH * 0.55, bodyL + s * 0.42));
+  } else if (isBear) {
+    // Stub tail
+    parts.push(makePart(accentC, noRots,
+      -s * 0.05, hipY + bodyH * 0.55, bodyL,
+       s * 0.05, hipY + bodyH * 0.55 + s * 0.08, bodyL + s * 0.06));
+  } else {
+    const tailW = isRabbit ? s * 0.12 : s * 0.06;
+    const tailH = isRabbit ? s * 0.12 : s * 0.16;
+    const tailD = isRabbit ? s * 0.08 : s * 0.12;
+    const tailY = isRabbit ? hipY + bodyH * 0.25 : hipY + bodyH * 0.70;
+    parts.push(makePart(bellyC, noRots,
+      -tailW, tailY, bodyL,
+       tailW, tailY + tailH, bodyL + tailD));
+  }
 
   return parts;
 }
@@ -495,21 +593,22 @@ function buildBird(species: Species, pose: AnimalPose, variant: number): Part[] 
 }
 
 // ---------------------------------------------------------------------------
-// Body plan: DRAGON — Minecraft-dragon / Ice-and-Fire inspired blocky rig
+// Body plan: DRAGON — Ice-and-Fire-style rig: long segmented neck & tail,
+// fan-finger bat wings, twin horn pairs, spike rows down the spine.
 //
-// Part list (25 boxes = 900 verts):
-//   Head group  (4): main head, snout, horn_L, horn_R
-//   Neck        (2): neck_lower, neck_upper   (S-curve stepping up to head)
-//   Body        (1): bulky chest/torso
-//   Back ridge  (4): spine plates along body top
-//   Wings       (6): upper_arm_L, panel_L1, panel_L2,
-//                    upper_arm_R, panel_R1, panel_R2
-//   Legs        (4): leg_FL, leg_FR, leg_BL, leg_BR   (thick, dragon-clawed)
-//   Tail        (4): tail_seg1, tail_seg2, tail_seg3, tail_spade
+// Part list (54 boxes = 1944 verts):
+//   Torso       (3): chest, hindquarters (tapered), belly plate
+//   Neck        (4): tapering segments pitched along an arc up to the head
+//   Neck spikes (2): small spikes on the neck ridge
+//   Head group  (7): skull, long snout, open lower jaw, horn pair ×2
+//   Back ridge  (4): spine plates along the torso
+//   Legs        (8): 4 legs + 4 clawed feet
+//   Wings      (16): humerus + 4 bony fingers + 3 membrane panels — per side,
+//                    rolled up at the shoulder (rollZ) and fanned back (twistY)
+//   Tail       (10): 6 tapering segments + vertical fin + 3 tail spikes
 //
-// Colors: dark-crimson body, darker belly/membrane, near-black horns/ridge.
-// Walk animation: leg swing (existing style) + wing membrane fold/unfold
-//   driven by walkPhase×walkAmp, tail lateral sway on walkPhase.
+// Colors: dark-crimson body, darker belly/membrane, near-black horns/ridge/
+//   claws/fingers. Wings beat on flapPhase (time-driven) even at rest.
 // ---------------------------------------------------------------------------
 
 function buildDragon(species: Species, pose: AnimalPose, variant: number): Part[] {
@@ -526,418 +625,352 @@ function buildDragon(species: Species, pose: AnimalPose, variant: number): Part[
   ];
 
   // ----- Proportions -----
-  const legH  = s * 0.42;   // hip height (shorter, hunkered dragon stance)
-  const bodyH = s * 0.34;   // torso height
-  const bodyW = s * 0.36;   // half-width (visibly wide)
-  const bodyL = s * 0.58;   // half-length
+  const legH  = s * 0.40;   // hip height (hunkered stance)
+  const bodyH = s * 0.32;   // torso height
+  const bodyW = s * 0.28;   // chest half-width
+  const bodyL = s * 0.55;   // half-length
 
   const hipY    = legH;
   const bodyTop = legH + bodyH;
 
-  // ----- Neck (2 segments, S-curve) -----
-  // Lower neck: rises from front of body, slightly forward lean
-  const neckLoW = s * 0.20;   // half-width
-  const neckLoH = s * 0.26;   // height of lower neck segment
-  const neckLoD = s * 0.22;   // depth
-  const neckLoZ = -(bodyL * 0.62); // attaches to front of body
-  const neckLoY0 = bodyTop;
-  // Upper neck: continues upward and slightly more forward, tapering
-  const neckHiW = s * 0.16;
-  const neckHiH = s * 0.28;
-  const neckHiD = s * 0.18;
-  const neckHiZ = neckLoZ - neckLoD * 0.4; // overlap slightly forward
-  const neckHiY0 = neckLoY0 + neckLoH * 0.75;
-
-  // ----- Head (angular, 2 sub-boxes: main skull + snout) -----
-  const headW = s * 0.26;   // half-width (angular / boxy)
-  const headH = s * 0.24;   // height of skull box
-  const headD = s * 0.28;   // depth of skull box
-  const headY = neckHiY0 + neckHiH * 0.80; // sits on top of upper neck
-  const skullFwdZ = neckHiZ - headD * 0.30; // front face of skull
-
-  // Snout: narrower, lower box projecting forward from skull
-  const snoutW = s * 0.18;
-  const snoutH = s * 0.14;
-  const snoutD = s * 0.24;
-  const snoutY = headY + headH * 0.08; // slightly below top of skull
-  const snoutFwdZ = skullFwdZ - snoutD; // extends further forward
-
-  // ----- Horns — two swept-back boxes on top of skull -----
-  const hornW = s * 0.06;
-  const hornH = s * 0.28;   // tall horns
-  const hornX = headW * 0.60;
-  const hornY0 = headY + headH * 0.70;
-  const hornZ  = skullFwdZ + headD * 0.70; // toward back of skull
-
-  // ----- Head yaw -----
-  const headYaw = pose.headYaw ?? 0;
-  // Pivot at the base-centre of the skull
-  const headPivotZ = skullFwdZ + headD * 0.5;
-  const headRots: Rot[] = headYaw !== 0
-    ? [twistY(headYaw, 0, headPivotZ)]
-    : [];
-
-  // ----- Walk animation -----
-  const swing    = Math.sin(pose.walkPhase) * pose.walkAmp;
-  const legPF    =  swing * 0.48;
-  const legPB    = -swing * 0.48;
-  const legPivotY = hipY;
-  const legR     = s * 0.15;  // thick legs
-  const legGap   = bodyW * 0.58;
-  const legFZ    = -(bodyL * 0.58);
-  const legBZ    =  (bodyL * 0.58);
-
-  // ----- Tail (3 tapering segments + spade) -----
-  // Lateral sway with walkPhase; phase offsets increase down the tail.
-  const tailRoot = bodyL; // tail begins at back of body
-
-  const tail1W = s * 0.24;
-  const tail1H = s * 0.26;
-  const tail1D = s * 0.42;
-  const tail1Y = hipY + bodyH * 0.26;
-  const sway1  = Math.sin(pose.walkPhase)         * pose.walkAmp * 0.25;
-  const tail1Rots: Rot[] = [twistY(sway1, 0, tailRoot)];
-
-  const tail2W = s * 0.16;
-  const tail2H = s * 0.18;
-  const tail2D = s * 0.36;
-  const tail2Y = hipY + bodyH * 0.16;
-  const sway2  = Math.sin(pose.walkPhase + 0.55)  * pose.walkAmp * 0.35;
-  const tail2Rots: Rot[] = [twistY(sway2, 0, tailRoot + tail1D)];
-
-  const tail3W = s * 0.10;
-  const tail3H = s * 0.12;
-  const tail3D = s * 0.28;
-  const tail3Y = hipY + bodyH * 0.08;
-  const sway3  = Math.sin(pose.walkPhase + 1.10)  * pose.walkAmp * 0.45;
-  const tail3Rots: Rot[] = [twistY(sway3, 0, tailRoot + tail1D + tail2D)];
-
-  // Spade/fin tip box (flat wide box)
-  const spadeW = s * 0.18;
-  const spadeH = s * 0.06;
-  const spadeD = s * 0.16;
-  const spadeY = tail3Y + tail3H * 0.5 - spadeH * 0.5;
-  const spadeZ = tailRoot + tail1D + tail2D + tail3D;
-  const sway4  = Math.sin(pose.walkPhase + 1.60)  * pose.walkAmp * 0.50;
-  const spadeRots: Rot[] = [twistY(sway4, 0, spadeZ)];
-
-  // ----- Wings — hinge at shoulder, fold/unfold with walkPhase -----
-  // Resting position: wings folded along body (flat panel angled slightly up).
-  // When walking, the panels sway outward/up on the beat.
-  const wingShoulderY = bodyTop - bodyH * 0.12; // just below top of body
-
-  // Upper arm box (short, muscular — connects body to membrane)
-  const uarmW = s * 0.12;
-  const uarmH = s * 0.14;
-  const uarmL = s * 0.28; // extends outward from body
-
-  // Membrane panels: two flat wide panels hinged at the upper arm tip.
-  // Panel 1: inner/proximal membrane
-  // Panel 2: outer/distal membrane
-  const mem1W = s * 0.38;  // lateral spread of inner panel
-  const mem1H = s * 0.06;  // thin flat panel
-  const mem1D = s * 0.50;  // fore-aft span
-
-  const mem2W = s * 0.32;
-  const mem2H = s * 0.05;
-  const mem2D = s * 0.44;
-
-  // Fold angle: at rest, panels tuck along body at ~15° from vertical.
-  // At walkAmp=1, the flap drives the panels 20° up and back.
-  const foldBase = 0.26; // radians from horizontal (folded-in default)
-  const flapDelta = Math.sin(pose.walkPhase) * pose.walkAmp * 0.22;
-  const wingAngle_L = -(foldBase + flapDelta); // left: pitch up (negative = up)
-  const wingAngle_R =  (foldBase + flapDelta); // right: pitch up (positive = up)
-
-  // Upper-arm pivot: at shoulder (body side, wingShoulderY)
-  const uarmPivotY_L = wingShoulderY;
-  const uarmPivotY_R = wingShoulderY;
-
-  // Upper arm rests horizontal then pitches with fold
-  const uarmRots_L: Rot[] = [pitch(wingAngle_L, uarmPivotY_L)];
-  const uarmRots_R: Rot[] = [pitch(wingAngle_R, uarmPivotY_R)];
-
-  // Membrane panels rotate further from body side — they follow the upper arm
-  // plus an additional droop angle simulating membrane hang.
-  const droopExtra = 0.18;
-  const mem1Rots_L: Rot[] = [pitch(wingAngle_L - droopExtra, wingShoulderY)];
-  const mem1Rots_R: Rot[] = [pitch(wingAngle_R + droopExtra, wingShoulderY)];
-  const mem2Rots_L: Rot[] = [pitch(wingAngle_L - droopExtra * 1.6, wingShoulderY)];
-  const mem2Rots_R: Rot[] = [pitch(wingAngle_R + droopExtra * 1.6, wingShoulderY)];
-
-  // ----- Back ridge plates (4 along spine) -----
-  const ridgeW = s * 0.05;
-  const ridgeH = s * 0.18;
-  const ridgeD = s * 0.07;
-  // Evenly spaced across body Z
-  const ridgeZs = [
-    -bodyL * 0.55,
-    -bodyL * 0.18,
-     bodyL * 0.18,
-     bodyL * 0.55,
-  ];
-
-  // ==========================================================================
-  // Assemble parts
-  // ==========================================================================
+  // ----- Animation drivers -----
+  const swing = Math.sin(pose.walkPhase) * pose.walkAmp;
+  const legPF =  swing * 0.48;
+  const legPB = -swing * 0.48;
+  // Wings beat on their own time-driven phase so they move even at rest.
+  const flapPhase = pose.flapPhase ?? pose.walkPhase;
+  const flapAmp = pose.flapAmp ?? pose.walkAmp;
 
   const parts: Part[] = [];
 
-  // --- Body (bulky chest) ---
+  // ----- Torso: deep chest + tapered hindquarters + belly plate -----
   parts.push(makePart(bodyC, [],
-    -bodyW, hipY,    -bodyL,
-     bodyW, bodyTop,  bodyL));
-
-  // --- Neck lower ---
+    -bodyW, hipY, -bodyL,
+     bodyW, bodyTop, bodyL * 0.30));
   parts.push(makePart(bodyC, [],
-    -neckLoW, neckLoY0, neckLoZ - neckLoD,
-     neckLoW, neckLoY0 + neckLoH, neckLoZ));
+    -bodyW * 0.78, hipY + s * 0.02, bodyL * 0.10,
+     bodyW * 0.78, bodyTop - s * 0.04, bodyL));
+  parts.push(makePart(bellyC, [],
+    -bodyW * 0.68, hipY - s * 0.06, -bodyL * 0.85,
+     bodyW * 0.68, hipY + s * 0.06, bodyL * 0.25));
 
-  // --- Neck upper ---
-  parts.push(makePart(bodyC, [],
-    -neckHiW, neckHiY0, neckHiZ - neckHiD,
-     neckHiW, neckHiY0 + neckHiH, neckHiZ));
-
-  // --- Skull ---
-  parts.push(makePart(bodyC, headRots,
-    -headW, headY, skullFwdZ,
-     headW, headY + headH, skullFwdZ + headD));
-
-  // --- Snout (distinct narrower box, slightly open jaw implied by placement) ---
-  parts.push(makePart(bellyC, headRots,
-    -snoutW, snoutY, snoutFwdZ,
-     snoutW, snoutY + snoutH, snoutFwdZ + snoutD));
-
-  // --- Horns (swept back — both tilt via slight pitch baked into position) ---
-  parts.push(makePart(accentC, headRots,
-    -hornX - hornW, hornY0, hornZ - hornW,
-    -hornX,          hornY0 + hornH, hornZ + hornW * 1.5));
-  parts.push(makePart(accentC, headRots,
-     hornX,          hornY0, hornZ - hornW,
-     hornX + hornW,  hornY0 + hornH, hornZ + hornW * 1.5));
-
-  // --- Back ridge plates ---
-  for (const rz of ridgeZs) {
+  // ----- Neck: 4 tapering segments swept up an arc toward the head -----
+  // Each is built vertical then pitched forward about its own base; the next
+  // segment's base continues from the rotated tip.
+  let nBaseY = bodyTop - s * 0.05;
+  let nBaseZ = -bodyL * 0.85;
+  const neckSegs = [
+    { hw: s * 0.160, hd: s * 0.180, len: s * 0.26, lean: 0.70 },
+    { hw: s * 0.140, hd: s * 0.155, len: s * 0.26, lean: 0.45 },
+    { hw: s * 0.120, hd: s * 0.135, len: s * 0.26, lean: 0.22 },
+    { hw: s * 0.100, hd: s * 0.115, len: s * 0.24, lean: 0.05 },
+  ];
+  // Subtle flap-driven bob so the neck never looks frozen.
+  // Scaled purely by flapAmp: amp 0 must stay phase-independent (test contract).
+  const neckBob = Math.sin(flapPhase * 0.8) * 0.08 * flapAmp;
+  const neckTops: [number, number][] = [];
+  for (const seg of neckSegs) {
+    const lean = seg.lean + neckBob;
+    parts.push(makePart(bodyC, [pitch(-lean, nBaseY, nBaseZ)],
+      -seg.hw, nBaseY - s * 0.03, nBaseZ - seg.hd,
+       seg.hw, nBaseY + seg.len, nBaseZ + seg.hd));
+    nBaseY += seg.len * Math.cos(lean);
+    nBaseZ -= seg.len * Math.sin(lean);
+    neckTops.push([nBaseY, nBaseZ]);
+  }
+  // Neck spikes: small blades along the back of the neck arc.
+  for (const i of [0, 2]) {
+    const [ny, nz] = neckTops[i];
     parts.push(makePart(accentC, [],
-      -ridgeW, bodyTop, rz - ridgeD,
-       ridgeW, bodyTop + ridgeH, rz + ridgeD));
+      -s * 0.03, ny - s * 0.02, nz + s * 0.10,
+       s * 0.03, ny + s * 0.10, nz + s * 0.17));
   }
 
-  // --- Legs (4 — thick, dragon-clawed) ---
-  parts.push(makePart(bodyC, [pitch( legPF, legPivotY)],
-    -legGap - legR, 0, legFZ - legR,
-    -legGap + legR, legH, legFZ + legR));
-  parts.push(makePart(bodyC, [pitch(-legPF, legPivotY)],
-     legGap - legR, 0, legFZ - legR,
-     legGap + legR, legH, legFZ + legR));
-  parts.push(makePart(bodyC, [pitch(-legPB, legPivotY)],
-    -legGap - legR, 0, legBZ - legR,
-    -legGap + legR, legH, legBZ + legR));
-  parts.push(makePart(bodyC, [pitch( legPB, legPivotY)],
-     legGap - legR, 0, legBZ - legR,
-     legGap + legR, legH, legBZ + legR));
+  // ----- Head: skull + long snout + open jaw + two horn pairs -----
+  const headW = s * 0.17;
+  const headH = s * 0.19;
+  const headD = s * 0.26;
+  const headY = nBaseY - s * 0.02;   // skull base
+  const headZ = nBaseZ;              // skull centre (also head-yaw pivot)
+  const headYaw = pose.headYaw ?? 0;
+  const headRots: Rot[] = headYaw !== 0 ? [twistY(headYaw, 0, headZ)] : [];
+  const skullFront = headZ - headD * 0.60;
 
-  // --- Wings (left side) ---
-  // Upper arm (shoulder → wing-root, extends left / -X)
-  parts.push(makePart(bodyC, uarmRots_L,
-    -bodyW - uarmL, wingShoulderY,          -uarmW,
-    -bodyW,          wingShoulderY + uarmH,  uarmW));
-  // Inner membrane panel 1
-  parts.push(makePart(membraneC, mem1Rots_L,
-    -bodyW - uarmL - mem1W, wingShoulderY,         -mem1D * 0.5,
-    -bodyW - uarmL,          wingShoulderY + mem1H,  mem1D * 0.5));
-  // Outer membrane panel 2
-  parts.push(makePart(membraneC, mem2Rots_L,
-    -bodyW - uarmL - mem1W - mem2W, wingShoulderY,         -mem2D * 0.4,
-    -bodyW - uarmL - mem1W,          wingShoulderY + mem2H,  mem2D * 0.4));
+  parts.push(makePart(bodyC, headRots,
+    -headW, headY, skullFront,
+     headW, headY + headH, headZ + headD * 0.35));
+  // Long snout projecting well forward of the skull.
+  parts.push(makePart(bodyC, headRots,
+    -s * 0.115, headY + s * 0.055, skullFront - s * 0.30,
+     s * 0.115, headY + s * 0.145, skullFront + s * 0.02));
+  // Lower jaw: darker, hinged at the skull — drops wide open for fire breath.
+  const jawHingeY = headY + s * 0.045;
+  const jawPitch = 0.10 + (pose.jawOpen ?? 0) * 0.45;
+  parts.push(makePart(bellyC,
+    [pitch(-jawPitch, jawHingeY, headZ), ...headRots],
+    -s * 0.095, headY - s * 0.045, skullFront - s * 0.26,
+     s * 0.095, headY + s * 0.02, headZ + s * 0.02));
+  // Two horn pairs on the skull rear, swept back.
+  const hornY0 = headY + headH * 0.85;
+  const hornZ = headZ + headD * 0.15;
+  const hornDefs: [number, number, number, number][] = [
+    // [xOffset, halfWidth, length, sweep]
+    [headW * 0.68, s * 0.040, s * 0.34, 0.85],
+    [headW * 0.30, s * 0.030, s * 0.20, 0.70],
+  ];
+  for (const [hx, hwid, hlen, sweep] of hornDefs) {
+    for (const side of [-1, 1]) {
+      parts.push(makePart(accentC,
+        [pitch(sweep, hornY0, hornZ), ...headRots],
+        side * hx - hwid, hornY0, hornZ - hwid,
+        side * hx + hwid, hornY0 + hlen, hornZ + hwid));
+    }
+  }
 
-  // --- Wings (right side) ---
-  parts.push(makePart(bodyC, uarmRots_R,
-     bodyW,          wingShoulderY,         -uarmW,
-     bodyW + uarmL,  wingShoulderY + uarmH,  uarmW));
-  parts.push(makePart(membraneC, mem1Rots_R,
-     bodyW + uarmL,          wingShoulderY,         -mem1D * 0.5,
-     bodyW + uarmL + mem1W,  wingShoulderY + mem1H,  mem1D * 0.5));
-  parts.push(makePart(membraneC, mem2Rots_R,
-     bodyW + uarmL + mem1W,          wingShoulderY,         -mem2D * 0.4,
-     bodyW + uarmL + mem1W + mem2W,  wingShoulderY + mem2H,  mem2D * 0.4));
+  // ----- Legs + clawed feet (feet share the leg's swing) -----
+  const legDefs: [number, number, number, number][] = [
+    // [x, z, pitchAngle, legHalfWidth]
+    [-bodyW * 0.70, -bodyL * 0.60,  legPF, s * 0.12],
+    [ bodyW * 0.70, -bodyL * 0.60, -legPF, s * 0.12],
+    [-bodyW * 0.60,  bodyL * 0.62, -legPB, s * 0.13],
+    [ bodyW * 0.60,  bodyL * 0.62,  legPB, s * 0.13],
+  ];
+  for (const [lx, lz, la, lr] of legDefs) {
+    const rots: Rot[] = [pitch(la, hipY)];
+    parts.push(makePart(bodyC, rots,
+      lx - lr, s * 0.06, lz - lr,
+      lx + lr, hipY + s * 0.06, lz + lr));
+    // Claw foot: darker, flat, projecting forward.
+    parts.push(makePart(accentC, rots,
+      lx - lr * 1.1, 0, lz - lr - s * 0.10,
+      lx + lr * 1.1, s * 0.09, lz + lr));
+  }
 
-  // --- Tail ---
-  parts.push(makePart(bodyC, tail1Rots,
-    -tail1W, tail1Y, tailRoot,
-     tail1W, tail1Y + tail1H, tailRoot + tail1D));
-  parts.push(makePart(bellyC, tail2Rots,
-    -tail2W, tail2Y, tailRoot + tail1D,
-     tail2W, tail2Y + tail2H, tailRoot + tail1D + tail2D));
-  parts.push(makePart(bellyC, tail3Rots,
-    -tail3W, tail3Y, tailRoot + tail1D + tail2D,
-     tail3W, tail3Y + tail3H, tailRoot + tail1D + tail2D + tail3D));
-  parts.push(makePart(accentC, spadeRots,
-    -spadeW, spadeY, spadeZ,
-     spadeW, spadeY + spadeH, spadeZ + spadeD));
+  // ----- Wings: bat-wing fan — humerus + 4 bony fingers + 3 membranes -----
+  // Each finger is a thin dark spar radiating from the wrist, swept back by an
+  // increasing twistY; membranes fill the gaps between fingers. The whole wing
+  // is rolled up at the shoulder (rollZ) and beats on flapPhase.
+  const shoulderY = bodyTop - s * 0.04;
+  const shoulderZ = -bodyL * 0.35;
+  const wristOff = s * 0.34;
+  const raise = 0.46 + Math.sin(flapPhase) * flapAmp * 0.50;
+  const fingers: [number, number][] = [
+    // [length, sweep-back angle] — spans sized so the wings read as able to
+    // actually lift the body (roughly wingspan ≈ 2× body length).
+    [s * 1.12, -0.10],
+    [s * 1.02,  0.28],
+    [s * 0.88,  0.66],
+    [s * 0.70,  1.05],
+  ];
+  const membranes: [number, number][] = [
+    [s * 0.95, 0.09],
+    [s * 0.82, 0.47],
+    [s * 0.62, 0.85],
+  ];
+  for (const side of [-1, 1] as const) {
+    const wristX = side * (bodyW + wristOff);
+    const lift = rollZ(side * (raise + 0.18), side * bodyW, shoulderY);
+    /** Box x-range between lateral offsets a..b from the body side. */
+    const spanX = (a: number, b: number): [number, number] =>
+      side < 0 ? [-bodyW - b, -bodyW - a] : [bodyW + a, bodyW + b];
+    // Humerus: muscular root from shoulder out to the wrist.
+    const [h0, h1] = spanX(-s * 0.05, wristOff + s * 0.02);
+    parts.push(makePart(bodyC,
+      [rollZ(side * raise, side * bodyW, shoulderY)],
+      h0, shoulderY - s * 0.055, shoulderZ - s * 0.09,
+      h1, shoulderY + s * 0.055, shoulderZ + s * 0.11));
+    // Bony fingers fanning back from the wrist.
+    for (const [len, sweep] of fingers) {
+      const [f0, f1] = spanX(wristOff, wristOff + len);
+      parts.push(makePart(accentC,
+        [twistY(side * sweep, wristX, shoulderZ), lift],
+        f0, shoulderY - s * 0.022, shoulderZ - s * 0.035,
+        f1, shoulderY + s * 0.022, shoulderZ + s * 0.035));
+    }
+    // Membrane panels between the fingers.
+    for (const [len, sweep] of membranes) {
+      const [m0, m1] = spanX(wristOff + s * 0.02, wristOff + len);
+      parts.push(makePart(membraneC,
+        [twistY(side * sweep, wristX, shoulderZ), lift],
+        m0, shoulderY - s * 0.010, shoulderZ - s * 0.110,
+        m1, shoulderY + s * 0.010, shoulderZ + s * 0.110));
+    }
+  }
+
+  // ----- Tail: 6 tapering segments + vertical fin + spikes, lateral sway ---
+  const tailSegs = [
+    { hw: s * 0.160, h: s * 0.200, d: s * 0.30 },
+    { hw: s * 0.138, h: s * 0.175, d: s * 0.30 },
+    { hw: s * 0.116, h: s * 0.150, d: s * 0.30 },
+    { hw: s * 0.095, h: s * 0.125, d: s * 0.30 },
+    { hw: s * 0.075, h: s * 0.100, d: s * 0.28 },
+    { hw: s * 0.055, h: s * 0.070, d: s * 0.26 },
+  ];
+  let ty = hipY + bodyH * 0.30;
+  let tz = bodyL;
+  const tailSpikes: [number, number, Rot[]][] = [];
+  for (let i = 0; i < tailSegs.length; i++) {
+    const seg = tailSegs[i];
+    const rots: Rot[] = [twistY(
+      Math.sin(pose.walkPhase + i * 0.35) * pose.walkAmp * (0.20 + i * 0.06),
+      0, tz)];
+    parts.push(makePart(i < 3 ? bodyC : bellyC, rots,
+      -seg.hw, ty, tz, seg.hw, ty + seg.h, tz + seg.d));
+    if (i === 0 || i === 2 || i === 4) {
+      tailSpikes.push([ty + seg.h, tz + seg.d * 0.5, rots]);
+    }
+    tz += seg.d;
+    ty -= s * 0.030;
+  }
+  // Vertical tail fin (blade) at the tip.
+  parts.push(makePart(accentC,
+    [twistY(Math.sin(pose.walkPhase + 6 * 0.35) * pose.walkAmp * 0.55, 0, tz)],
+    -s * 0.030, ty - s * 0.01, tz - s * 0.04,
+     s * 0.030, ty + s * 0.20, tz + s * 0.14));
+  // Tail spikes riding on their segment's sway.
+  for (const [sy, sz, rots] of tailSpikes) {
+    parts.push(makePart(accentC, rots,
+      -s * 0.028, sy - s * 0.01, sz - s * 0.05,
+       s * 0.028, sy + s * 0.09, sz + s * 0.05));
+  }
+
+  // ----- Back ridge: 4 plates along the torso spine ----
+  const ridgeDefs: [number, number, number][] = [
+    // [z, baseY, height]
+    [-bodyL * 0.60, bodyTop,            s * 0.16],
+    [-bodyL * 0.20, bodyTop,            s * 0.19],
+    [ bodyL * 0.25, bodyTop - s * 0.04, s * 0.16],
+    [ bodyL * 0.65, bodyTop - s * 0.04, s * 0.12],
+  ];
+  for (const [rz, ry, rh] of ridgeDefs) {
+    parts.push(makePart(accentC, [],
+      -s * 0.045, ry, rz - s * 0.07,
+       s * 0.045, ry + rh, rz + s * 0.07));
+  }
 
   return parts;
 }
 
 // ---------------------------------------------------------------------------
-// Body plan: GRIFFIN
-// quadruped body + bird head/beak + folded wings + feather tail + eagle ears
-// body(1) + head(1) + beak(1) + ear_L(1) + ear_R(1)
-// + leg_FL(1) + leg_FR(1) + leg_BL(1) + leg_BR(1)
-// + wing_uarm_L(1) + wing_panel_L1(1) + wing_panel_L2(1)
-// + wing_uarm_R(1) + wing_panel_R1(1) + wing_panel_R2(1)
-// + tail(1) + neck(1)
-// = 17 boxes = 612 verts
+// Body plan: GRIFFIN — eagle front / lion rear with raised feathered wings
+//
+// Part list (22 boxes = 792 verts):
+//   Torso  (3): feathered chest, lion hindquarters, pale belly
+//   Neck   (1): leaning eagle neck
+//   Head   (4): eagle head, hooked beak, ear tuft ×2
+//   Legs   (4)
+//   Wings  (8): humerus + feather panel ×2 + dark tip — per side, rolled up
+//               at the shoulder (rollZ) like the dragon
+//   Tail   (2): thin lion tail + feather fan tip
 // ---------------------------------------------------------------------------
 
 function buildGriffin(species: Species, pose: AnimalPose, variant: number): Part[] {
   const s = SPECIES_DEFS[species].size;
-  const bodyC   = applyVariant(BASE_COLORS[species], variant);
+  const bodyC   = applyVariant(BASE_COLORS[species], variant); // tawny gold
   const bellyC  = BELLY_COLORS[species];
-  const accentC = ACCENT_COLORS[species];
+  const accentC = ACCENT_COLORS[species];                      // bright gold
 
-  const legH  = s * 0.50;
-  const bodyH = s * 0.36;
-  const bodyW = s * 0.28;
-  const bodyL = s * 0.50;
-
+  const legH  = s * 0.48;
+  const bodyH = s * 0.34;
+  const bodyW = s * 0.26;
+  const bodyL = s * 0.52;
   const hipY    = legH;
   const bodyTop = legH + bodyH;
 
-  const neckW = s * 0.14;
-  const neckH = s * 0.30;
-  const neckZ = -(bodyL * 0.55);
-
-  // Bird-like head
-  const headR = s * 0.22;
-  const headY = bodyTop + neckH;
-  const headFwdZ = neckZ - headR * 2;
-
-  const swing  = Math.sin(pose.walkPhase) * pose.walkAmp;
-  const legPF  =  swing * 0.50;
-  const legPB  = -swing * 0.50;
-  const legPivotY = hipY;
-  const legR   = s * 0.10;
-  const legGap = bodyW * 0.50;
-  const legFZ  = -(bodyL * 0.60);
-  const legBZ  =  (bodyL * 0.60);
-
-  // Wing flap (membrane upgrade matching dragon technique)
-  const flapAngle = Math.sin(pose.walkPhase) * pose.walkAmp * 0.55;
-  const foldBase  = 0.20; // resting fold angle
-  const wingPivotY = bodyTop - bodyH * 0.10;
-
-  // Upper arm
-  const uarmW = s * 0.10;
-  const uarmH = s * 0.12;
-  const uarmL = s * 0.24;
-
-  // Two membrane panels per side
-  const mem1W = s * 0.30;
-  const mem1H = s * 0.05;
-  const mem1D = s * 0.42;
-  const mem2W = s * 0.24;
-  const mem2H = s * 0.04;
-  const mem2D = s * 0.36;
-
-  const droopExtra = 0.14;
-  const wingAngle_L = -(foldBase + flapAngle);
-  const wingAngle_R =  (foldBase + flapAngle);
-
-  const uarmRots_L:  Rot[] = [pitch(wingAngle_L, wingPivotY)];
-  const uarmRots_R:  Rot[] = [pitch(wingAngle_R, wingPivotY)];
-  const mem1Rots_L:  Rot[] = [pitch(wingAngle_L - droopExtra, wingPivotY)];
-  const mem1Rots_R:  Rot[] = [pitch(wingAngle_R + droopExtra, wingPivotY)];
-  const mem2Rots_L:  Rot[] = [pitch(wingAngle_L - droopExtra * 1.5, wingPivotY)];
-  const mem2Rots_R:  Rot[] = [pitch(wingAngle_R + droopExtra * 1.5, wingPivotY)];
-
-  const headYaw = pose.headYaw ?? 0;
-  const headRots: Rot[] = headYaw !== 0
-    ? [twistY(headYaw, 0, headFwdZ + headR)]
-    : [];
+  const swing = Math.sin(pose.walkPhase) * pose.walkAmp;
+  const legPF =  swing * 0.50;
+  const legPB = -swing * 0.50;
 
   const parts: Part[] = [];
 
-  // Body
+  // ----- Torso: feathered chest + lion hindquarters + pale belly -----
   parts.push(makePart(bodyC, [],
     -bodyW, hipY, -bodyL,
-     bodyW, bodyTop, bodyL));
-
-  // Neck
+     bodyW, bodyTop, bodyL * 0.30));
   parts.push(makePart(bodyC, [],
-    -neckW, bodyTop, neckZ - neckW,
-     neckW, bodyTop + neckH, neckZ + neckW));
-
-  // Head (eagle-like round)
-  parts.push(makePart(accentC, headRots,
-    -headR, headY, headFwdZ,
-     headR, headY + headR * 2, headFwdZ + headR * 2));
-
-  // Beak
-  const beakW = s * 0.10;
-  const beakH = s * 0.12;
-  const beakD = s * 0.24;
-  parts.push(makePart(accentC, headRots,
-    -beakW, headY + headR * 0.4, headFwdZ - beakD,
-     beakW, headY + headR * 0.4 + beakH, headFwdZ));
-
-  // Tufted ears (small)
-  const earW = s * 0.05;
-  const earH = s * 0.10;
-  const earX = headR * 0.65;
-  const earY0 = headY + headR * 2;
-  const earZ  = headFwdZ + headR * 0.6;
-  parts.push(makePart(bodyC, headRots,
-    -earX - earW, earY0, earZ - earW,
-    -earX,        earY0 + earH, earZ + earW));
-  parts.push(makePart(bodyC, headRots,
-     earX,        earY0, earZ - earW,
-     earX + earW, earY0 + earH, earZ + earW));
-
-  // Legs (lion-like hindquarters)
-  parts.push(makePart(bodyC, [pitch( legPF, legPivotY)],
-    -legGap - legR, 0, legFZ - legR,
-    -legGap + legR, legH, legFZ + legR));
-  parts.push(makePart(bodyC, [pitch(-legPF, legPivotY)],
-     legGap - legR, 0, legFZ - legR,
-     legGap + legR, legH, legFZ + legR));
-  parts.push(makePart(bodyC, [pitch(-legPB, legPivotY)],
-    -legGap - legR, 0, legBZ - legR,
-    -legGap + legR, legH, legBZ + legR));
-  parts.push(makePart(bodyC, [pitch( legPB, legPivotY)],
-     legGap - legR, 0, legBZ - legR,
-     legGap + legR, legH, legBZ + legR));
-
-  // Wings (left side) — upper arm + 2 membrane panels
-  parts.push(makePart(bellyC, uarmRots_L,
-    -bodyW - uarmL, wingPivotY,         -uarmW,
-    -bodyW,          wingPivotY + uarmH,  uarmW));
-  parts.push(makePart(bellyC, mem1Rots_L,
-    -bodyW - uarmL - mem1W, wingPivotY,         -mem1D * 0.5,
-    -bodyW - uarmL,          wingPivotY + mem1H,  mem1D * 0.5));
-  parts.push(makePart(bellyC, mem2Rots_L,
-    -bodyW - uarmL - mem1W - mem2W, wingPivotY,         -mem2D * 0.4,
-    -bodyW - uarmL - mem1W,          wingPivotY + mem2H,  mem2D * 0.4));
-
-  // Wings (right side)
-  parts.push(makePart(bellyC, uarmRots_R,
-     bodyW,          wingPivotY,         -uarmW,
-     bodyW + uarmL,  wingPivotY + uarmH,  uarmW));
-  parts.push(makePart(bellyC, mem1Rots_R,
-     bodyW + uarmL,          wingPivotY,         -mem1D * 0.5,
-     bodyW + uarmL + mem1W,  wingPivotY + mem1H,  mem1D * 0.5));
-  parts.push(makePart(bellyC, mem2Rots_R,
-     bodyW + uarmL + mem1W,          wingPivotY,         -mem2D * 0.4,
-     bodyW + uarmL + mem1W + mem2W,  wingPivotY + mem2H,  mem2D * 0.4));
-
-  // Feather tail
-  const tailW = s * 0.26;
-  const tailH = s * 0.22;
-  const tailD = s * 0.28;
-  const tailY = hipY + bodyH * 0.55;
+    -bodyW * 0.85, hipY, bodyL * 0.10,
+     bodyW * 0.85, bodyTop - s * 0.03, bodyL));
   parts.push(makePart(bellyC, [],
-    -tailW, tailY, bodyL,
-     tailW, tailY + tailH, bodyL + tailD));
+    -bodyW * 0.70, hipY - s * 0.05, -bodyL * 0.80,
+     bodyW * 0.70, hipY + s * 0.05, bodyL * 0.20));
+
+  // ----- Leaning eagle neck up to the head -----
+  const lean = 0.35;
+  const neckLen = s * 0.32;
+  const neckZ = -bodyL * 0.72;
+  const neckY = bodyTop - s * 0.04;
+  parts.push(makePart(bodyC, [pitch(-lean, neckY, neckZ)],
+    -s * 0.13, neckY - s * 0.03, neckZ - s * 0.15,
+     s * 0.13, neckY + neckLen, neckZ + s * 0.15));
+  const headY = neckY + neckLen * Math.cos(lean) - s * 0.02;
+  const headZ = neckZ - neckLen * Math.sin(lean);
+  const headYaw = pose.headYaw ?? 0;
+  const headRots: Rot[] = headYaw !== 0 ? [twistY(headYaw, 0, headZ)] : [];
+
+  // ----- Eagle head + hooked beak + ear tufts -----
+  const headR = s * 0.16;
+  parts.push(makePart(bodyC, headRots,
+    -headR, headY, headZ - headR * 1.4,
+     headR, headY + headR * 2.0, headZ + headR));
+  parts.push(makePart(accentC, headRots,
+    -s * 0.06, headY + headR * 0.7, headZ - headR * 1.4 - s * 0.16,
+     s * 0.06, headY + headR * 1.2, headZ - headR * 1.4 + s * 0.02));
+  for (const side of [-1, 1]) {
+    parts.push(makePart(bodyC, headRots,
+      side * headR * 0.6 - s * 0.04, headY + headR * 2.0, headZ - s * 0.04,
+      side * headR * 0.6 + s * 0.04, headY + headR * 2.0 + s * 0.11, headZ + s * 0.04));
+  }
+
+  // ----- Legs -----
+  const legR = s * 0.10;
+  const legDefs: [number, number, number][] = [
+    [-bodyW * 0.60, -bodyL * 0.60,  legPF],
+    [ bodyW * 0.60, -bodyL * 0.60, -legPF],
+    [-bodyW * 0.60,  bodyL * 0.62, -legPB],
+    [ bodyW * 0.60,  bodyL * 0.62,  legPB],
+  ];
+  for (const [lx, lz, la] of legDefs) {
+    parts.push(makePart(bodyC, [pitch(la, hipY)],
+      lx - legR, 0, lz - legR,
+      lx + legR, hipY + s * 0.05, lz + legR));
+  }
+
+  // ----- Wings: humerus + 2 feather panels + dark tip, rolled up ----------
+  const shoulderY = bodyTop - s * 0.03;
+  const shoulderZ = -bodyL * 0.25;
+  const flapPhase = pose.flapPhase ?? pose.walkPhase;
+  const flapAmp = pose.flapAmp ?? pose.walkAmp;
+  const raise = 0.42 + Math.sin(flapPhase) * flapAmp * 0.45;
+  for (const side of [-1, 1] as const) {
+    const roll = (a: number): Rot[] => [rollZ(side * a, side * bodyW, shoulderY)];
+    const spanX = (a: number, b: number): [number, number] =>
+      side < 0 ? [-bodyW - b, -bodyW - a] : [bodyW + a, bodyW + b];
+    const [h0, h1] = spanX(-s * 0.04, s * 0.24);
+    parts.push(makePart(bodyC, roll(raise),
+      h0, shoulderY - s * 0.05, shoulderZ - s * 0.10,
+      h1, shoulderY + s * 0.05, shoulderZ + s * 0.14));
+    const [p10, p11] = spanX(s * 0.20, s * 0.56);
+    parts.push(makePart(bodyC, roll(raise + 0.20),
+      p10, shoulderY - s * 0.02, shoulderZ - s * 0.14,
+      p11, shoulderY + s * 0.02, shoulderZ + s * 0.42));
+    const [p20, p21] = spanX(s * 0.52, s * 0.84);
+    parts.push(makePart(bellyC, roll(raise + 0.40),
+      p20, shoulderY - s * 0.016, shoulderZ - s * 0.14,
+      p21, shoulderY + s * 0.016, shoulderZ + s * 0.30));
+    const [t0, t1] = spanX(s * 0.80, s * 1.02);
+    parts.push(makePart(accentC, roll(raise + 0.58),
+      t0, shoulderY - s * 0.012, shoulderZ - s * 0.12,
+      t1, shoulderY + s * 0.012, shoulderZ + s * 0.18));
+  }
+
+  // ----- Lion tail + feather fan tip -----
+  const tailSway = Math.sin(pose.walkPhase + 0.8) * pose.walkAmp * 0.35;
+  parts.push(makePart(bodyC, [twistY(tailSway, 0, bodyL)],
+    -s * 0.05, hipY + bodyH * 0.45, bodyL,
+     s * 0.05, hipY + bodyH * 0.45 + s * 0.09, bodyL + s * 0.34));
+  parts.push(makePart(bellyC, [twistY(tailSway, 0, bodyL)],
+    -s * 0.14, hipY + bodyH * 0.40, bodyL + s * 0.32,
+     s * 0.14, hipY + bodyH * 0.40 + s * 0.16, bodyL + s * 0.50));
 
   return parts;
 }
@@ -1043,6 +1076,8 @@ export function buildAnimalMesh(
     case 'horse':
     case 'cow':
     case 'donkey':
+    case 'wolf':
+    case 'bear':
       parts = buildQuadruped(species, pose, colorVariant);
       break;
     case 'bird':
@@ -1080,9 +1115,11 @@ export function buildAnimalMesh(
 //   horse:      10 boxes  =  360 verts
 //   cow:        11 boxes  =  396 verts
 //   donkey:     10 boxes  =  360 verts
-//   dragon:     25 boxes  =  900 verts  (new rig — largest)
-//   griffin:    17 boxes  =  612 verts  (upgraded wing membranes)
+//   wolf:       10 boxes  =  360 verts  (snout + bushy tail)
+//   bear:       11 boxes  =  396 verts  (snout + hump + stub tail)
+//   dragon:     54 boxes  = 1944 verts  (Ice-and-Fire rig — largest)
+//   griffin:    22 boxes  =  792 verts  (raised feathered wings)
 //   sea_serpent: 8 boxes  =  288 verts
 //
-// Dragon is the max: 25 × 36 = 900 verts.
-export const ANIMAL_MAX_VERTS = 900;
+// Dragon is the max: 54 × 36 = 1944 verts.
+export const ANIMAL_MAX_VERTS = 1944;

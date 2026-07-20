@@ -37,6 +37,15 @@ const FLEE_DURATION_S    = 4;   // s
 
 const ATTACK_COOLDOWN_S  = 1.2; // s between bite/swipe ticks
 
+/**
+ * Territorial rares (untamed dragons / griffins): entering this radius around
+ * the animal's home provokes an attack, and it keeps pursuing until the player
+ * leaves the territory (plus hysteresis) — then it walks back home.
+ */
+export const TERRITORY_RADIUS = 50;  // m around home
+const TERRITORY_HYSTERESIS   = 8;    // m beyond the edge before it gives up
+const TERRITORY_RETURN_S     = 30;   // s cap on the walk-home leg
+
 const WANDER_RADIUS      = 24;  // m around home
 const IDLE_MIN_S         = 2;
 const IDLE_MAX_S         = 6;
@@ -58,18 +67,26 @@ export interface AnimalAICtx {
   playerDist: number;   // pre-computed Math.hypot distance
   rng: () => number;
   heightAt: (x: number, z: number) => number;
+  /**
+   * Optional collision-aware XZ move (the player's layered GroundQuery).
+   * When provided, animals slide along settlement walls instead of phasing
+   * through buildings. Falls back to free movement when absent.
+   */
+  moveXZ?: (x: number, z: number, dx: number, dz: number, r: number) => [number, number];
   speciesDef: SpeciesDef;
   onAttackPlayer: (damage: number) => void;
 }
+
+type MoveXZ = NonNullable<AnimalAICtx['moveXZ']>;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/** Attack damage for a species: max(1, round(size)) for aggro species. */
+/** Attack damage for a species: attackDmg, else max(1, round(size)). */
 export function aggroDamage(species: Species): number {
   const def = SPECIES_DEFS[species];
-  return Math.max(1, Math.round(def.size));
+  return def.attackDmg ?? Math.max(1, Math.round(def.size));
 }
 
 /** Move entity toward (tx, tz) at given speed, clamped to terrain. */
@@ -81,6 +98,8 @@ function moveToward(
   dtS: number,
   heightAt: (x: number, z: number) => number,
   isWater: boolean,
+  moveXZ?: MoveXZ,
+  radius = 0.4,
 ): void {
   const dx = tx - e.x;
   const dz = tz - e.z;
@@ -90,11 +109,13 @@ function moveToward(
   const nx = dx / dist;
   const nz = dz / dist;
   const step = speed * dtS;
-  const newX = e.x + nx * step;
-  const newZ = e.z + nz * step;
 
-  e.x = newX;
-  e.z = newZ;
+  if (moveXZ !== undefined) {
+    [e.x, e.z] = moveXZ(e.x, e.z, nx * step, nz * step, radius);
+  } else {
+    e.x += nx * step;
+    e.z += nz * step;
+  }
   e.yaw = Math.atan2(nx, -nz); // facing direction: yaw 0 = -Z
   e.walkPhase += speed * dtS * 1.6;
 
@@ -102,7 +123,7 @@ function moveToward(
   if (isWater) {
     e.y = -0.5;
   } else {
-    e.y = heightAt(newX, newZ);
+    e.y = heightAt(e.x, e.z);
   }
 }
 
@@ -115,18 +136,20 @@ function moveAway(
   dtS: number,
   heightAt: (x: number, z: number) => number,
   isWater: boolean,
+  moveXZ?: MoveXZ,
+  radius = 0.4,
 ): void {
   const dx = e.x - fx;
   const dz = e.z - fz;
   const dist = Math.hypot(dx, dz);
   if (dist < 0.01) {
     // Exactly on top: flee in +X direction.
-    moveToward(e, e.x + 10, e.z, speed, dtS, heightAt, isWater);
+    moveToward(e, e.x + 10, e.z, speed, dtS, heightAt, isWater, moveXZ, radius);
     return;
   }
   const nx = dx / dist;
   const nz = dz / dist;
-  moveToward(e, e.x + nx * 100, e.z + nz * 100, speed, dtS, heightAt, isWater);
+  moveToward(e, e.x + nx * 100, e.z + nz * 100, speed, dtS, heightAt, isWater, moveXZ, radius);
 }
 
 /** Pick a random wander target within WANDER_RADIUS of home. */
@@ -155,9 +178,30 @@ export function stepAnimal(
 ): void {
   if (e.mode === 'dead') return;
 
-  const { playerX, playerZ, playerDist, rng, heightAt, speciesDef, onAttackPlayer } = ctx;
+  const { playerX, playerZ, playerDist, rng, heightAt, moveXZ, speciesDef, onAttackPlayer } = ctx;
   const isWater = speciesDef.water === true;
   const speed   = speciesDef.speed;
+  // Collision radius scales with the animal; water species skip solids entirely.
+  const radius  = Math.max(0.3, speciesDef.size * 0.45);
+  const collide = isWater ? undefined : moveXZ;
+
+  // ---- Owned stay/sit (right-click toggle) ---------------------------------
+  // sit eases 0<->1 over ~0.4 s; while staying the entity holds position and
+  // skips all follow/wander logic regardless of LOD distance.
+  if (e.owned === true) {
+    const sitTarget = e.staying === true ? 1 : 0;
+    const cur = e.sit ?? 0;
+    if (cur !== sitTarget) {
+      const step = dtS / 0.4;
+      e.sit = cur < sitTarget ? Math.min(sitTarget, cur + step) : Math.max(sitTarget, cur - step);
+    }
+    if (e.staying === true) {
+      e.y = isWater ? -0.5 : heightAt(e.x, e.z);
+      e.homeX = e.x;
+      e.homeZ = e.z;
+      return;
+    }
+  }
 
   // ---- LOD: skip if too far ------------------------------------------------
   if (playerDist > LOD_SKIP_DIST) return;
@@ -167,7 +211,7 @@ export function stepAnimal(
     // Drift slowly back toward home, low walk amplitude.
     const distHome = Math.hypot(e.x - e.homeX, e.z - e.homeZ);
     if (distHome > 8) {
-      moveToward(e, e.homeX, e.homeZ, speed * 0.3, dtS, heightAt, isWater);
+      moveToward(e, e.homeX, e.homeZ, speed * 0.3, dtS, heightAt, isWater, collide, radius);
     }
     // Keep y synced.
     e.y = isWater ? -0.5 : heightAt(e.x, e.z);
@@ -179,6 +223,11 @@ export function stepAnimal(
   // Phase K: owned entities (babies) only follow the player — never flee or aggro.
   const isOwned = (e as EntityState & { owned?: boolean }).owned === true;
 
+  // Territorial rares defend the ground around their home, not just their
+  // person. Water rares (sea serpent) keep the plain proximity trigger.
+  const isTerritorial = speciesDef.rare && speciesDef.aggro && !isWater;
+  const playerDistHome = Math.hypot(playerX - e.homeX, playerZ - e.homeZ);
+
   if (isOwned) {
     // Force follow mode and skip the flee/aggro logic.
     e.mode = 'follow';
@@ -186,9 +235,13 @@ export function stepAnimal(
     // --- Check flee/aggro triggers (transition override) ----------------------
     // (mode !== 'dead' already guaranteed by the early return above)
     if (speciesDef.aggro) {
-      // Aggro species: enter aggro when player close enough.
+      // Aggro species: enter aggro when player close enough (territorial:
+      // when the player sets foot anywhere inside the territory).
+      const provoked = isTerritorial
+        ? playerDistHome <= TERRITORY_RADIUS
+        : playerDist <= AGGRO_TRIGGER_DIST;
       if ((e.mode === 'idle' || e.mode === 'graze' || e.mode === 'wander')
-          && playerDist <= AGGRO_TRIGGER_DIST) {
+          && provoked) {
         e.mode = 'aggro';
         e.stateTimer = 0;
       }
@@ -242,7 +295,7 @@ export function stepAnimal(
         const tz = e.z + Math.sin(angle) * dist;
         // Don't stray too far from home.
         if (Math.hypot(tx - e.homeX, tz - e.homeZ) < WANDER_RADIUS * 0.5) {
-          moveToward(e, tx, tz, speed * 0.3, dtS * 8, heightAt, isWater);
+          moveToward(e, tx, tz, speed * 0.3, dtS * 8, heightAt, isWater, collide, radius);
         }
       }
       e.y = isWater ? -0.5 : heightAt(e.x, e.z);
@@ -262,7 +315,7 @@ export function stepAnimal(
         break;
       }
 
-      moveToward(e, tx, tz, speed * 0.6, dtS, heightAt, isWater);
+      moveToward(e, tx, tz, speed * 0.6, dtS, heightAt, isWater, collide, radius);
       break;
     }
 
@@ -273,16 +326,27 @@ export function stepAnimal(
         e.stateTimer = IDLE_MIN_S + rng() * (IDLE_MAX_S - IDLE_MIN_S);
         break;
       }
-      moveAway(e, playerX, playerZ, speed * FLEE_SPEED_MUL, dtS, heightAt, isWater);
+      moveAway(e, playerX, playerZ, speed * FLEE_SPEED_MUL, dtS, heightAt, isWater, collide, radius);
       break;
     }
 
     case 'aggro': {
       // Walk toward player.
-      if (playerDist > AGGRO_TRIGGER_DIST * 2) {
-        // Player escaped — return to idle.
-        e.mode = 'idle';
-        e.stateTimer = IDLE_MIN_S + rng() * (IDLE_MAX_S - IDLE_MIN_S);
+      const escaped = isTerritorial
+        ? playerDistHome > TERRITORY_RADIUS + TERRITORY_HYSTERESIS
+        : playerDist > AGGRO_TRIGGER_DIST * 2;
+      if (escaped) {
+        if (isTerritorial) {
+          // Player left the territory — walk back home.
+          const ext = e as EntityState & { _wanderTX?: number; _wanderTZ?: number };
+          ext._wanderTX = e.homeX;
+          ext._wanderTZ = e.homeZ;
+          e.mode = 'wander';
+          e.stateTimer = TERRITORY_RETURN_S;
+        } else {
+          e.mode = 'idle';
+          e.stateTimer = IDLE_MIN_S + rng() * (IDLE_MAX_S - IDLE_MIN_S);
+        }
         break;
       }
 
@@ -300,7 +364,7 @@ export function stepAnimal(
         e.yaw = Math.atan2(aggroDx, -aggroDz);
       } else {
         // Move toward player.
-        moveToward(e, playerX, playerZ, speed, dtS, heightAt, isWater);
+        moveToward(e, playerX, playerZ, speed, dtS, heightAt, isWater, collide, radius);
       }
       break;
     }
@@ -314,7 +378,7 @@ export function stepAnimal(
         e.z = playerZ + (e.z - playerZ) * (FOLLOW_RADIUS / Math.max(playerDist, 0.001));
         e.y = isWater ? -0.5 : heightAt(e.x, e.z);
       } else if (playerDist > FOLLOW_STOP_DIST) {
-        moveToward(e, playerX, playerZ, speed * 0.7, dtS, heightAt, isWater);
+        moveToward(e, playerX, playerZ, speed * 0.7, dtS, heightAt, isWater, collide, radius);
       } else {
         // Close enough: stand still, keep y synced.
         e.y = isWater ? -0.5 : heightAt(e.x, e.z);

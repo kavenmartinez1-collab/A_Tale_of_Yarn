@@ -49,7 +49,7 @@ export const RECIPES: readonly Recipe[] = [
   { output: 'iron_axe',     count: 1, inputs: [['iron_ingot', 2], ['sticks', 1]],                  station: 'forge', category: 'tools'   },
   { output: 'iron_pickaxe', count: 1, inputs: [['iron_ingot', 2], ['sticks', 1]],                  station: 'forge', category: 'tools'   },
   { output: 'iron_sword',   count: 1, inputs: [['iron_ingot', 3], ['sticks', 1]],                  station: 'forge', category: 'weapons' },
-  { output: 'hunter_bow',   count: 1, inputs: [['logs', 2], ['healing_herb', 1]],                  station: 'hand',  category: 'weapons' },
+  { output: 'hunter_bow',   count: 1, inputs: [['logs', 2], ['bow_string', 1]],                    station: 'hand',  category: 'weapons' },
   { output: 'meal',         count: 1, inputs: [['berries', 5]],                                    station: 'fire',  needsPot: true, category: 'food' },
 
   // ---- basic processed materials ------------------------------------------
@@ -63,11 +63,13 @@ export const RECIPES: readonly Recipe[] = [
   { output: 'arrow',       count: 4, inputs: [['arrow_shaft', 1], ['feather', 1], ['stone', 1]],   station: 'hand',  category: 'weapons' },
   { output: 'wool_yarn',   count: 1, inputs: [['wool', 2]],                                        station: 'hand',  category: 'camp'    },
   { output: 'bone_needle', count: 1, inputs: [['bone', 1]],                                        station: 'hand',  category: 'tools'   },
+  { output: 'bone_needle', count: 1, inputs: [['old_bone', 1]],                                    station: 'hand',  category: 'tools'   },
 
   // ---- fire / shelter tools -----------------------------------------------
   { output: 'fire_starter', count: 1, inputs: [['sticks', 1], ['stone', 1]],                       station: 'hand', category: 'camp'    },
   { output: 'torch',        count: 4, inputs: [['sticks', 1], ['coal', 1]],                        station: 'hand', category: 'camp'    },
-  { output: 'campfire_kit', count: 1, inputs: [['logs', 3], ['sticks', 2], ['coal', 1]],           station: 'hand', category: 'camp'    },
+  { output: 'torch',        count: 2, inputs: [['sticks', 1], ['torch_oil', 1]],                   station: 'hand', category: 'camp'    },
+  { output: 'campfire_kit', count: 1, inputs: [['logs', 3], ['sticks', 2]],                        station: 'hand', category: 'camp'    },
 
   // ---- smelting (forge) ---------------------------------------------------
   { output: 'copper_ingot', count: 1, inputs: [['copper_ore', 2]],                                 station: 'forge', category: 'camp'    },
@@ -84,6 +86,10 @@ export const RECIPES: readonly Recipe[] = [
   // ---- containers ---------------------------------------------------------
   { output: 'gourd_bottle', count: 1, inputs: [['gourd', 1]], station: 'hand', category: 'camp' },
   { output: 'gourd_bowl',   count: 1, inputs: [['gourd', 1]], station: 'hand', category: 'camp' },
+
+  // ---- bronze tools -------------------------------------------------------
+  { output: 'bronze_axe',     count: 1, inputs: [['bronze_ingot', 2], ['sticks', 1]],              station: 'forge', category: 'tools'   },
+  { output: 'bronze_pickaxe', count: 1, inputs: [['bronze_ingot', 2], ['sticks', 1]],              station: 'forge', category: 'tools'   },
 
   // ---- bronze weapons -----------------------------------------------------
   { output: 'bronze_sword',  count: 1, inputs: [['bronze_ingot', 2], ['sticks', 1]],               station: 'forge', category: 'weapons' },
@@ -109,6 +115,11 @@ export const RECIPES: readonly Recipe[] = [
   { output: 'iron_helm',  count: 1, inputs: [['iron_ingot', 3]], station: 'forge', category: 'armor' },
   { output: 'iron_chest', count: 1, inputs: [['iron_ingot', 5]], station: 'forge', category: 'armor' },
   { output: 'iron_legs',  count: 1, inputs: [['iron_ingot', 4]], station: 'forge', category: 'armor' },
+
+  // ---- dragonscale armor (forge; scales from slain dragons) ---------------
+  { output: 'dragonscale_helm',  count: 1, inputs: [['dragon_scale', 3], ['iron_ingot', 1], ['leather', 1]], station: 'forge', category: 'armor' },
+  { output: 'dragonscale_chest', count: 1, inputs: [['dragon_scale', 6], ['iron_ingot', 2], ['leather', 2]], station: 'forge', category: 'armor' },
+  { output: 'dragonscale_legs',  count: 1, inputs: [['dragon_scale', 4], ['iron_ingot', 1], ['leather', 1]], station: 'forge', category: 'armor' },
 
   // ---- food (fire + pot) --------------------------------------------------
   { output: 'meat_cooked',   count: 1, inputs: [['meat_raw', 1]],                                      station: 'fire',            category: 'food' },

@@ -342,13 +342,13 @@ function makeCtx(overrides: Partial<AnimalAICtx> = {}): AnimalAICtx {
 // ---------------------------------------------------------------------------
 
 {
-  // dragon size=3.5 → max(1, round(3.5)) = 4
-  check('dragon aggroDamage = 4', aggroDamage('dragon') === 4);
-  // griffin size=2.2 → max(1, round(2.2)) = 2
-  check('griffin aggroDamage = 2', aggroDamage('griffin') === 2);
-  // sea_serpent size=4.0 → max(1, round(4.0)) = 4
-  check('sea_serpent aggroDamage = 4', aggroDamage('sea_serpent') === 4);
-  // rabbit size=0.4 → max(1, round(0.4)) = 1
+  // Explicit attackDmg wins over the size formula.
+  check('dragon aggroDamage = 5 (attackDmg)', aggroDamage('dragon') === 5);
+  check('griffin aggroDamage = 3 (attackDmg)', aggroDamage('griffin') === 3);
+  check('sea_serpent aggroDamage = 4 (attackDmg)', aggroDamage('sea_serpent') === 4);
+  check('wolf aggroDamage = 2 (attackDmg)', aggroDamage('wolf') === 2);
+  check('bear aggroDamage = 4 (attackDmg)', aggroDamage('bear') === 4);
+  // rabbit size=0.4 → fallback max(1, round(0.4)) = 1
   check('rabbit aggroDamage = 1 (non-aggro but formula still works)', aggroDamage('rabbit') === 1);
 }
 
@@ -399,21 +399,59 @@ function makeCtx(overrides: Partial<AnimalAICtx> = {}): AnimalAICtx {
 }
 
 // ---------------------------------------------------------------------------
-// 18. Aggro entity: returns to idle when player moves far away
+// 18. Territorial rares: pursue inside territory, walk home once it's left
 // ---------------------------------------------------------------------------
 
 {
+  // Untamed dragon keeps pursuing while the player is inside its territory
+  // (50 m of home), even past the plain 32 m aggro give-up distance.
   const e = makeEntity('dragon', 0, 0);
   e.mode = 'aggro';
+  stepAnimal(e, 1 / 60, makeCtx({
+    playerX: 45, playerZ: 0,
+    playerDist: 45,
+    speciesDef: SPECIES_DEFS['dragon'],
+  }));
+  check('territorial dragon keeps pursuing inside territory', e.mode === 'aggro',
+    `mode=${e.mode}`);
 
-  // Player now 50 m away (> AGGRO_TRIGGER_DIST * 2 = 32 m).
+  // Player leaves the territory (> 58 m from home) → dragon heads home.
+  stepAnimal(e, 1 / 60, makeCtx({
+    playerX: 70, playerZ: 0,
+    playerDist: 70 - e.x,
+    speciesDef: SPECIES_DEFS['dragon'],
+  }));
+  check('territorial dragon returns home when territory left', e.mode === 'wander',
+    `mode=${e.mode}`);
+}
+
+{
+  // Standing anywhere inside the territory provokes the dragon, even when
+  // the dragon itself is farther away than the plain 16 m trigger.
+  const e = makeEntity('dragon', 0, 0);
+  e.mode = 'idle';
+  e.stateTimer = 10;
+  stepAnimal(e, 1 / 60, makeCtx({
+    playerX: 40, playerZ: 0,
+    playerDist: 40,
+    speciesDef: SPECIES_DEFS['dragon'],
+  }));
+  check('entering dragon territory provokes aggro', e.mode === 'aggro',
+    `mode=${e.mode}`);
+}
+
+{
+  // Non-rare aggro species keep the old give-up rule (idle past 32 m).
+  const e = makeEntity('sea_serpent', 0, 0);
+  e.mode = 'aggro';
+  // Sea serpent is water — territorial logic does not apply.
   stepAnimal(e, 1 / 60, makeCtx({
     playerX: 50, playerZ: 0,
     playerDist: 50,
-    speciesDef: SPECIES_DEFS['dragon'],
+    heightAt: () => -20,
+    speciesDef: SPECIES_DEFS['sea_serpent'],
   }));
-
-  check('aggro → idle when player escapes', e.mode === 'idle',
+  check('water rare keeps plain aggro give-up (idle)', e.mode === 'idle',
     `mode=${e.mode}`);
 }
 
@@ -503,6 +541,64 @@ function makeCtx(overrides: Partial<AnimalAICtx> = {}): AnimalAICtx {
 // ---------------------------------------------------------------------------
 
 check('FOLLOW_RADIUS exported and = 30', FOLLOW_RADIUS === 30);
+
+// ---------------------------------------------------------------------------
+// 24. Stay/sit: owned entity told to stay holds position and sits
+// ---------------------------------------------------------------------------
+
+{
+  const e = makeEntity('horse', 10, 0);
+  e.mode = 'follow';
+  e.owned = true;
+  e.staying = true;
+  const startX = e.x;
+  const startZ = e.z;
+
+  // Player far beyond FOLLOW_RADIUS — a following horse would teleport-catchup.
+  stepAnimal(e, 0.5, makeCtx({
+    playerX: 100, playerZ: 0,
+    playerDist: 90,
+    speciesDef: SPECIES_DEFS['horse'],
+  }));
+
+  check('staying: position unchanged even with player far away',
+    e.x === startX && e.z === startZ, `x=${e.x} z=${e.z}`);
+  check('staying: home synced to current spot', e.homeX === startX && e.homeZ === startZ);
+  check('staying: sit eased upward', (e.sit ?? 0) > 0, `sit=${e.sit}`);
+
+  // sit reaches 1 after enough time (0.4 s ease).
+  stepAnimal(e, 0.5, makeCtx({
+    playerX: 100, playerZ: 0, playerDist: 90,
+    speciesDef: SPECIES_DEFS['horse'],
+  }));
+  check('staying: sit reaches 1', e.sit === 1, `sit=${e.sit}`);
+
+  // Cancel stay: sit eases back down and follow resumes (teleport catchup;
+  // playerDist 50 is within the full-AI LOD range but beyond FOLLOW_RADIUS).
+  e.staying = false;
+  stepAnimal(e, 0.1, makeCtx({
+    playerX: 60, playerZ: 0, playerDist: 50,
+    speciesDef: SPECIES_DEFS['horse'],
+  }));
+  check('stay cancelled: sit eases back down', (e.sit ?? 1) < 1, `sit=${e.sit}`);
+  check('stay cancelled: follow resumes (moved)', e.x !== startX, `x=${e.x}`);
+}
+
+// ---------------------------------------------------------------------------
+// 25. Stay/sit: non-owned entities ignore staying flag
+// ---------------------------------------------------------------------------
+
+{
+  const e = makeEntity('deer', 5, 0);
+  e.mode = 'idle';
+  e.staying = true; // not owned — should be inert
+  stepAnimal(e, 0.5, makeCtx({
+    playerX: 0, playerZ: 0, playerDist: 5,
+    speciesDef: SPECIES_DEFS['deer'],
+  }));
+  check('non-owned: staying flag does not sit', (e.sit ?? 0) === 0, `sit=${e.sit}`);
+  check('non-owned: deer still flees when player close', e.mode === 'flee', `mode=${e.mode}`);
+}
 
 // ---------------------------------------------------------------------------
 // Summary

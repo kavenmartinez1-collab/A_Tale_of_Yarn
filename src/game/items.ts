@@ -166,6 +166,12 @@ export const ITEM_DEFS = {
   iron_chest: { name: 'Iron Chest', kind: 'armor', color: [0.66, 0.68, 0.72], stack: 1, warmth: 0, armor: { slot: 'body', defense: 6 } },
   iron_legs:  { name: 'Iron Legs',  kind: 'armor', color: [0.65, 0.67, 0.71], stack: 1, warmth: 0, armor: { slot: 'legs', defense: 4 } },
 
+  // --- Armor: dragonscale tier (defense 6/9/6, warmth 0.2) ------------------
+  // Top tier: forged from scales of slain dragons. Warm — dragons run hot.
+  dragonscale_helm:  { name: 'Dragonscale Helm',    kind: 'armor', color: [0.16, 0.48, 0.28], stack: 1, warmth: 0.2, armor: { slot: 'head', defense: 6 } },
+  dragonscale_chest: { name: 'Dragonscale Chest',   kind: 'armor', color: [0.14, 0.45, 0.26], stack: 1, warmth: 0.2, armor: { slot: 'body', defense: 9 } },
+  dragonscale_legs:  { name: 'Dragonscale Greaves', kind: 'armor', color: [0.13, 0.42, 0.24], stack: 1, warmth: 0.2, armor: { slot: 'legs', defense: 6 } },
+
   // --- Consumables with effectClass (Phase E) -------------------------------
   healing_potion: { name: 'Healing Potion', kind: 'consumable', color: [0.75, 0.20, 0.25], stack: 20, edible: { heal: 8 }, effectClass: 'heal' },
   warming_potion: { name: 'Warming Potion', kind: 'consumable', color: [0.85, 0.45, 0.15], stack: 20, effectClass: 'warm' },

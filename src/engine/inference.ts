@@ -41,6 +41,32 @@ export interface InferenceSessionConfig {
   gpu?: GPUContext;
 }
 
+/** Per-call chat options (template rendering + generation tuning). */
+export interface ChatCallOptions {
+  enableThinking?: boolean;
+  emptyThink?: boolean;
+  /** Render WITHOUT the trailing assistant preamble — used for KV
+   *  warm-prefill so the cached tokens stay a strict prefix of the next
+   *  real prompt. */
+  addGenerationPrompt?: boolean;
+  /** Per-call prefill chunk size (see GenerateOptions.prefillChunk). */
+  prefillChunk?: number;
+}
+
+/** chat() bound to its own private KV session over the shared weights.
+ *  Lets multiple consumers (Director, Ecology, NPC chat) keep independent
+ *  conversation prefixes without evicting each other's cache. */
+export interface ForkedChatContext {
+  chat(
+    messages: Array<{ role: string; content: string }>,
+    sampling?: SamplingConfig,
+    onToken?: OnTokenCallback,
+    opts?: ChatCallOptions,
+  ): GenerationHandle;
+  /** Drop this fork's KV cache (frees GPU memory until next use). */
+  resetKV(): void;
+}
+
 export interface InferenceSession {
   /** Generate text from a plain prompt. */
   run(prompt: string, sampling?: SamplingConfig, onToken?: OnTokenCallback): GenerationHandle;
@@ -51,8 +77,11 @@ export interface InferenceSession {
     messages: Array<{ role: string; content: string }>,
     sampling?: SamplingConfig,
     onToken?: OnTokenCallback,
-    opts?: { enableThinking?: boolean; emptyThink?: boolean },
+    opts?: ChatCallOptions,
   ): GenerationHandle;
+
+  /** Fork a private KV session over the shared weights (GGUF sessions). */
+  forkKV?(): ForkedChatContext;
 
   /** Persistent KV session backing chat() turns. */
   readonly kvSession: KVSessionState;
@@ -190,10 +219,11 @@ export async function createInferenceSession(
     messages: Array<{ role: string; content: string }>,
     sampling?: SamplingConfig,
     onToken?: OnTokenCallback,
-    opts?: { enableThinking?: boolean; emptyThink?: boolean },
+    opts?: ChatCallOptions,
   ): GenerationHandle {
     const prompt = applyChatTemplate(tokenizer, messages, opts);
-    return generate(gpu.device, engine, tokenizer, prompt, sampling, onToken, { kvSession });
+    return generate(gpu.device, engine, tokenizer, prompt, sampling, onToken,
+      { kvSession, prefillChunk: opts?.prefillChunk });
   }
 
   function destroy() {

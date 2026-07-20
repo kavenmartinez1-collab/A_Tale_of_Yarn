@@ -52,6 +52,29 @@ struct VSOut {
   @location(2) tint: f32,
 }
 
+// --- shared stylized lighting helpers (keep identical across scene shaders) --
+
+// Hemispheric ambient (cool sky above, warm bounce below) + half-Lambert sun
+// + a weak cool moon fill at night (starVis-gated, mirrored sun direction).
+fn sceneLight(albedo: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+  let up = n.y * 0.5 + 0.5;
+  let ambTint = mix(vec3<f32>(1.06, 0.98, 0.88), vec3<f32>(0.86, 0.96, 1.14), up);
+  let diff = dot(n, frame.sunDir) * 0.5 + 0.5;
+  let sun = (0.26 * diff + 0.62 * diff * diff) * frame.sunColor;
+  let moonDir = normalize(vec3<f32>(-frame.sunDir.x, abs(frame.sunDir.y), -frame.sunDir.z));
+  let moon = max(dot(n, moonDir), 0.0) * frame.starVis * vec3<f32>(0.05, 0.06, 0.10);
+  return albedo * (frame.ambient * ambTint + sun + moon);
+}
+
+// Gentle filmic-ish grade: lifts shadows, rolls off highlights, +10% sat.
+fn grade(c: vec3<f32>) -> vec3<f32> {
+  let x = max(c, vec3<f32>(0.0));
+  let toned = x * (vec3<f32>(1.25) + x * 0.45)
+            / (vec3<f32>(1.0) + x * (vec3<f32>(0.90) + x * 0.45));
+  let l = dot(toned, vec3<f32>(0.2126, 0.7152, 0.0722));
+  return mix(vec3<f32>(l), toned, 1.10);
+}
+
 @vertex
 fn vs_main(
   @location(0) position: vec3<f32>,
@@ -66,7 +89,13 @@ fn vs_main(
   let local = position * inst.w;
   let rotated = vec3<f32>(local.x * c - local.z * s, local.y,
                           local.x * s + local.z * c);
-  let world = rotated + inst.xyz;
+  var world = rotated + inst.xyz;
+  // Wind sway: canopy leans gently, trunk stays rooted. Per-instance phase
+  // from the same hash so neighbouring trees never move in lockstep.
+  let leafFrac = smoothstep(TRUNK_TOP, 4.5, position.y);
+  let phase = frame.time * 1.3 + hash * 6.2831853;
+  world.x += sin(phase) * 0.10 * leafFrac * inst.w;
+  world.z += cos(phase * 0.7) * 0.07 * leafFrac * inst.w;
   var out: VSOut;
   out.pos = frame.viewProj * vec4<f32>(world, 1.0);
   out.worldPos = world;
@@ -101,11 +130,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     * (1.0 + detail * ((clump - 0.5) * 0.35 + (g - 0.5) * 0.18));
   let albedo = select(leaf, bark, in.localY < TRUNK_TOP);
 
-  let diff = dot(n, frame.sunDir) * 0.5 + 0.5;
-  var color = albedo * (frame.ambient + (0.30 * diff + 0.55 * diff * diff) * frame.sunColor);
+  var color = sceneLight(albedo, n);
 
   let fog = 1.0 - exp(-frame.fogDensity * dist);
   color = mix(color, frame.fogColor, fog);
 
-  return vec4<f32>(color, 1.0);
+  return vec4<f32>(grade(color), 1.0);
 }

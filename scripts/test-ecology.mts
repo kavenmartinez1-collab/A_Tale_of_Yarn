@@ -1,30 +1,17 @@
 /**
- * Deterministic unit tests for the Ecology Director core (spec validator,
- * prompt builder, fallback). Pure CPU — no GPU, no DOM, no server. Run:
+ * Deterministic unit tests for the ecology core (spec validator, procedural
+ * generator, fallback). Pure CPU — no GPU, no DOM, no server. Run:
  *   npx tsx scripts/test-ecology.mts
- *
- * The golden prompt hash is the prompt-drift tripwire: any change to the
- * prompt text fails this test and must be deliberate (bump
- * ECOLOGY_PROMPT_VERSION in ecology-spec.ts and update the constant below).
  */
 
 import {
   validateEcologySpec,
   ECOLOGY_FALLBACK,
-  ECOLOGY_FIXTURES,
-  ECOLOGY_PROMPT_VERSION,
+  proceduralEcologySpec,
 } from '../src/game/entities/ecology-spec';
 import type { EcologySpec } from '../src/game/entities/ecology-spec';
-import {
-  buildEcologyBrief,
-  buildEcologyMessages,
-  buildEcologyRetryMessage,
-} from '../src/game/entities/ecology-prompt';
 import type { Biome } from '../src/game/biome';
 import { SPECIES_DEFS } from '../src/game/entities/entity-types';
-
-// ── Update ONLY on deliberate prompt changes (see header). ───────────────────
-const GOLDEN_PROMPT_HASH: number | null = 0x8fe39066;
 
 // ── Harness ───────────────────────────────────────────────────────────────────
 
@@ -40,15 +27,6 @@ function check(name: string, cond: boolean, detail = ''): void {
   }
 }
 
-function fnv1a(bytes: Uint8Array): number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < bytes.length; i++) {
-    h ^= bytes[i];
-    h = Math.imul(h, 0x01000193);
-  }
-  return h >>> 0;
-}
-
 function ok(r: ReturnType<typeof validateEcologySpec>): r is { spec: EcologySpec } {
   return 'spec' in r;
 }
@@ -56,42 +34,6 @@ function ok(r: ReturnType<typeof validateEcologySpec>): r is { spec: EcologySpec
 function errors(r: ReturnType<typeof validateEcologySpec>): string[] {
   return 'errors' in r ? r.errors : [];
 }
-
-// ── Fixture validation ────────────────────────────────────────────────────────
-
-{
-  const plainsForest: Biome[] = ['plains', 'forest'];
-  const alpine: Biome[] = ['alpine', 'mountain_forest'];
-
-  // Fixture 0: plains/forest herds (rabbit, deer, horse)
-  const r0 = validateEcologySpec(ECOLOGY_FIXTURES[0], plainsForest);
-  check('fixture 0: validates against plains+forest', ok(r0), JSON.stringify(errors(r0)));
-
-  // Fixture 1: alpine with bird + dragon
-  const r1 = validateEcologySpec(ECOLOGY_FIXTURES[1], alpine);
-  check('fixture 1: validates against alpine+mountain_forest', ok(r1), JSON.stringify(errors(r1)));
-
-  // Verify version and mood bounds on fixtures
-  check('fixture 0: version=1', ECOLOGY_FIXTURES[0].version === 1);
-  check('fixture 1: version=1', ECOLOGY_FIXTURES[1].version === 1);
-  check('fixture 0: mood length ok',
-    ECOLOGY_FIXTURES[0].mood.length >= 1 && ECOLOGY_FIXTURES[0].mood.length <= 40);
-  check('fixture 1: mood length ok',
-    ECOLOGY_FIXTURES[1].mood.length >= 1 && ECOLOGY_FIXTURES[1].mood.length <= 40);
-
-  // Herd count bounds
-  for (const [fi, fix] of ECOLOGY_FIXTURES.entries()) {
-    check(`fixture ${fi}: herds 0-5`, fix.herds.length >= 0 && fix.herds.length <= 5);
-    for (const h of fix.herds) {
-      check(`fixture ${fi}: herd ${h.species} count 1-6`,
-        Number.isInteger(h.count) && h.count >= 1 && h.count <= 6);
-    }
-  }
-}
-
-// ── Version check ─────────────────────────────────────────────────────────────
-
-check('ECOLOGY_PROMPT_VERSION === 1', ECOLOGY_PROMPT_VERSION === 1);
 
 // ── validateEcologySpec: happy paths ─────────────────────────────────────────
 
@@ -345,7 +287,10 @@ check('ECOLOGY_PROMPT_VERSION === 1', ECOLOGY_PROMPT_VERSION === 1);
   const fb1 = ECOLOGY_FALLBACK(['plains']);
   check('fallback plains: version=1', fb1.version === 1);
   check('fallback plains: mood="quiet"', fb1.mood === 'quiet');
-  check('fallback plains: 1-2 herds', fb1.herds.length >= 1 && fb1.herds.length <= 2);
+  // 2 grazers + up to 1 predator (wolf is plains-admissible)
+  check('fallback plains: 1-3 herds', fb1.herds.length >= 1 && fb1.herds.length <= 3);
+  check('fallback plains: includes a predator',
+    fb1.herds.some((h) => SPECIES_DEFS[h.species].aggro));
   check('fallback plains: no rare species',
     fb1.herds.every((h) => !SPECIES_DEFS[h.species].rare));
   const fb1r = validateEcologySpec(fb1, ['plains']);
@@ -395,102 +340,112 @@ check('ECOLOGY_PROMPT_VERSION === 1', ECOLOGY_PROMPT_VERSION === 1);
   }
 }
 
-// ── buildEcologyBrief ─────────────────────────────────────────────────────────
+// ── proceduralEcologySpec ─────────────────────────────────────────────────────
 
 {
-  const b1 = buildEcologyBrief(1337, 0, 0, ['plains', 'forest']);
-  const b2 = buildEcologyBrief(1337, 0, 0, ['plains', 'forest']);
-  check('brief: deterministic', JSON.stringify(b1) === JSON.stringify(b2));
-  check('brief: two flavor words', b1.flavorWords.length === 2);
-  check('brief: flavor words distinct', b1.flavorWords[0] !== b1.flavorWords[1]);
-  check('brief: seed preserved', b1.seed === 1337);
-  check('brief: ecx/ecz preserved', b1.ecx === 0 && b1.ecz === 0);
-  check('brief: biomes preserved', JSON.stringify(b1.biomes) === JSON.stringify(['plains', 'forest']));
+  const biomeSets: [string, Biome[]][] = [
+    ['plains', ['plains']],
+    ['plains+forest', ['plains', 'forest']],
+    ['alpine', ['alpine', 'mountain_forest']],
+    ['ocean', ['ocean']],
+    ['desert+beach', ['desert', 'beach']],
+    ['mixed', ['plains', 'forest', 'alpine']],
+  ];
 
-  // Different seed → different output
-  const b3 = buildEcologyBrief(9999, 0, 0, ['plains', 'forest']);
-  check('brief: different seed changes words',
-    JSON.stringify(b1.flavorWords) !== JSON.stringify(b3.flavorWords));
+  // Determinism: same inputs → identical spec.
+  for (const [label, biomes] of biomeSets) {
+    const a = proceduralEcologySpec(1337, 4, -7, biomes);
+    const b = proceduralEcologySpec(1337, 4, -7, biomes);
+    check(`procedural ${label}: deterministic`,
+      JSON.stringify(a) === JSON.stringify(b));
+  }
 
-  // Different cell coordinates → different output
-  const b4 = buildEcologyBrief(1337, 5, -3, ['plains', 'forest']);
-  check('brief: different cell changes words',
-    JSON.stringify(b1.flavorWords) !== JSON.stringify(b4.flavorWords));
+  // Different seed / cell → different spec somewhere in a small neighborhood.
+  {
+    const base = JSON.stringify(proceduralEcologySpec(1337, 0, 0, ['plains', 'forest']));
+    const seedDiff = JSON.stringify(proceduralEcologySpec(9999, 0, 0, ['plains', 'forest']));
+    let cellDiff = false;
+    for (let x = -2; x <= 2 && !cellDiff; x++) {
+      for (let z = -2; z <= 2 && !cellDiff; z++) {
+        if (x === 0 && z === 0) continue;
+        if (JSON.stringify(proceduralEcologySpec(1337, x, z, ['plains', 'forest'])) !== base) {
+          cellDiff = true;
+        }
+      }
+    }
+    check('procedural: seed changes output', seedDiff !== base);
+    check('procedural: cell changes output', cellDiff);
+  }
 
-  // Flavor spread across cells
-  const flavors = new Set<string>();
-  for (let x = -3; x <= 3; x++) {
-    for (let z = -3; z <= 3; z++) {
-      const br = buildEcologyBrief(42, x, z, ['plains']);
-      flavors.add(br.flavorWords[0]);
+  // Every generated spec validates clean across many cells and biome sets.
+  let allValid = true;
+  let firstBad = '';
+  for (const [label, biomes] of biomeSets) {
+    for (let x = -8; x <= 8; x++) {
+      for (let z = -8; z <= 8; z++) {
+        const spec = proceduralEcologySpec(42, x, z, biomes);
+        const r = validateEcologySpec(spec, biomes);
+        if (!ok(r)) {
+          allValid = false;
+          if (firstBad === '') {
+            firstBad = `${label} (${x},${z}): ${JSON.stringify(errors(r))}`;
+          }
+        }
+      }
     }
   }
-  check('brief: flavor spread over cells', flavors.size >= 4, `got ${flavors.size}`);
-}
+  check('procedural: all specs validate clean (289 cells × 6 biome sets)',
+    allValid, firstBad);
 
-// ── buildEcologyMessages ──────────────────────────────────────────────────────
+  // Variety over a large sample of plains+forest cells.
+  {
+    const moods = new Set<string>();
+    const species = new Set<string>();
+    let barren = 0;
+    let rare = 0;
+    let predator = 0;
+    const N = 21; // 441 cells
+    for (let x = -10; x <= 10; x++) {
+      for (let z = -10; z <= 10; z++) {
+        const spec = proceduralEcologySpec(7, x, z, ['plains', 'forest', 'alpine']);
+        moods.add(spec.mood);
+        if (spec.herds.length === 0) barren++;
+        for (const h of spec.herds) {
+          species.add(h.species);
+          if (SPECIES_DEFS[h.species].rare) rare++;
+          if (SPECIES_DEFS[h.species].aggro && !SPECIES_DEFS[h.species].rare) predator++;
+        }
+      }
+    }
+    const total = N * N;
+    check('procedural variety: >= 6 distinct moods', moods.size >= 6, `got ${moods.size}`);
+    check('procedural variety: >= 5 distinct species', species.size >= 5, `got ${species.size}`);
+    check('procedural variety: some barren cells', barren > 0, `got ${barren}`);
+    check('procedural variety: barren cells uncommon (< 20%)',
+      barren < total * 0.2, `got ${barren}/${total}`);
+    check('procedural variety: some rare herds', rare > 0, `got ${rare}`);
+    check('procedural variety: rare herds uncommon (< 25%)',
+      rare < total * 0.25, `got ${rare}/${total}`);
+    check('procedural variety: some predator herds', predator > 0, `got ${predator}`);
+  }
 
-{
-  const brief = buildEcologyBrief(1337, 0, 0, ['plains', 'forest']);
-  const msgs = buildEcologyMessages(brief);
-
-  check('messages: system+user pair', msgs.length === 2);
-  check('messages: system role first', msgs[0].role === 'system');
-  check('messages: user role second', msgs[1].role === 'user');
-  check('messages: system mentions schema shape',
-    msgs[0].content.includes('"version"') && msgs[0].content.includes('"herds"'));
-  check('messages: system lists all species',
-    msgs[0].content.includes('rabbit') && msgs[0].content.includes('sea_serpent') &&
-    msgs[0].content.includes('dragon') && msgs[0].content.includes('griffin'));
-  check('messages: system mentions rare rule',
-    msgs[0].content.includes('RARE') || msgs[0].content.toLowerCase().includes('rare'));
-  check('messages: system embeds fixture 0',
-    msgs[0].content.includes(JSON.stringify(ECOLOGY_FIXTURES[0])));
-  check('messages: system embeds fixture 1',
-    msgs[0].content.includes(JSON.stringify(ECOLOGY_FIXTURES[1])));
-  check('messages: user states cell biomes',
-    msgs[1].content.includes('plains') && msgs[1].content.includes('forest'));
-  check('messages: user states flavor words',
-    msgs[1].content.includes(brief.flavorWords[0]) &&
-    msgs[1].content.includes(brief.flavorWords[1]));
-  check('messages: user demands json fence',
-    msgs[1].content.includes('```json'));
-}
-
-// ── buildEcologyRetryMessage ──────────────────────────────────────────────────
-
-{
-  const retry = buildEcologyRetryMessage(['bad thing one', 'bad thing two']);
-  check('retry: lists error one', retry.includes('bad thing one'));
-  check('retry: lists error two', retry.includes('bad thing two'));
-  check('retry: demands json fence', retry.includes('```json'));
-}
-
-// ── Golden prompt hash ────────────────────────────────────────────────────────
-
-{
-  const brief = buildEcologyBrief(1337, 0, 0, ['plains', 'forest']);
-  const msgs = buildEcologyMessages(brief);
-  const hash = fnv1a(new TextEncoder().encode(JSON.stringify(msgs)));
-
-  if (GOLDEN_PROMPT_HASH === null) {
-    console.log(`\ngolden prompt hash: 0x${hash.toString(16)} — paste into GOLDEN_PROMPT_HASH`);
-  } else {
-    check(
-      'prompt: golden hash',
-      hash === GOLDEN_PROMPT_HASH,
-      `got 0x${hash.toString(16)}, want 0x${GOLDEN_PROMPT_HASH.toString(16)}`,
-    );
-    check('prompt: ECOLOGY_PROMPT_VERSION === 1', ECOLOGY_PROMPT_VERSION === 1);
+  // Ocean-only cells: only sea_serpent is admissible — spec must still be valid.
+  {
+    let allOceanValid = true;
+    for (let x = 0; x < 20; x++) {
+      const spec = proceduralEcologySpec(11, x, 100, ['ocean']);
+      if (!ok(validateEcologySpec(spec, ['ocean']))) allOceanValid = false;
+      for (const h of spec.herds) {
+        if (h.species !== 'sea_serpent') allOceanValid = false;
+      }
+    }
+    check('procedural ocean: valid, sea_serpent only', allOceanValid);
   }
 }
 
 // ── Result ────────────────────────────────────────────────────────────────────
 
 console.log(`\n${passed} passed, ${failed} failed`);
-if (failed > 0 || (GOLDEN_PROMPT_HASH as number | null) === null) {
-  if ((GOLDEN_PROMPT_HASH as number | null) === null) {
-    console.error('GOLDEN_PROMPT_HASH not set — re-run after hard-coding the hash above');
-  }
+if (failed > 0) {
   process.exit(1);
 }

@@ -25,6 +25,12 @@ const BUOYANCY = 6;       // spring toward the float line (1/s²-ish)
 const WATER_DRAG = 2.5;   // vertical velocity damping (1/s)
 const SWIM_UP_SPEED = 2.5; // Space paddles upward (m/s)
 
+/** True when the event targets a text-entry element (chat input etc.). */
+function isTextEntry(t: EventTarget | null): boolean {
+  return t instanceof HTMLElement &&
+    (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+}
+
 export class PlayerController {
   pos: Vec3;
   velY = 0;
@@ -43,7 +49,13 @@ export class PlayerController {
 
   constructor(public world: GroundQuery, spawn: Vec3) {
     this.pos = [...spawn] as Vec3;
-    window.addEventListener('keydown', (e) => this.keys.add(e.code));
+    window.addEventListener('keydown', (e) => {
+      // Ignore keystrokes typed into text fields (NPC chat input) so WASD/
+      // Space while typing don't drive the character.
+      if (isTextEntry(e.target)) return;
+      this.keys.add(e.code);
+    });
+    // Keyup always clears — even from a text field — so keys never stick.
     window.addEventListener('keyup', (e) => this.keys.delete(e.code));
     window.addEventListener('blur', () => this.keys.clear());
   }

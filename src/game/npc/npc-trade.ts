@@ -6,7 +6,7 @@
 import { ITEM_DEFS, type GameItemId } from '../items';
 
 /** Bump when the NPC prompt/trade logic changes materially. */
-export const NPC_PROMPT_VERSION = 1;
+export const NPC_PROMPT_VERSION = 9; // v9: open-topic conversation rules (no blocks)
 
 export type NpcRole = 'farmer' | 'villager' | 'merchant' | 'guard';
 
@@ -28,6 +28,7 @@ export const TRADE_CATALOG: Record<NpcRole, CatalogEntry[]> = {
     { id: 'meat_raw',     price: 4, stock: 6 },
     { id: 'egg_bird',     price: 5, stock: 4 },
     { id: 'healing_herb', price: 3, stock: 5 },
+    { id: 'wool',         price: 5, stock: 6 },
   ],
   villager: [
     { id: 'torch',       price: 6,  stock: 4 },
@@ -147,6 +148,124 @@ export function extractTradeOffer(text: string): TradeOffer | null {
   }
 
   return lastOffer;
+}
+
+// ---------------------------------------------------------------------------
+// NPC action extraction (Phase N2 — conversation consequences)
+// ---------------------------------------------------------------------------
+
+export type NpcActionKind =
+  | 'hostile' | 'afraid' | 'end'
+  // Romance (Phase N6): flirt landed / proposal answered.
+  | 'charmed' | 'accept_proposal' | 'reject_proposal'
+  // Companion (Phase N8): agreed to come along / told to stay behind.
+  | 'follow' | 'stay'
+  // Hospitality (Phase N9): NPC invites the traveller into their home.
+  | 'invite_home';
+
+const ACTION_KINDS: ReadonlySet<string> = new Set([
+  'hostile', 'afraid', 'end', 'charmed', 'accept_proposal', 'reject_proposal',
+  'follow', 'stay', 'invite_home',
+]);
+
+export interface NpcAction {
+  action: NpcActionKind;
+  /** Short in-fiction reason, e.g. "player threatened my wife". */
+  reason?: string;
+}
+
+function parseRawAction(parsed: unknown): NpcAction | null {
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const p = parsed as Record<string, unknown>;
+  if (typeof p.action !== 'string' || !ACTION_KINDS.has(p.action)) return null;
+  const action: NpcAction = { action: p.action as NpcActionKind };
+  if (typeof p.reason === 'string' && p.reason.trim() !== '') {
+    action.reason = p.reason.trim();
+  }
+  return action;
+}
+
+/**
+ * Extract an NPC action JSON object ({"action":"hostile"|"afraid"|"end",
+ * "reason":"..."}) from a reply. Same balanced-brace scan as
+ * extractTradeOffer; the last valid action wins.
+ */
+export function extractNpcAction(text: string): NpcAction | null {
+  let last: NpcAction | null = null;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '{') continue;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let end = -1;
+    for (let j = i; j < text.length; j++) {
+      const ch = text[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+      } else if (ch === '"') {
+        inStr = true;
+      } else if (ch === '{') {
+        depth++;
+      } else if (ch === '}') {
+        depth--;
+        if (depth === 0) { end = j; break; }
+      }
+    }
+    if (end === -1) continue;
+    try {
+      const parsed: unknown = JSON.parse(text.slice(i, end + 1));
+      const action = parseRawAction(parsed);
+      if (action !== null) last = action;
+    } catch { /* skip */ }
+    i = end;
+  }
+  return last;
+}
+
+/**
+ * Remove NPC control JSON (action and trade objects) from a reply so the chat
+ * bubble shows only prose. History keeps the raw text — the LLM still sees
+ * its own JSON — but the player never should.
+ */
+export function stripNpcJson(text: string): string {
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '{') { out += text[i]; continue; }
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let end = -1;
+    for (let j = i; j < text.length; j++) {
+      const ch = text[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+      } else if (ch === '"') {
+        inStr = true;
+      } else if (ch === '{') {
+        depth++;
+      } else if (ch === '}') {
+        depth--;
+        if (depth === 0) { end = j; break; }
+      }
+    }
+    if (end === -1) { out += text[i]; continue; }
+    let control = false;
+    try {
+      const parsed: unknown = JSON.parse(text.slice(i, end + 1));
+      // Any top-level "action"/"trade" object is control data — strip even
+      // malformed ones (hallucinated ids etc.) so JSON never leaks to chat.
+      control = parsed !== null && typeof parsed === 'object' &&
+        ('action' in parsed || 'trade' in parsed);
+    } catch { /* not JSON — keep as prose */ }
+    if (control) i = end; // skip the whole object
+    else out += text[i];
+  }
+  // Tidy the whitespace holes left by removed objects.
+  return out.replace(/[ \t]+\n/g, '\n').replace(/\n{2,}/g, '\n').trim();
 }
 
 export type ValidationResult =

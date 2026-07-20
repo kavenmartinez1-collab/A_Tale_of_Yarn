@@ -1,191 +1,108 @@
-# Artifex WebGPU
+# ArtifexWebGame
 
-**Browser-based LLM inference on any GPU — from scratch, in WGSL.**
+An open-world survival RPG demo rendered on **pure WebGPU** — no engine, no Three.js, just handwritten WGSL shaders, TypeScript, and Vite. An in-browser LLM "Director" (running on the same GPU as the renderer) dreams up dungeons and ecology as you explore, and settlement NPCs are live LLM chatbots with personas, memory, and moods. Everything — terrain, creatures, dialogue, inference — runs locally in your browser tab.
 
-A from-the-ground-up transformer inference engine that runs entirely in your
-browser. No server-side inference, no Python, no CUDA — just WebGPU compute
-shaders. It runs dense models, DeltaNet hybrids, 35B-class Mixture-of-Experts
-(experts streamed from CPU RAM via WASM workers), and vision-language models,
-loading weights directly from HuggingFace, GGUF files, or your local Ollama
-store.
+## Requirements
 
-> Part of the [Artifex](https://github.com/kavenmartinez1-collab/Artifex-Assistantv5)
-> project; this engine also lives standalone here.
+- **Node.js 18+** (20+ recommended)
+- A **WebGPU-capable browser**: recent Chrome or Edge on Windows/macOS work out of the box. On Linux you may need to enable `chrome://flags/#enable-unsafe-webgpu`.
+- A **GPU**. Any WebGPU-capable card renders the world; the LLM features (Director, NPC chat) like a few GB of free VRAM. On weak hardware, run with `?director=off`.
 
-> Then Paul stood in the midst of Mars' hill, and said, Ye men of Athens, I
-> perceive that in all things ye are too superstitious. For as I passed by, and
-> beheld your devotions, I found an altar with this inscription, TO THE UNKNOWN
-> GOD. Whom therefore ye ignorantly worship, him declare I unto you. God that
-> made the world and all things therein, seeing that he is Lord of heaven and
-> earth, dwelleth not in temples made with hands; Neither is worshipped with
-> men's hands, as though he needed any thing, seeing he giveth to all life, and
-> breath, and all things; And hath made of one blood all nations of men for to
-> dwell on all the face of the earth, and hath determined the times before
-> appointed, and the bounds of their habitation; That they should seek the
-> Lord, if haply they might feel after him, and find him, though he be not far
-> from every one of us: For in him we live, and move, and have our being; as
-> certain also of your own poets have said, For we are also his offspring.
-> Forasmuch then as we are the offspring of God, we ought not to think that the
-> Godhead is like unto gold, or silver, or stone, graven by art and man's
-> device. And the times of this ignorance God winked at; but now commandeth all
-> men every where to repent: Because he hath appointed a day, in the which he
-> will judge the world in righteousness by that man whom he hath ordained;
-> whereof he hath given assurance unto all men, in that he hath raised him from
-> the dead.
->
-> — Acts 17:22–31 (KJV), Paul at the Areopagus
-
-## Highlights
-
-- **Pure-WGSL transformer** — handwritten kernels for matmul (f32/INT4/INT8/k-quant),
-  attention, LayerNorm, RMSNorm, RoPE, softmax, SwiGLU, and embedding. No ML framework.
-- **Runs real models** — dense Qwen2.5/3, DeltaNet hybrids (Qwen3.5/3.6), and
-  Qwen3.6-35B-A3B MoE with experts held in CPU RAM across a WASM worker fleet.
-- **Three weight sources** — HuggingFace SafeTensors (streamed via HTTP range),
-  GGUF (k-quants + IQ4), and Ollama-store blobs — all auto-discovered.
-- **Browser-native vision** — a from-scratch WGSL vision transformer encodes
-  images for Qwen3-VL (parity-verified against HuggingFace transformers to ~1e-4)
-  and Qwen3.6 multimodal. Drag-drop, paste, or attach.
-- **Real chat** — multi-turn history with KV-prefix reuse, sliding-window context
-  management, key-point compression, and session save/load.
-- **TurboQuant KV** — 3–4 bit KV cache compression (~80% memory) on supported models.
-- **Per-card auto-config** — VRAM budget and attention limits derived from the GPU.
-
-## Setup — step by step
-
-> **Prefer zero setup?** The app also runs as a hosted static page — it's an
-> installable PWA that works offline after the first visit, streaming models
-> straight from HuggingFace (`.github/workflows/deploy-pages.yml` deploys it
-> to GitHub Pages). The local install below additionally unlocks
-> machine-local models: Ollama, your HF cache, and `models/` folders.
-
-New to this? Follow these in order. You'll copy-paste a few commands; that's it.
-
-### 1. Install the two things you need
-
-- **Node.js** (version 18 or newer) — download the "LTS" installer from
-  [nodejs.org](https://nodejs.org/) and run it (click Next through the prompts).
-- **Git** — from [git-scm.com/downloads](https://git-scm.com/downloads) (also
-  just click through). Git is how you copy the project to your computer.
-- A **WebGPU browser** — **use Google Chrome** (it works most reliably). You
-  almost certainly already have a recent enough version.
-
-### 2. Open a terminal
-
-- **Windows**: press the Start key, type `cmd`, press Enter.
-- **Mac**: press Cmd+Space, type `terminal`, press Enter.
-
-You'll paste commands here and press Enter after each.
-
-### 3. Download the project (clone it)
-
-```bash
-git clone https://github.com/kavenmartinez1-collab/Artifex_Web.git
-cd Artifex_Web
-```
-
-The first line copies the project into a folder; the second moves into it.
-
-### 4. Install and start
+## Install & run
 
 ```bash
 npm install
 npm run dev
 ```
 
-`npm install` downloads the project's building blocks (takes a minute, one
-time only). `npm run dev` starts it and **opens the app in your browser
-automatically**. Leave this terminal window open while you use the app — it's
-the local server. To stop it later, click the terminal and press `Ctrl+C`.
+`npm run dev` starts Vite on `http://localhost:5173` plus a small local dev server. The game lives at:
 
-### 5. Load a model and chat
+```
+http://localhost:5173/game.html
+```
 
-In the app, the easiest first run: click **Browse** to see models already on
-your computer (from Ollama, if you have it), or type a small model name like
-`Qwen/Qwen2.5-0.5B-Instruct` into the model box and click **Load**. Wait for
-"inference engine ready," then type a message. The first load downloads the
-model (small models are a few hundred MB); after that it's cached.
+Useful URL flags (append to `game.html`):
 
-**Next time** you want to use it, you only need steps 2 and 4 — open a terminal,
-`cd Artifex_Web`, and `npm run dev`.
-
-> Everything runs on **your** computer, in your browser — no data is sent
-> anywhere. The small local server only hands model files to the browser and
-> reports your GPU's free memory; it does no AI itself.
-
-## Using local models
-
-Three sources are auto-discovered — none require configuration:
-
-| Source | How |
+| Flag | Effect |
 |---|---|
-| **Ollama** | Any pulled model appears as `ollama/<name>:<tag>`. |
-| **HuggingFace cache** | Anything previously downloaded (`HF_HOME` respected). |
-| **`models/` folder** | Drop GGUF files or model folders in `models/` (see `models/README.md`). |
+| `?director=off` | Disable the LLM Director; dungeons/ecology fall back to deterministic fixtures |
+| `?npcllm=fast\|abliterated\|default` | NPC dialogue model. `fast` (default): abliterated Qwen3-1.7B — uncensored, snappy replies. `abliterated`: Qwen3-4B — smarter, slower. `default`: reuses the Director model (no extra download, stock safety training) |
+| `?wipe=1` | Blank slate: delete ALL saved data (saves, slots, NPC memories, caches) before boot |
+| `?tod=0.5` | Freeze the day/night cycle at a fixed time |
+| `?weather=clear\|overcast\|rain` | Pin the weather |
 
-To point at model directories elsewhere on disk, create
-`model-dirs.local.json` next to `package.json` (gitignored):
+The NPC chat model (~1.1 GB) downloads from Hugging Face the first time you approach a settlement and is cached after that. Until it's ready, NPCs answer with scripted fallback lines — give it a few minutes on first run.
 
-```json
-["D:/llm-models/gguf", "D:/my-quants"]
-```
+## Controls
 
-or set `ARTIFEX_MODEL_DIRS` (`;`-separated). Only aliases ever reach the
-browser — absolute paths stay server-side.
+Click the canvas to lock the pointer.
 
-## Choosing a model
+| Input | Action |
+|---|---|
+| WASD | Move (camera-relative) |
+| Mouse | Orbit camera; wheel zooms |
+| Shift | Sprint (drains stamina) |
+| Space | Jump / paddle up while swimming / ascend on a flying mount |
+| Q | Descend on a flying mount |
+| Left click | Gather, attack, place, ignite, shoot bow, throw, feed, fill container — context-sensitive |
+| E | Interact: talk, loot, mount/dismount, drink from fresh water, enter dungeons, upgrade campfire to forge, eat/drink held item, attempt jail escape |
+| F (hold) | Mount attack — dragon fire breath, hoof/claw stomp on other mounts |
+| 1–9 | Select hotbar slot |
+| I / Tab | Inventory (armor equip lives here) |
+| B | Crafting |
+| C | Character customization |
+| Esc | Close panel, or open the game menu (Save / Load / New Game) |
+| R | Toggle debug fly camera |
+| F8 / F9 | Debug snapshot / auto-capture |
 
-The engine fits weights in VRAM (experts for MoE models stream from system
-RAM). It tells you up front if a model won't fit on your GPU — pick a smaller
-one or a lower quant. As a rough guide, a model needs a bit more free VRAM than
-its file size; an ~8 GB card comfortably runs 7–9B models at Q4_K_M.
+## Staying alive
 
-**GGUF quantization**: the engine runs `Q4_0`, `Q5_0`, `Q8_0`, the K-quants
-`Q2_K`/`Q3_K`/`Q4_K_M`/`Q5_K_M`/`Q6_K`, and the IQ4 pair `IQ4_XS`/`IQ4_NL`
-(plus F16/F32/BF16). The grid-codebook IQ quants (`IQ1*`/`IQ2*`/`IQ3*`) and
-`Q4_1`/`Q5_1` aren't supported yet; the engine says so before downloading.
-When in doubt, grab a `*-Q4_K_M.gguf` (or `*-IQ4_XS.gguf` to save VRAM —
-same 4-bit class, slightly better quality per byte).
+Your vitals are **health, thirst, stamina, and temperature** (a BOTW-style warmth model — the strongest warm source wins).
 
-**Model families**: verified — Llama, Qwen3 / Qwen3.5 / Qwen3.6 (incl. the
-35B MoE), Gemma 4. Experimental (recognized, attempted, not yet fully
-verified — the app flags these on load) — Qwen2.5, Mistral. Not yet
-supported: Gemma 2/3, Phi-3 (fused QKV), DeepSeek (MLA), and Mamba2 hybrids
-(Nemotron-H, Granite-hybrid). Loading an unsupported architecture gives a
-clear message naming it, never silent garbage.
+- **Drink**: stand at a river or inland pond and press E, or craft a container and left-click to fill it. Ocean and beach water is salt — undrinkable.
+- **Gather**: punch (or better, axe) trees for logs, mine rocks with a pickaxe, pick bushes. Three swings per node with the right tool.
+- **Campfire**: craft a campfire kit, left-click to place, ignite with a fire starter or torch, feed it fuel. Warmth, light, and a cooking station.
+- **Forge**: press E on a lit campfire while carrying 8 stone to upgrade it. Iron tools, swords, and armor are forged here.
+- **Cook**: recipes at a fire (some need a cooking pot in your pack) turn raw food into meals with timed effects.
+- **Craft**: press B — roughly 56 recipes across tools, weapons, armor, food, and camp gear, gated by station (hand / fire / forge).
+- **Shelter**: place fiber, wool, or hide tents for warmth and rain cover; higher tiers fight harsher cold.
+- **Weather**: storms bring lightning that can strike you and set trees ablaze — and fire spreads. Wearing iron armor in a storm makes you a bigger target.
 
-## Vision
+## What's out there
 
-Load a vision model (e.g. `Qwen/Qwen3-VL-4B-Instruct`, or a Qwen3.6 GGUF with a
-sibling `mmproj-*.gguf`) and the 📎 button activates. Attach, paste, or
-drag-drop an image; supported formats are PNG, JPEG, WebP, GIF, BMP. The vision
-transformer runs in WGSL alongside the language model.
+- **Settlements** — ranches, villages, towns, and castles, populated by LLM-driven NPCs. Every conversation is live and open-ended — talk about anything: personas, persistent memory of what you've said, disposition that warms or sours.
+- **Trade** — buy and sell with NPC stock and gold; prices can be haggled down (to a floor — they're not fools).
+- **Crime** — witnessed misdeeds put a bounty on your head. Pay it, serve jail time, or try to break out.
+- **Romance** — flirt, court, and marry an NPC. Spouses remember, and keep small gifts for you.
+- **Wildlife** — rabbits, deer, and horses share the world with wolves and bears that attack on sight, plus rare territorial creatures best approached with a plan (or not at all).
+- **Taming & mounts** — feed animals their favorite food, ride horses, and win over — or hatch from a stolen egg — a dragon you can fly, raining fire with F.
+- **Dungeons** — crypts, caves, and ruins authored by the in-browser LLM Director, persisted per world seed so re-entry is deterministic.
+- **Loot & gear** — you spawn with a full iron kit, gold, and trade stock; progression runs up to forged iron and dragonscale armor.
+- **Save/load** — multiple save slots via the Esc menu; the world persists across reloads.
 
-Qwen3-VL and Qwen3.6 are parity-verified. Other families (Gemma 4) are marked
-**EXPERIMENTAL** in the UI until they pass a reference parity run.
-
-## How it works
-
-```
-HF SafeTensors ─┐
-local GGUF       ├─→  ModelDescriptor  ─→  WGSL forward pass  ─→  streaming chat
-Ollama blob     │    (per-layer kind,        (attention / DeltaNet
-images ──────────┘    rope, MoE, vision)      SSM / MoE / vision tower)
-```
-
-A single descriptor parameterizes the whole forward pass, so one engine serves
-many architectures and weight formats. Correctness is held by parity harnesses
-that diff against reference implementations (llama.cpp for text, HuggingFace
-transformers for vision) — see the `__VISION_PARITY__` and `__TQ_PARITY__`
-console helpers.
-
-## Developer scripts
+## Development
 
 ```bash
-npm run typecheck     # tsc --noEmit
-npm run build         # production bundle
-npm run test:e2e      # Playwright kernel tests (headless WebGPU)
+npx tsc --noEmit        # typecheck (or: npm run typecheck)
 ```
+
+Game logic is deliberately split into pure, DOM/GPU-free modules with fast Node test suites under `scripts/`:
+
+```bash
+npx tsx scripts/test-vitals.mts
+npx tsx scripts/test-crafting.mts
+npx tsx scripts/test-crime.mts
+npx tsx scripts/test-taming.mts
+# ... see scripts/test-*.mts for the full set
+```
+
+End-to-end tests use Playwright driving real Chrome (headless Chromium lacks working WebGPU on Windows):
+
+```bash
+npm run test:e2e        # playwright test, specs in tests/e2e
+```
+
+The game exposes `window.__gameReady`, `window.__gameStats`, and `window.__gameDebug` for machine-readable assertions in e2e specs.
 
 ## License
 

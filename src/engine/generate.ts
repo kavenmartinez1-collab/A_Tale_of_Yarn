@@ -120,6 +120,12 @@ export interface GenerateOptions {
   /** Persistent KV session for multi-turn reuse. When set, generate() keeps
    *  the cache alive across calls instead of destroying it. */
   kvSession?: KVSessionState;
+  /** Per-call prefill chunk size. Background callers (Director/Ecology) use a
+   *  small chunk to keep frame hitches short; leaving it unset uses the fast
+   *  production default. Replaces the racy global __DEBUG_PREFILL_CHUNK__
+   *  set/restore-around-await pattern, which leaked the small chunk into
+   *  concurrent generations (NPC chat prefill ran 4x slower). */
+  prefillChunk?: number;
 }
 
 // ── Multimodal prompts ───────────────────────────────────────────────────
@@ -720,7 +726,7 @@ export function generate(
     // to force a specific chunk size, e.g. 1 to take the single-row path on every
     // prompt token (slow, but isolates batched-GEMM precision from chunked-prefill
     // semantics). When unset, use the production default.
-    const chunkOverride = (globalThis as any).__DEBUG_PREFILL_CHUNK__;
+    const chunkOverride = opts?.prefillChunk ?? (globalThis as any).__DEBUG_PREFILL_CHUNK__;
     const PREFILL_CHUNK = (typeof chunkOverride === 'number' && chunkOverride > 0)
       ? Math.floor(chunkOverride)
       : PREFILL_CHUNK_DEFAULT;

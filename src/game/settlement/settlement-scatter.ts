@@ -52,6 +52,20 @@ function rollKind(r: number): SettlementKind {
   return 'castle';
 }
 
+/**
+ * Forced sites: cells whose settlement is pinned to an exact kind + position,
+ * replacing whatever the cell would roll. Used to guarantee a castle town
+ * within walking distance of world spawn so every feature (guards, crime,
+ * trade, first-visit questioning...) is testable right at the start.
+ *
+ * Position was validated offline against seed 1337: h=10.7 m (above sand),
+ * ring Δh=4.3 m (castle budget 7), 143 m clear of the cell's dungeon
+ * entrance, ~260 m from spawn (32, 32).
+ */
+const FORCED_SITES = new Map<string, { kind: SettlementKind; x: number; z: number }>([
+  ['-1,0', { kind: 'castle', x: -191, z: 166 }],
+]);
+
 /** Per-cell settlement roll. Deterministic; memoize at the call site. */
 export function settlementSiteAt(
   seed: number,
@@ -59,6 +73,17 @@ export function settlementSiteAt(
   scz: number,
   heightAt: (x: number, z: number) => number,
 ): SettlementSite | null {
+  const forced = FORCED_SITES.get(`${scx},${scz}`);
+  if (forced !== undefined) {
+    return {
+      kind: forced.kind,
+      x: forced.x,
+      y: heightAt(forced.x, forced.z),
+      z: forced.z,
+      radius: SETTLEMENT_RADIUS[forced.kind],
+      seed: mix32(seed ^ SALT, scz, scx),
+    };
+  }
   const rng = mulberry32(mix32(seed ^ SALT, scx, scz));
   if (rng() >= PRESENCE) return null;
   const kind = rollKind(rng());

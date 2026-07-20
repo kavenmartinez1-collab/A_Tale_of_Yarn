@@ -63,6 +63,29 @@ fn vnoise(p: vec2<f32>) -> f32 {
   return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
+// --- shared stylized lighting helpers (keep identical across scene shaders) --
+
+// Hemispheric ambient (cool sky above, warm bounce below) + half-Lambert sun
+// + a weak cool moon fill at night (starVis-gated, mirrored sun direction).
+fn sceneLight(albedo: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+  let up = n.y * 0.5 + 0.5;
+  let ambTint = mix(vec3<f32>(1.06, 0.98, 0.88), vec3<f32>(0.86, 0.96, 1.14), up);
+  let diff = dot(n, frame.sunDir) * 0.5 + 0.5;
+  let sun = (0.26 * diff + 0.62 * diff * diff) * frame.sunColor;
+  let moonDir = normalize(vec3<f32>(-frame.sunDir.x, abs(frame.sunDir.y), -frame.sunDir.z));
+  let moon = max(dot(n, moonDir), 0.0) * frame.starVis * vec3<f32>(0.05, 0.06, 0.10);
+  return albedo * (frame.ambient * ambTint + sun + moon);
+}
+
+// Gentle filmic-ish grade: lifts shadows, rolls off highlights, +10% sat.
+fn grade(c: vec3<f32>) -> vec3<f32> {
+  let x = max(c, vec3<f32>(0.0));
+  let toned = x * (vec3<f32>(1.25) + x * 0.45)
+            / (vec3<f32>(1.0) + x * (vec3<f32>(0.90) + x * 0.45));
+  let l = dot(toned, vec3<f32>(0.2126, 0.7152, 0.0722));
+  return mix(vec3<f32>(l), toned, 1.10);
+}
+
 @vertex
 fn vs_main(
   @location(0) position: vec3<f32>,
@@ -123,13 +146,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   // Fixed-color objects (player, props) skip the terrain bands.
   albedo = mix(albedo, object.color.rgb, step(0.5, object.offset.w));
 
-  // Half-Lambert sun + flat ambient — soft stylized lighting, no shadows yet.
-  let diff = dot(n, frame.sunDir) * 0.5 + 0.5;
-  var color = albedo * (frame.ambient + (0.30 * diff + 0.55 * diff * diff) * frame.sunColor);
+  // Hemispheric ambient + half-Lambert sun + night moon fill (sceneLight).
+  var color = sceneLight(albedo, n);
 
   // Exponential distance fog toward the sky/horizon color.
   let fog = 1.0 - exp(-frame.fogDensity * dist);
   color = mix(color, frame.fogColor, fog);
 
-  return vec4<f32>(color, 1.0);
+  return vec4<f32>(grade(color), 1.0);
 }

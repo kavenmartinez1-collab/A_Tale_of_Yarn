@@ -13,7 +13,8 @@ import { entranceSiteAt, DCELL } from '../src/game/dungeon/entrance-site';
 
 /** Update ONLY on deliberate scatter/heightfield changes. */
 // Rebaked for Phase L1 (castle kind added, new distribution).
-const GOLDEN_HASH: number | null = 0x33ff4024;
+// Rebaked for forced near-spawn castle "Greenholm" at (-191, 166), cell (-1,0).
+const GOLDEN_HASH: number | null = 0x38b59f91;
 
 const WORLD_SEED = 1337;
 

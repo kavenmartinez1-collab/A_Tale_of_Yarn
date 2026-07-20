@@ -1,22 +1,19 @@
 /**
- * Ecology spec — the JSON contract between the AI Ecologist and the
- * deterministic entity-scatter system. LLM-friendly on purpose: enums,
- * small arrays, no coordinates — the LLM decides what/why, scatter()
- * decides where every creature appears.
+ * Ecology spec — the contract between per-cell wildlife design and the
+ * deterministic entity-scatter system: enums, small arrays, no coordinates —
+ * the spec decides what/why, scatter() decides where every creature appears.
+ *
+ * Specs are authored by proceduralEcologySpec(): herd composition is
+ * invisible background data the player never reads, so a seeded generator
+ * gives the same variety as the old LLM Ecologist at zero GPU cost (the
+ * model now serves NPC dialogue only — the one place its output is read).
  *
  * validateEcologySpec() is hand-rolled (no deps, supply-chain policy).
- * Bad Ecologist output must never crash the game: callers log errors and
- * fall back to ECOLOGY_FALLBACK().
  */
 
 import type { Biome } from '../biome';
 import { type Species, SPECIES_DEFS } from './entity-types';
-
-/** Bump when the spec schema changes materially — invalidates persisted specs. */
-export const ECOLOGY_PROMPT_VERSION = 1;
-
-/** localStorage key prefix for persisted ecology specs. */
-export const ECOLOGY_KEY = 'artifex-ecology:v1';
+import { mix32 } from '../dungeon/dungeon-layout';
 
 export interface HerdSpec {
   species: Species;
@@ -165,18 +162,29 @@ export function validateEcologySpec(
 
 /**
  * Deterministic fallback spec used when Ecologist output fails validation.
- * Picks up to 2 common (non-rare) species admissible for the given biomes,
- * in stable SPECIES_DEFS key order. Each chosen species gets count 2.
+ * Picks up to 2 common (non-rare, non-aggro) species admissible for the given
+ * biomes, in stable SPECIES_DEFS key order, plus at most 1 common predator
+ * (aggro, non-rare — wolf/bear) so forests stay dangerous without the LLM.
+ * Each chosen species gets count 2.
  */
 export function ECOLOGY_FALLBACK(cellBiomes: Biome[]): EcologySpec {
   const herds: HerdSpec[] = [];
   for (const sp of Object.keys(SPECIES_DEFS) as Species[]) {
     if (herds.length >= 2) break;
     const def = SPECIES_DEFS[sp];
-    if (def.rare) continue;
+    if (def.rare || def.aggro) continue;
     const admissible = def.biomes.some((b) => cellBiomes.includes(b));
     if (admissible) {
       herds.push({ species: sp, count: 2 });
+    }
+  }
+  // One predator herd (first admissible common aggro species — wolf, then bear).
+  for (const sp of Object.keys(SPECIES_DEFS) as Species[]) {
+    const def = SPECIES_DEFS[sp];
+    if (def.rare || !def.aggro) continue;
+    if (def.biomes.some((b) => cellBiomes.includes(b))) {
+      herds.push({ species: sp, count: 2 });
+      break;
     }
   }
   // If no admissible common species exist, include the sea_serpent (ocean
@@ -190,31 +198,80 @@ export function ECOLOGY_FALLBACK(cellBiomes: Biome[]): EcologySpec {
   return { version: 1, mood: 'quiet', herds };
 }
 
-// ── Fixtures (few-shot examples, must be valid) ──────────────────────────────
+// ── Procedural generator ─────────────────────────────────────────────────────
 
 /**
- * Known-valid ecology specs used as few-shot examples in the prompt.
- * Both must pass validateEcologySpec() against representative biome lists
- * (enforced in scripts/test-ecology.mts).
+ * Deterministic per-cell ecology authoring — replaces the LLM Ecologist.
+ * Seeded xorshift32 keyed by (seed, ecx, ecz) gives stable, varied herd
+ * compositions: mostly grazers, sometimes a predator pack, rarely a rare
+ * beast, occasionally a barren cell. Output always satisfies
+ * validateEcologySpec by construction (checked as belt-and-braces).
  */
-export const ECOLOGY_FIXTURES: EcologySpec[] = [
-  // Plains / forest cell — common grazers and small game.
-  {
-    version: 1,
-    mood: 'peaceful',
-    herds: [
-      { species: 'rabbit', count: 4 },
-      { species: 'deer', count: 3 },
-      { species: 'horse', count: 2 },
-    ],
-  },
-  // Alpine cell with a solitary dragon.
-  {
-    version: 1,
-    mood: 'dangerous',
-    herds: [
-      { species: 'bird', count: 3 },
-      { species: 'dragon', count: 1 },
-    ],
-  },
-];
+export function proceduralEcologySpec(
+  seed: number, ecx: number, ecz: number, biomes: Biome[],
+): EcologySpec {
+  let s = mix32(seed, ecx, ecz) >>> 0;
+  if (s === 0) s = 1;
+  const rnd = (): number => {
+    s ^= s << 13; s >>>= 0;
+    s ^= s >>> 17;
+    s ^= s << 5; s >>>= 0;
+    return s / 4294967296;
+  };
+  const pick = <T>(arr: T[]): T => arr[Math.floor(rnd() * arr.length)];
+
+  // Split admissible species by role.
+  const grazers: Species[] = [];
+  const predators: Species[] = [];
+  const rares: Species[] = [];
+  for (const sp of Object.keys(SPECIES_DEFS) as Species[]) {
+    const def = SPECIES_DEFS[sp];
+    if (!def.biomes.some((b) => biomes.includes(b))) continue;
+    if (def.rare) rares.push(sp);
+    else if (def.aggro) predators.push(sp);
+    else grazers.push(sp);
+  }
+
+  const herds: HerdSpec[] = [];
+  let total = 0;
+
+  // ~7% of cells are barren — silence is part of the variety.
+  const barren = rnd() < 0.07;
+  if (!barren) {
+    // 1–3 distinct grazer herds of 2–5 individuals (capped by the 14 total).
+    const nGrazers = Math.min(grazers.length, 1 + Math.floor(rnd() * 3));
+    const pool = grazers.slice();
+    for (let i = 0; i < nGrazers; i++) {
+      const sp = pool.splice(Math.floor(rnd() * pool.length), 1)[0];
+      const count = Math.min(2 + Math.floor(rnd() * 4), 14 - total);
+      if (count < 1) break;
+      herds.push({ species: sp, count });
+      total += count;
+    }
+    // 45% chance of one predator pack (1–3) — keeps the wilds dangerous.
+    if (predators.length > 0 && rnd() < 0.45 && total < 14) {
+      const count = Math.min(1 + Math.floor(rnd() * 3), 14 - total);
+      herds.push({ species: pick(predators), count });
+      total += count;
+    }
+    // 10% chance of a rare beast — count exactly 1 per the validator.
+    if (rares.length > 0 && rnd() < 0.1 && total < 14 && herds.length < 5) {
+      herds.push({ species: pick(rares), count: 1 });
+      total += 1;
+    }
+  }
+
+  // Mood follows composition so HUD flavor matches what the player meets.
+  const hasRare = herds.some((h) => SPECIES_DEFS[h.species].rare);
+  const hasPredator = herds.some((h) => SPECIES_DEFS[h.species].aggro);
+  const mood =
+    herds.length === 0 ? pick(['barren', 'silent', 'empty winds']) :
+    hasRare ? pick(['eerie stillness', 'ancient presence', 'ominous']) :
+    hasPredator ? pick(['tense', 'watchful', 'wild']) :
+    total >= 9 ? pick(['thriving', 'teeming', 'lively']) :
+    pick(['peaceful', 'quiet', 'serene']);
+
+  const spec: EcologySpec = { version: 1, mood, herds };
+  const checked = validateEcologySpec(spec, biomes);
+  return 'errors' in checked ? ECOLOGY_FALLBACK(biomes) : spec;
+}

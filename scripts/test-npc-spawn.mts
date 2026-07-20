@@ -17,7 +17,10 @@ import type { SettlementKind } from '../src/game/settlement/settlement-scatter';
 
 /** Update ONLY on deliberate spawn-logic changes. */
 // Baked for Phase L1 initial implementation.
-const GOLDEN_NPC_SPAWN_HASH: number | null = 0xae0ea4a1;
+// Old hash (pre settlement visual pass v3 — layout pads changed): 0xae0ea4a1
+// Old hash (pre merchant→stall / guard→keep pad preferences): 0x2236d944
+// Old hash (pre door-side spawn fix — NPCs no longer inside buildings): 0xff3291b4
+const GOLDEN_NPC_SPAWN_HASH: number | null = 0xe2026ae7;
 
 // ---------------------------------------------------------------------------
 // Harness

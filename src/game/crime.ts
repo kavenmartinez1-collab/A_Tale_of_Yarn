@@ -42,7 +42,8 @@ export type CrimeKind =
   | 'assault'
   | 'murder'
   | 'kill_owned_animal'
-  | 'escape_jail';
+  | 'escape_jail'
+  | 'threat';
 
 /** Gold bounty value for each crime kind. */
 export const BOUNTY_AMOUNTS: Record<CrimeKind, number> = {
@@ -52,6 +53,7 @@ export const BOUNTY_AMOUNTS: Record<CrimeKind, number> = {
   murder:          1000,
   kill_owned_animal: 30,
   escape_jail:      100,
+  threat:            15,
 };
 
 /** Per-region ledger: outstanding bounty and a capped, chronological log. */
@@ -187,6 +189,7 @@ export function escapeJail(state: CrimeState, region: string, t: number): number
 
 const VALID_CRIME_KINDS: ReadonlySet<string> = new Set<CrimeKind>([
   'theft', 'horse_theft', 'assault', 'murder', 'kill_owned_animal', 'escape_jail',
+  'threat',
 ]);
 
 export function serializeCrimeState(s: CrimeState): string {
