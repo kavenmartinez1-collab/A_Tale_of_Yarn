@@ -40,47 +40,59 @@ export function buildSettlementSolids(s: ResolvedSettlement): SettlementSolids {
       x1: pad.wx + hx, z1: pad.wz + hz,
       top: pad.wy + pad.h,
     };
+    /** Blocker + the platform skirt that hides the downhill slope gap. */
+    const solidWithSkirt = (): void => {
+      blockers.push(foot);
+      platforms.push({
+        x0: foot.x0 - SKIRT_MARGIN, z0: foot.z0 - SKIRT_MARGIN,
+        x1: foot.x1 + SKIRT_MARGIN, z1: foot.z1 + SKIRT_MARGIN,
+        top: pad.wy + 0.08,
+      });
+    };
     switch (pad.type) {
+      // Roofed structures: solid, and their skirt is standable.
       case 'house':
+      case 'townhouse':
       case 'barn':
       case 'keep':
-        blockers.push(foot);
-        platforms.push({
-          x0: foot.x0 - SKIRT_MARGIN, z0: foot.z0 - SKIRT_MARGIN,
-          x1: foot.x1 + SKIRT_MARGIN, z1: foot.z1 + SKIRT_MARGIN,
-          top: pad.wy + 0.08,
-        });
+      case 'church':
+      case 'tavern':
+      case 'longhouse':
+      case 'smithy':
+      case 'mill':
+      case 'granary':
+      case 'tower':
+      case 'wall':
+      case 'stable':
+        solidWithSkirt();
         break;
+      // Solid furniture and clutter: block, but no standable top — a player
+      // perched on a hay bale or a hedge looks worse than one walking round it.
       case 'well':
       case 'fence':
       case 'stall':
+      case 'trough':
+      case 'pillory':
+      case 'shrine':
+      case 'barrels':
+      case 'hedge':
+      case 'cart':
+      case 'woodpile':
+      case 'haystack':
+      case 'brazier':
         blockers.push(foot);
         break;
       case 'ruin':
         if (pad.h >= MIN_BLOCK_H) blockers.push(foot);
         else platforms.push(foot); // rubble: step onto it
         break;
+      // Poles, cloth and worked ground — walk straight through.
       case 'signpost':
       case 'lamp':
-        break; // poles — not worth blocking
-      case 'tower':
-      case 'wall':
-        blockers.push(foot);
-        platforms.push({
-          x0: foot.x0 - SKIRT_MARGIN, z0: foot.z0 - SKIRT_MARGIN,
-          x1: foot.x1 + SKIRT_MARGIN, z1: foot.z1 + SKIRT_MARGIN,
-          top: pad.wy + 0.08,
-        });
-        break;
-      case 'stable':
-        // Stable is enterable from the front (-z face) — only block left/right/back walls.
-        // Simplified: block the full footprint but add skirt as platform.
-        blockers.push(foot);
-        platforms.push({
-          x0: foot.x0 - SKIRT_MARGIN, z0: foot.z0 - SKIRT_MARGIN,
-          x1: foot.x1 + SKIRT_MARGIN, z1: foot.z1 + SKIRT_MARGIN,
-          top: pad.wy + 0.08,
-        });
+      case 'banner':
+      case 'washline':
+      case 'crops':
+      case 'graves':
         break;
       case 'gatehouse': {
         // Two flanking piers; leave a 4.4 m passage in the center.
@@ -127,6 +139,14 @@ export function buildSettlementSolids(s: ResolvedSettlement): SettlementSolids {
           top: pad.wy + 0.08,
         });
         break;
+      default: {
+        // Exhaustiveness guard. A new PadType with no case here would be
+        // silently non-solid — the player walks through a new building and
+        // nothing anywhere reports a problem. Make it a compile error.
+        const unhandled: never = pad.type;
+        void unhandled;
+        break;
+      }
     }
   }
   return { blockers, platforms };

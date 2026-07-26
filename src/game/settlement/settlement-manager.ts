@@ -1,8 +1,14 @@
 /**
  * SettlementManager — discovers settlement sites near the player (same lazy
  * 3×3-cell memoized scan as dungeon entrances), resolves + meshes each one on
- * first approach, and serves its ≤ 4 palette-batched draws through the
- * dungeon pipeline (surface mode, zeroed lights) within draw distance.
+ * first approach, and serves its palette-batched draws through the dungeon
+ * pipeline (surface mode, zeroed lights) within draw distance. One draw per
+ * palette in use: 5 for a ruin, 9 for a castle town (settlement-palette.ts).
+ *
+ * Meshes are built once and kept: a castle town is ~72k verts (1.7 MB of
+ * vertex buffer) and takes ~14 ms to build, so the cost is a one-off hitch on
+ * first approach rather than anything per-frame. Nothing is ever evicted, so
+ * a very long walk accumulates buffers for every settlement ever visited.
  *
  * Also the registry for collision + signpost interaction (C-M4/5): `nearby()`
  * exposes the resolved settlements around a position.
@@ -10,10 +16,10 @@
 
 import type { Vec3 } from '../math';
 import type { HeightField } from '../noise';
-import { LIGHTS_BUFFER_SIZE, type DungeonDraw, type Renderer } from '../renderer';
+import { LIGHTS_BUFFER_SIZE, STRIDE_PROP, type DungeonDraw, type Renderer } from '../renderer';
 import { settlementSiteAt, SCELL, type SettlementSite } from './settlement-scatter';
 import { resolveSettlement, type ResolvedSettlement } from './settlement-layout';
-import { buildSettlementMeshes } from './settlement-mesh';
+import { buildSettlementMeshes, type SettlementFlame } from './settlement-mesh';
 import {
   spawnSettlementNpcs, resolveNpcs, type ResolvedNpc,
 } from '../npc/npc-spawn';
@@ -28,6 +34,8 @@ interface Active {
   resolved: ResolvedSettlement;
   draws: DungeonDraw[];
   npcs: ResolvedNpc[];
+  /** World-space brazier / gate-torch / lantern anchors for the fire system. */
+  flames: SettlementFlame[];
 }
 
 export class SettlementManager {
@@ -120,6 +128,21 @@ export class SettlementManager {
     return out;
   }
 
+  /**
+   * Brazier / gate-torch / lantern anchors within draw distance, for the
+   * billboard fire system. Culled the same way `draws()` is.
+   */
+  flamePoints(): SettlementFlame[] {
+    const out: SettlementFlame[] = [];
+    for (const { resolved, flames } of this.active.values()) {
+      if (flames.length === 0) continue;
+      const d = Math.hypot(
+        this.pos[0] - resolved.site.x, this.pos[2] - resolved.site.z);
+      if (d <= SETTLEMENT_DRAW_DIST) out.push(...flames);
+    }
+    return out;
+  }
+
   /** Resolved settlements meshed so far (collision + signposts). */
   nearby(): ResolvedSettlement[] {
     return [...this.active.values()].map((a) => a.resolved);
@@ -202,7 +225,8 @@ export class SettlementManager {
     }
     const resolved = resolveSettlement(site,
       (x, z) => this.heightField.heightAt(x, z));
-    const draws: DungeonDraw[] = buildSettlementMeshes(resolved).map(
+    const flames: SettlementFlame[] = [];
+    const draws: DungeonDraw[] = buildSettlementMeshes(resolved, flames).map(
       ({ palette, verts }) => {
         const vertexBuffer = this.renderer.device.createBuffer({
           label: `settlement-${key}-pal${palette}`,
@@ -211,10 +235,13 @@ export class SettlementManager {
         });
         this.renderer.device.queue.writeBuffer(vertexBuffer, 0, verts);
         // Meshes are world-space: zero offset, surface material 100+palette.
-        const { bindGroup } =
+        const { bindGroup, shadowBindGroup } =
           this.renderer.createObjectBindGroup(0, 0, 0, 100 + palette);
         return {
-          draw: { vertexBuffer, indexBuffer: null, count: verts.length / 3, bindGroup },
+          draw: {
+            vertexBuffer, indexBuffer: null, count: verts.length / (STRIDE_PROP / 4),
+            bindGroup, shadowBindGroup,
+          },
           lightsBindGroup: this.lightsBindGroup!,
         };
       });
@@ -224,6 +251,6 @@ export class SettlementManager {
       spawnedNpcs, site.x, site.z,
       (x, z) => this.heightField.heightAt(x, z),
     );
-    this.active.set(key, { resolved, draws, npcs });
+    this.active.set(key, { resolved, draws, npcs, flames });
   }
 }

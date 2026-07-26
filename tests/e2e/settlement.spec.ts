@@ -46,7 +46,10 @@ test('signpost welcomes the player to a named settlement', async ({ page }) => {
     () => window.__gameDebug!.nearestSettlement());
   expect(settlement).not.toBeNull();
   expect(settlement!.name.length).toBeGreaterThan(2);
-  expect(['ruins', 'ranch', 'village', 'town']).toContain(settlement!.kind);
+  // 'castle' belongs here: settlement-scatter pins a castle town at world
+  // (-191, 166), ~260 m from spawn, so it is routinely the nearest settlement.
+  expect(['ruins', 'ranch', 'village', 'town', 'castle'])
+    .toContain(settlement!.kind);
 
   await page.keyboard.press('e');
   await page.waitForFunction(

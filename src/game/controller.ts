@@ -71,7 +71,17 @@ export class PlayerController {
     if (this.keys.has('KeyA')) ix -= 1;
 
     const floatY = SEA_LEVEL - SWIM_SINK;
-    this.swimming = this.swimEnabled && this.pos[1] < floatY && !this.grounded;
+    // You float when the water is deep enough to lift you — whether or not
+    // your feet can still reach the bottom.
+    //
+    // This used to also require !grounded, which meant that wading down a
+    // shelving seabed never started a swim: every step landed you back on the
+    // bottom, so `grounded` stayed true and you walked along the sea floor
+    // fully submerged while the screen filled with blue. Deciding on water
+    // depth instead makes entering the sea a swim, and leaves genuinely
+    // shallow water (bed above the float line) as ordinary wading.
+    const bed = this.world.groundHeight(this.pos[0], this.pos[2], RADIUS);
+    this.swimming = this.swimEnabled && bed < floatY && this.pos[1] < SEA_LEVEL;
 
     if (ix !== 0 || iz !== 0) {
       const len = Math.hypot(ix, iz);
@@ -93,7 +103,9 @@ export class PlayerController {
       this.moveSpeed = 0;
     }
 
-    if (this.grounded && this.keys.has('Space')) {
+    // Swimming takes precedence: touching the sea bed mid-stroke should still
+    // paddle (handled below), not fire a jump.
+    if (this.grounded && !this.swimming && this.keys.has('Space')) {
       this.velY = JUMP_SPEED;
       this.grounded = false;
     }

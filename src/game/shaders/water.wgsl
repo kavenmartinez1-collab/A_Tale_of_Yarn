@@ -1,27 +1,19 @@
-// Water — one large camera-following quad at sea level (y = 0, keep in sync
-// with SEA_LEVEL in noise.ts). Drawn AFTER the sky with depth test on and
-// depth writes OFF: terrain above water occludes it, underwater terrain and
-// horizon sky show through the alpha blend. Bufferless (6 verts from
-// vertex_index); no cull so it reads from below while swimming.
+// Water — one large camera-following quad at sea level (y = 0; keep in sync
+// with SEA_LEVEL in noise.ts). Runs in the transparent pass, after the opaque
+// scene has been copied, so it can sample what is behind it.
+//
+// What that copy buys, versus the old flat alpha-blended quad:
+//   - refraction: the seabed bends through the wave normal
+//   - depth-based absorption: red goes first, then green, over path length
+//   - shoreline foam from the *actual* geometry depth, not a height guess
+//   - caustics projected onto whatever the light reaches
+// Plus Fresnel sky reflection, GGX sun glitter, and crest sub-surface glow.
 
-struct Frame {
-  viewProj: mat4x4<f32>,
-  invViewProj: mat4x4<f32>,
-  cameraPos: vec3<f32>,
-  sunDir: vec3<f32>,
-  fogColor: vec3<f32>,
-  fogDensity: f32,
-  time: f32,
-  sunColor: vec3<f32>,
-  ambient: f32,
-  skyZenith: vec3<f32>,
-  starVis: f32,
-  cloudCover: f32,
-  rainLevel: f32,
-  envPad: vec2<f32>,
-}
+#include "common.wgsl"
 
-@group(0) @binding(0) var<uniform> frame: Frame;
+@group(1) @binding(0) var sceneCopy: texture_2d<f32>;
+@group(1) @binding(1) var sceneDepth: texture_depth_2d;
+@group(1) @binding(2) var sceneSampler: sampler;
 
 const SEA_LEVEL: f32 = 0.0;
 const EXTENT: f32 = 1400.0; // beyond the far-fog horizon
@@ -49,86 +41,147 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
   return out;
 }
 
-// Gentle filmic-ish grade — keep identical to the scene shaders so the water
-// blends seamlessly against graded terrain and sky.
-fn grade(c: vec3<f32>) -> vec3<f32> {
-  let x = max(c, vec3<f32>(0.0));
-  let toned = x * (vec3<f32>(1.25) + x * 0.45)
-            / (vec3<f32>(1.0) + x * (vec3<f32>(0.90) + x * 0.45));
-  let l = dot(toned, vec3<f32>(0.2126, 0.7152, 0.0722));
-  return mix(vec3<f32>(l), toned, 1.10);
-}
-
-// Directional wave field — four sine trains at different scales/speeds.
-// Cheap, tileless, and gives a coherent normal for fresnel + sun glint.
+/**
+ * Directional wave field — six sine trains at different scales and speeds,
+ * with a sharpening exponent so crests are pointed and troughs are broad the
+ * way real gravity waves are.
+ */
 fn waveH(p: vec2<f32>, t: f32) -> f32 {
   var h = sin(dot(p, vec2<f32>(0.140, 0.090)) + t * 0.90) * 0.50;
-  h += sin(dot(p, vec2<f32>(-0.110, 0.190)) - t * 0.70) * 0.32;
-  h += sin(dot(p, vec2<f32>(0.420, -0.310)) + t * 1.50) * 0.13;
-  h += sin(dot(p, vec2<f32>(-0.730, -0.540)) - t * 2.10) * 0.07;
+  h = h + sin(dot(p, vec2<f32>(-0.110, 0.190)) - t * 0.70) * 0.32;
+  h = h + sin(dot(p, vec2<f32>(0.420, -0.310)) + t * 1.50) * 0.13;
+  h = h + sin(dot(p, vec2<f32>(-0.730, -0.540)) - t * 2.10) * 0.07;
+  h = h + sin(dot(p, vec2<f32>(1.310, 0.870)) + t * 2.90) * 0.035;
+  h = h + sin(dot(p, vec2<f32>(-1.910, 1.470)) - t * 3.70) * 0.020;
   return h;
 }
 
-@fragment
-fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
-  let deep    = vec3<f32>(0.05, 0.21, 0.34);
-  let shallow = vec3<f32>(0.13, 0.40, 0.48);
+/** Animated caustic pattern — two counter-rotating Voronoi-ish interferences. */
+fn caustics(p: vec2<f32>, t: f32) -> f32 {
+  let a = sin(p.x * 1.9 + t * 0.9) * sin(p.y * 2.1 - t * 0.7);
+  let b = sin((p.x + p.y) * 1.3 - t * 1.1) * sin((p.x - p.y) * 1.7 + t * 0.8);
+  let v = a * b;
+  return pow(clamp(v * 0.5 + 0.5, 0.0, 1.0), 5.0);
+}
 
+@fragment
+fn fs_main(in: VSOut) -> SceneOut {
   let viewVec = in.worldPos - frame.cameraPos;
   let dist = length(viewVec);
   let dir = viewVec / max(dist, 0.001);
+  let underwater = frame.cameraPos.y < SEA_LEVEL;
 
-  // Wave normal via finite differences; rain roughens the surface with an
-  // extra high-frequency shimmer, and waves flatten with distance so the
-  // far sea doesn't sparkle into noise.
+  // --- wave normal ---
   let p = in.worldPos.xz;
   let t = frame.time;
   let e = 0.6;
   var h0 = waveH(p, t);
-  var hx = waveH(p + vec2<f32>(e, 0.0), t);
-  var hz = waveH(p + vec2<f32>(0.0, e), t);
+  let hx = waveH(p + vec2<f32>(e, 0.0), t);
+  let hz = waveH(p + vec2<f32>(0.0, e), t);
   if (frame.rainLevel > 0.0) {
     // Irrational frequency ratio + phase drift kills the checkerboard read.
     let rip = sin(p.x * 2.13 + p.y * 0.71 + t * 9.0)
             * sin(p.y * 1.53 - p.x * 0.47 - t * 6.3);
-    h0 += rip * 0.06 * frame.rainLevel;
+    h0 = h0 + rip * 0.06 * frame.rainLevel;
   }
-  let steep = 0.9 * exp(-dist * 0.004); // wave slope, fading with distance
-  let n = normalize(vec3<f32>((h0 - hx) / e * steep, 1.0, (h0 - hz) / e * steep));
+  // Flatten waves with distance so the far sea does not sparkle into noise.
+  let steep = 0.9 * exp(-dist * 0.004);
+  var n = normalize(vec3<f32>((h0 - hx) / e * steep, 1.0, (h0 - hz) / e * steep));
+  if (underwater) { n = -n; }
 
-  // Water body: deep in the troughs, brighter on the crests.
-  var color = mix(deep, shallow, clamp(0.5 + 0.45 * h0, 0.0, 1.0));
+  // --- what is behind the water ---
+  let screenUV = in.pos.xy * frame.screenSize.zw;
+  let dim = vec2<f32>(textureDimensions(sceneDepth, 0));
+  let bgDepth = textureLoad(sceneDepth, vec2<i32>(screenUV * dim), 0);
+  let bgWorld = worldFromDepth(screenUV, bgDepth, frame.invViewProj);
+  // Path length through water from the surface to whatever is behind it.
+  var waterDepth = select(distance(bgWorld, in.worldPos), 60.0, bgDepth >= 0.99999);
+  waterDepth = clamp(waterDepth, 0.0, 60.0);
 
-  // Crest foam: broken up by a drifting interference pattern, faded with
-  // distance so the far sea stays clean.
+  // Refraction: displace the lookup along the wave normal, scaled by depth so
+  // shallow water (where the offset would sample above the shoreline and
+  // smear the beach) barely bends at all.
+  let refrAmt = clamp(waterDepth * 0.06, 0.0, 1.0) * 0.035
+              * clamp(40.0 / max(dist, 1.0), 0.0, 1.0);
+  let refrUV = clamp(screenUV + n.xz * refrAmt, vec2<f32>(0.001), vec2<f32>(0.999));
+  // Re-test the displaced sample: if it landed on something *above* the water
+  // the bend is invalid, so fall back to the straight-through sample.
+  let refrDepth = textureLoad(sceneDepth, vec2<i32>(refrUV * dim), 0);
+  let refrWorld = worldFromDepth(refrUV, refrDepth, frame.invViewProj);
+  let validRefr = refrWorld.y < SEA_LEVEL + 0.15;
+  let sampleUV = select(screenUV, refrUV, validRefr);
+  var behind = textureSampleLevel(sceneCopy, sceneSampler, sampleUV, 0.0).rgb;
+
+  // Caustics on the lit seabed, strongest in shallow water.
+  let sunUp = smoothstep(-0.05, 0.15, frame.sunDir.y);
+  let caust = caustics(bgWorld.xz * 1.1, t) * exp(-waterDepth * 0.22) * sunUp;
+  behind = behind + frame.sunColor * caust * 0.55;
+
+  // Beer-Lambert absorption: red extinguishes fastest, blue survives longest.
+  let extinction = vec3<f32>(0.46, 0.115, 0.062);
+  let transmit = exp(-extinction * waterDepth);
+  // Scattered light in the body of the water, tinted by the sun.
+  let scatterColor = vec3<f32>(0.045, 0.190, 0.215)
+                   * (frame.ambient * 3.0 + frame.sunColor * 0.55 * sunUp);
+  var color = behind * transmit + scatterColor * (1.0 - transmit);
+
+  // --- reflection ---
+  let R = reflect(dir, n);
+  var reflected = skyProbe(R);
+  // Grazing reflections pick up the horizon haze; steep ones see open sky.
+  reflected = mix(reflected, frame.fogColor, smoothstep(0.35, 0.0, R.y) * 0.5);
+
+  let cosV = clamp(dot(-dir, n), 0.0, 1.0);
+  // Schlick with water's F0 = 0.02.
+  var fres = 0.02 + 0.98 * pow(1.0 - cosV, 5.0);
+  if (underwater) {
+    // Seen from below, past the critical angle the surface mirrors entirely.
+    fres = clamp(smoothstep(0.30, 0.10, cosV), 0.0, 1.0);
+    reflected = mix(color, scatterColor * 2.0, 0.5);
+  }
+  color = mix(color, reflected, fres);
+
+  // --- specular glitter ---
+  let H = normalize(-dir + frame.sunDir);
+  let ndh = max(dot(n, H), 0.0);
+  let rough = mix(0.055, 0.18, clamp(frame.rainLevel + dist * 0.002, 0.0, 1.0));
+  let D = distGGX(ndh, rough);
+  color = color + frame.sunColor * D * 0.045 * sunUp * (1.0 - frame.rainLevel * 0.6);
+
+  // --- foam ---
+  // Shoreline: where the water is shallow against the geometry behind it.
+  let shore = 1.0 - smoothstep(0.0, 1.35, waterDepth);
+  // Break the band up so it is a surf line, not a contour.
+  let surf = fbm2(p * 1.7 + vec2<f32>(t * 0.35, -t * 0.22), 3);
+  let shoreFoam = smoothstep(0.30, 0.95, shore) * (0.45 + 0.85 * surf);
+  // Crest foam on the tops of waves.
   let fnoise = sin(p.x * 1.71 + t * 1.1) * sin(p.y * 1.37 - t * 0.9);
-  let foam = smoothstep(0.55, 0.95, h0)
-           * clamp(0.5 + 0.5 * fnoise, 0.0, 1.0)
-           * exp(-dist * 0.010);
-  color = mix(color, vec3<f32>(0.88, 0.93, 0.95), foam * 0.55);
+  let crestFoam = smoothstep(0.55, 0.95, h0)
+                * clamp(0.5 + 0.5 * fnoise, 0.0, 1.0)
+                * exp(-dist * 0.010);
+  let foam = clamp(shoreFoam + crestFoam * 0.55, 0.0, 1.0);
+  let foamLit = vec3<f32>(0.90, 0.94, 0.96)
+              * (frame.ambient * 3.0 + frame.sunColor * 0.85 * sunUp);
+  color = mix(color, foamLit, foam * 0.85);
 
-  // Fresnel: grazing angles mirror the sky, looking down shows the body.
-  let cosV = max(dot(-dir, n), 0.0);
-  let fres = 0.03 + 0.97 * pow(1.0 - cosV, 5.0);
-  let skyRefl = mix(frame.skyZenith, frame.fogColor, 0.55);
-  color = mix(color, skyRefl, clamp(fres * 0.85, 0.0, 1.0));
+  // Sub-surface glow: backlit crests scatter green-blue toward the viewer.
+  let back = pow(clamp(dot(dir, frame.sunDir), 0.0, 1.0), 4.0);
+  color = color + vec3<f32>(0.10, 0.34, 0.30) * back * smoothstep(0.1, 0.8, h0)
+        * frame.sunColor * 0.5 * sunUp;
 
-  // Sun glint: real specular off the wave normal, dimmed by rain overcast.
-  let sunUp = max(frame.sunDir.y, 0.0);
-  let spec = pow(max(dot(reflect(dir, n), frame.sunDir), 0.0), 90.0);
-  color += frame.sunColor * spec * sunUp * (1.0 - frame.rainLevel * 0.6) * 0.9;
+  // --- opacity + fog ---
+  // Deep water is opaque; shallow water lets the beach read through so the
+  // shoreline is a soft gradient rather than a hard cut.
+  var alpha = mix(0.30, 1.0, clamp(waterDepth * 0.75, 0.0, 1.0));
+  alpha = max(alpha, fres * 0.95);
+  alpha = max(alpha, foam * 0.9);
 
-  // Night: darken the water body toward the sky.
-  color *= mix(0.25, 1.0, clamp(frame.sunColor.g + 0.3, 0.0, 1.0));
+  color = applyFog(color, in.worldPos, dir);
+  let fogAmt = 1.0 - exp(-frame.fogDensity * dist);
+  alpha = mix(alpha, 1.0, fogAmt);
 
-  // More opaque at glancing angles, clearer looking straight down.
-  var alpha = mix(0.60, 0.92, fres);
-
-  // Distance fog: far water fades to the horizon color and turns opaque so
-  // the quad rim never shows against the sky.
-  let fog = 1.0 - exp(-frame.fogDensity * dist);
-  color = mix(color, frame.fogColor, fog);
-  alpha = mix(alpha, 1.0, fog);
-
-  return vec4<f32>(grade(color), alpha);
+  var out: SceneOut;
+  out.color = vec4<f32>(color, clamp(alpha, 0.0, 1.0));
+  out.normal = packNormal(n, 0.5);
+  return out;
 }

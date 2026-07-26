@@ -9,6 +9,9 @@
     "preview": "vite preview",
     "server": "tsx server/dev-server.ts",
     "typecheck": "tsc --noEmit",
+    "test:mesh": "tsx scripts/check-winding.mts && tsx scripts/test-character-mesh.mts && tsx scripts/test-animal-mesh.mts",
+    "test:combat": "tsx scripts/test-attack-routing.mts && tsx scripts/test-projectiles.mts && tsx scripts/test-animal-ai.mts && tsx scripts/test-mounting.mts",
+    "test:world": "tsx scripts/test-roads.mts",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed"
   },

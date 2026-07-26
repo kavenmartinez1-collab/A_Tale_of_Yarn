@@ -9,6 +9,8 @@
  * FALLBACK_SPEC.
  */
 
+import { screenText } from '../npc/content-safety';
+
 export type DungeonTheme = 'crypt' | 'cave' | 'ruin';
 export type RoomType = 'entrance' | 'combat' | 'treasure' | 'boss';
 export type RoomSize = 'small' | 'medium' | 'large';
@@ -78,6 +80,13 @@ export function validateSpec(
   }
   if (typeof o.name !== 'string' || o.name.length === 0 || o.name.length > 60) {
     errors.push('name must be a non-empty string (max 60 chars)');
+  } else if (screenText(o.name).blocked) {
+    // The dungeon name is the ONE free-text field in a director spec that is
+    // shown to the player verbatim, so it goes through the same guardrail as
+    // NPC dialogue (npc/content-safety.ts). Reported as a validation error
+    // rather than silently rewritten, so the director's existing retry path
+    // regenerates the spec — see buildRetryMessage.
+    errors.push('name is not permitted; choose a different dungeon name');
   }
 
   // --- rooms -------------------------------------------------------------

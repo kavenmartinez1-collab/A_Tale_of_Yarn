@@ -7,8 +7,17 @@
  * water clamping, determinism with seeded rng.
  */
 
-import { stepAnimal, onEntityDamaged, aggroDamage, FOLLOW_RADIUS } from '../src/game/entities/animal-ai';
-import { SPECIES_DEFS } from '../src/game/entities/entity-types';
+import {
+  stepAnimal, onEntityDamaged, aggroDamage, FOLLOW_RADIUS, DEFEND_GIVEUP_DIST,
+  CombatIndex, isFighting, wantsAirborne,
+  type DefendTarget,
+} from '../src/game/entities/animal-ai';
+import {
+  appetite, courageOf, factionOf,
+} from '../src/game/entities/combat-targeting';
+import {
+  SPECIES_DEFS, dispositionOf, type Species,
+} from '../src/game/entities/entity-types';
 import type { EntityState } from '../src/game/entities/entity-manager';
 import type { AnimalAICtx } from '../src/game/entities/animal-ai';
 import { mulberry32 } from '../src/game/mesh-utils';
@@ -598,6 +607,634 @@ check('FOLLOW_RADIUS exported and = 30', FOLLOW_RADIUS === 30);
   }));
   check('non-owned: staying flag does not sit', (e.sit ?? 0) === 0, `sit=${e.sit}`);
   check('non-owned: deer still flees when player close', e.mode === 'flee', `mode=${e.mode}`);
+}
+
+// ---------------------------------------------------------------------------
+// 26. Mounts defend their rider — owned animals intercept hostiles
+//
+// "also mounts should attack all hostile mobs coming after the players."
+// An owned animal used to be hard-forced to 'follow' and could never attack
+// anything, so a tamed dragon watched its owner be mauled.
+// ---------------------------------------------------------------------------
+
+{
+  // --- it engages -----------------------------------------------------------
+  const mount = makeEntity('dragon', 0, 0);
+  mount.owned = true;
+  mount.mode = 'follow';
+  const threat: DefendTarget = { id: 'wolf-1', x: 14, z: 0 };
+  const hits: { id: string; dmg: number }[] = [];
+  const defendCtx = (t: DefendTarget | null) => makeCtx({
+    playerX: 0, playerZ: 0, playerDist: 2,
+    speciesDef: SPECIES_DEFS['dragon'],
+    defendTarget: t,
+    onAttackEntity: (id: string, dmg: number) => hits.push({ id, dmg }),
+  });
+
+  stepAnimal(mount, 0.1, defendCtx(threat));
+  check('owned mount switches to defend when a hostile is nominated',
+    mount.mode === 'defend', `mode=${mount.mode}`);
+
+  // --- it closes the distance ----------------------------------------------
+  const startDist = Math.hypot(threat.x - mount.x, threat.z - mount.z);
+  for (let i = 0; i < 20; i++) stepAnimal(mount, 0.1, defendCtx(threat));
+  const nowDist = Math.hypot(threat.x - mount.x, threat.z - mount.z);
+  check('the defender closes on the threat', nowDist < startDist - 2,
+    `${startDist.toFixed(1)} -> ${nowDist.toFixed(1)}`);
+  check('the defender faces the threat', Math.abs(mount.yaw - Math.PI / 2) < 0.2,
+    `yaw=${mount.yaw.toFixed(2)}`);
+
+  // --- it lands hits, on the right target, at a cadence ---------------------
+  for (let i = 0; i < 60; i++) stepAnimal(mount, 0.1, defendCtx(threat));
+  check('the defender actually hits the threat', hits.length > 0,
+    `hits=${hits.length}`);
+  check('every hit names the nominated threat',
+    hits.every(h => h.id === 'wolf-1'));
+  check('hits carry the species attack damage',
+    hits.every(h => h.dmg === aggroDamage('dragon')), `dmg=${hits[0]?.dmg}`);
+  // 6 s of contact at a 1.2 s cooldown is at most ~6 hits, not one per tick.
+  check('the defender does not hit every tick', hits.length < 12,
+    `hits=${hits.length} over ~8 s`);
+
+  // --- it goes home when the threat is gone --------------------------------
+  stepAnimal(mount, 0.1, defendCtx(null));
+  check('the defender returns to follow when the threat is gone',
+    mount.mode === 'follow', `mode=${mount.mode}`);
+
+  // --- it will not chase a threat halfway across the map -------------------
+  const far = makeEntity('horse', 0, 0);
+  far.owned = true;
+  far.mode = 'follow';
+  stepAnimal(far, 0.1, makeCtx({
+    playerX: 0, playerZ: 0, playerDist: 2,
+    speciesDef: SPECIES_DEFS['horse'],
+    defendTarget: { id: 'far-wolf', x: DEFEND_GIVEUP_DIST + 20, z: 0 },
+    onAttackEntity: () => {},
+  }));
+  check('a threat beyond the give-up distance is ignored',
+    far.mode === 'follow', `mode=${far.mode}`);
+}
+
+// ---------------------------------------------------------------------------
+// 27. Defending must not break the things owned animals already did
+// ---------------------------------------------------------------------------
+
+{
+  // No defendTarget at all → identical follow behaviour to before.
+  const pet = makeEntity('horse', 20, 0);
+  pet.owned = true;
+  pet.mode = 'follow';
+  const before = { x: pet.x, z: pet.z };
+  stepAnimal(pet, 0.5, makeCtx({
+    playerX: 0, playerZ: 0, playerDist: 20,
+    speciesDef: SPECIES_DEFS['horse'],
+  }));
+  check('an owned animal with no threat still follows',
+    pet.mode === 'follow' && pet.x < before.x, `x=${pet.x}`);
+
+  // An owned animal must NEVER aggro the player, threat or no threat.
+  const tamedBear = makeEntity('bear', 1, 0);
+  tamedBear.owned = true;
+  let mauled = 0;
+  for (let i = 0; i < 40; i++) {
+    stepAnimal(tamedBear, 0.1, makeCtx({
+      playerX: 0, playerZ: 0, playerDist: 1,
+      speciesDef: SPECIES_DEFS['bear'],
+      defendTarget: { id: 'w', x: 6, z: 0 },
+      onAttackEntity: () => {},
+      onAttackPlayer: () => { mauled++; },
+    }));
+  }
+  check('an owned aggro species never attacks its owner', mauled === 0);
+  check('...even while defending', tamedBear.mode === 'defend');
+
+  // A defender told to STAY holds its ground — an explicit order outranks
+  // initiative, and a pet that abandons a spot you parked it on is a bug.
+  const parked = makeEntity('wolf', 3, 3);
+  parked.owned = true;
+  parked.staying = true;
+  const parkedAt = { x: parked.x, z: parked.z };
+  for (let i = 0; i < 20; i++) {
+    stepAnimal(parked, 0.1, makeCtx({
+      playerX: 0, playerZ: 0, playerDist: 4,
+      speciesDef: SPECIES_DEFS['wolf'],
+      defendTarget: { id: 'w', x: 10, z: 3 },
+      onAttackEntity: () => { throw new Error('a staying pet attacked'); },
+    }));
+  }
+  check('a pet told to stay does not run off to fight',
+    parked.x === parkedAt.x && parked.z === parkedAt.z);
+
+  // Wild animals must ignore defendTarget entirely.
+  const wolf = makeEntity('wolf', 3, 0);
+  wolf.mode = 'idle';
+  let wildAttacked = false;
+  stepAnimal(wolf, 0.1, makeCtx({
+    playerX: 0, playerZ: 0, playerDist: 3,
+    speciesDef: SPECIES_DEFS['wolf'],
+    defendTarget: { id: 'other', x: 5, z: 0 },
+    onAttackEntity: () => { wildAttacked = true; },
+  }));
+  check('a wild animal ignores defendTarget and still aggros the player',
+    wolf.mode === 'aggro' && !wildAttacked, `mode=${wolf.mode}`);
+
+  // A defender with no onAttackEntity wired up must still not crash.
+  const noHook = makeEntity('horse', 0, 0);
+  noHook.owned = true;
+  let threw = false;
+  try {
+    for (let i = 0; i < 30; i++) {
+      stepAnimal(noHook, 0.1, makeCtx({
+        playerX: 0, playerZ: 0, playerDist: 2,
+        speciesDef: SPECIES_DEFS['horse'],
+        defendTarget: { id: 'w', x: 1, z: 0 },
+      }));
+    }
+  } catch { threw = true; }
+  check('a defender with no attack callback degrades safely', !threw);
+}
+
+// ===========================================================================
+// MOB-VS-MOB COMBAT
+//
+// Every hostile in this game used to target exactly one thing: the player. A
+// wolf and a deer could stand touching each other indefinitely. These tests
+// assert what must be TRUE of the replacement, and each one is paired with a
+// case that would pass if the rule were absent — a test that only checks
+// "the wolf attacked something" cannot tell hunting from flailing.
+// ===========================================================================
+
+/** Build an index over a handful of entities, with the player at the origin. */
+function indexOf(...ents: EntityState[]): CombatIndex {
+  const ix = new CombatIndex();
+  ix.rebuild(ents, null, 0, 0);
+  return ix;
+}
+
+/**
+ * Where the observer stands during a mob-combat simulation.
+ *
+ * Not "very far away", which is the obvious choice and is wrong: `stepAnimal`
+ * skips entirely past 200 m and drops to a slow home-drift past 80 m, so a
+ * player parked at 400 m produces a test in which nothing happens at all and
+ * every assertion fails for the same uninformative reason. This spot is ~64 m
+ * from the action — inside the full state machine, comfortably outside the
+ * 16 m aggro and 12 m flee triggers, so the player is present but irrelevant.
+ */
+const WATCH_X = 45;
+const WATCH_Z = -45;
+
+/** Step `e` for `seconds`, rebuilding the index each tick so targets track. */
+function simulate(
+  actors: EntityState[], seconds: number,
+  ctxFor: (e: EntityState, ix: CombatIndex) => Partial<AnimalAICtx>,
+  npcs: { id: string; x: number; z: number }[] | null = null,
+): void {
+  const ix = new CombatIndex();
+  const dt = 1 / 30;
+  for (let t = 0; t < seconds; t += dt) {
+    ix.rebuild(actors, npcs, WATCH_X, WATCH_Z);
+    for (const e of actors) {
+      if (e.mode === 'dead') continue;
+      stepAnimal(e, dt, makeCtx({
+        playerX: WATCH_X,
+        playerZ: WATCH_Z,
+        playerDist: Math.hypot(e.x - WATCH_X, e.z - WATCH_Z),
+        speciesDef: SPECIES_DEFS[e.species],
+        combat: ix,
+        ...ctxFor(e, ix),
+      }));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// M1. A predator prefers prey to a rock — appetite is not "attack anything".
+// ---------------------------------------------------------------------------
+
+{
+  const wolfSize = SPECIES_DEFS.wolf.size;
+  const target = (sp: Species, owned = false) => ({
+    id: sp, kind: 'entity' as const, x: 5, z: 0, species: sp,
+    size: SPECIES_DEFS[sp].size, owned, faction: factionOf(sp),
+  });
+  const want = (sp: Species): number =>
+    appetite('wolf', 'predator', wolfSize, target(sp), courageOf('wolf', 0, false));
+
+  check('a wolf wants a deer', want('deer') > 0, `${want('deer')}`);
+  check('a wolf wants a rabbit', want('rabbit') > 0);
+  // The pairing that proves the rule exists: it must REFUSE something too big.
+  check('a wolf will not start on a bear', want('bear') === 0, `${want('bear')}`);
+  check('a wolf will not start on a dragon', want('dragon') === 0);
+  check('a wolf will not eat another wolf', want('wolf') === 0);
+  check('a wolf prefers a deer to a person',
+    want('deer') > appetite('wolf', 'predator', wolfSize,
+      { id: 'n', kind: 'npc', x: 5, z: 0, size: 1.45, owned: false, faction: 'wild' },
+      courageOf('wolf', 0, false)));
+
+  // Prey never starts anything, however small the other thing is.
+  check('a deer never picks a fight',
+    appetite('deer', dispositionOf(SPECIES_DEFS.deer), SPECIES_DEFS.deer.size,
+      target('rabbit'), courageOf('deer', 0, false)) === 0);
+
+  // Fliers are apex, and go for people rather than livestock.
+  const npcT = { id: 'n', kind: 'npc' as const, x: 5, z: 0, size: 1.45,
+    owned: false, faction: 'wild' as const };
+  const wolfOnNpc = appetite('wolf', 'predator', SPECIES_DEFS.wolf.size, npcT,
+    courageOf('wolf', 0, false));
+  const dragonOnNpc = appetite('dragon', 'predator', SPECIES_DEFS.dragon.size, npcT,
+    courageOf('dragon', 0, false));
+  check('a dragon is far readier to take a villager than a wolf is',
+    dragonOnNpc > wolfOnNpc * 2, `${dragonOnNpc.toFixed(2)} vs ${wolfOnNpc.toFixed(2)}`);
+  check('a wyvern will attack a deer',
+    appetite('wyvern', 'predator', SPECIES_DEFS.wyvern.size, target('deer'),
+      courageOf('wyvern', 0, false)) > 0);
+}
+
+// ---------------------------------------------------------------------------
+// M2. Pack courage: the goblin rule, stated as a property.
+// ---------------------------------------------------------------------------
+
+{
+  const gob = SPECIES_DEFS.goblin;
+  const big = { id: 'bear', kind: 'entity' as const, x: 4, z: 0,
+    species: 'bear' as Species, size: SPECIES_DEFS.bear.size, owned: false,
+    faction: 'wild' as const };
+
+  const alone = appetite('goblin', 'raider', gob.size, big, courageOf('goblin', 0, false));
+  const mob = appetite('goblin', 'raider', gob.size, big, courageOf('goblin', 4, false));
+  check('a lone goblin will not take on a bear', alone === 0);
+  check('four goblins will', mob > 0, `${mob}`);
+  // And the pairing: courage is not infinite for anything that can feel fear.
+  check('courage rises with allies',
+    courageOf('goblin', 3, false) > courageOf('goblin', 0, false));
+  check('fearless things do not do arithmetic about their odds',
+    courageOf('skeleton', 0, true) === Number.POSITIVE_INFINITY);
+  check('a lone skeleton takes on anything',
+    appetite('skeleton', 'undead', SPECIES_DEFS.skeleton.size, big,
+      courageOf('skeleton', 0, true)) > 0);
+}
+
+// ---------------------------------------------------------------------------
+// M3. A wolf actually hunts a deer, and the hunt RESOLVES.
+//
+// The whole feature in one simulation. Both halves matter: a hunt that never
+// starts is the old behaviour, and a hunt that never ends is a pair of
+// entities vibrating against each other forever, which is the failure mode
+// this is most likely to ship with.
+// ---------------------------------------------------------------------------
+
+{
+  const wolf = makeEntity('wolf', 0, 0);
+  const deer = makeEntity('deer', 12, 0);
+  let deerHits = 0;
+
+  simulate([wolf, deer], 24, (e) => ({
+    onAttackEntity: (id: string, dmg: number) => {
+      const t = id === deer.id ? deer : wolf;
+      if (t.mode === 'dead') return;
+      t.hp = Math.max(0, t.hp - dmg);
+      if (t === deer) deerHits++;
+      if (t.hp <= 0) { t.mode = 'dead'; return; }
+      onEntityDamaged(t, { id: e.id, kind: 'entity', x: e.x, z: e.z });
+    },
+  }));
+
+  check('the wolf hunted the deer', deerHits > 0, `${deerHits} hits landed`);
+  check('the hunt RESOLVED — the deer is dead', deer.mode === 'dead',
+    `deer hp ${deer.hp}, mode ${deer.mode}`);
+  check('the wolf is not stuck in combat afterwards',
+    !isFighting(wolf) || wolf.mode !== 'hunt',
+    `wolf mode ${wolf.mode}`);
+}
+
+// ---------------------------------------------------------------------------
+// M4. Fleeing prey runs FROM its attacker, and gains ground on nothing else.
+// ---------------------------------------------------------------------------
+
+{
+  const wolf = makeEntity('wolf', 0, 0);
+  const rabbit = makeEntity('rabbit', 3, 0);
+  const startGap = Math.hypot(rabbit.x - wolf.x, rabbit.z - wolf.z);
+
+  // Hit it once, then let it run without the wolf pursuing.
+  onEntityDamaged(rabbit, { id: wolf.id, kind: 'entity', x: wolf.x, z: wolf.z });
+  check('a struck rabbit flees rather than fights', rabbit.mode === 'flee');
+
+  const ix = new CombatIndex();
+  for (let t = 0; t < 2; t += 1 / 30) {
+    ix.rebuild([wolf, rabbit], null, WATCH_X, WATCH_Z);
+    stepAnimal(rabbit, 1 / 30, makeCtx({
+      // The player is 60 m away in -X. Running from the PLAYER would carry the
+      // rabbit toward +X... which is where the wolf is. The two directions are
+      // deliberately opposed so the assertion below can tell them apart.
+      playerX: -60, playerZ: 0,
+      playerDist: Math.hypot(rabbit.x + 60, rabbit.z),
+      speciesDef: SPECIES_DEFS.rabbit, combat: ix,
+    }));
+  }
+  const endGap = Math.hypot(rabbit.x - wolf.x, rabbit.z - wolf.z);
+  check('fleeing prey increases the distance to its ATTACKER',
+    endGap > startGap + 1, `${startGap.toFixed(1)} -> ${endGap.toFixed(1)} m`);
+
+  // The pairing that proves it is running from the wolf and not just from the
+  // player: the player is 200 m away in +X, so running from the PLAYER would
+  // move it toward -X, i.e. straight through the wolf.
+  check('...and is running from the wolf, not from the distant player',
+    rabbit.x > wolf.x, `rabbit x ${rabbit.x.toFixed(1)}, wolf x ${wolf.x.toFixed(1)}`);
+}
+
+// ---------------------------------------------------------------------------
+// M5. A hunt that cannot make progress gives up. No lock-ups.
+//
+// The specific scenario: a target that is unreachable because every move is
+// cancelled (a wall, a room clamp, a rock the pathless mover cannot round).
+// Without the stall detector this runs forever.
+// ---------------------------------------------------------------------------
+
+{
+  const wolf = makeEntity('wolf', 0, 0);
+  const deer = makeEntity('deer', 15, 0);
+  const ix = new CombatIndex();
+  let ticks = 0;
+  let gaveUp = false;
+  for (let t = 0; t < 60 && !gaveUp; t += 1 / 30) {
+    ix.rebuild([wolf, deer], null, WATCH_X, WATCH_Z);
+    stepAnimal(wolf, 1 / 30, makeCtx({
+      playerX: WATCH_X, playerZ: WATCH_Z,
+      playerDist: Math.hypot(wolf.x - WATCH_X, wolf.z - WATCH_Z),
+      speciesDef: SPECIES_DEFS.wolf, combat: ix,
+      // Every attempted move is refused — the wolf is pinned behind something.
+      moveXZ: (x, z) => [x, z],
+    }));
+    ticks++;
+    if (ticks > 30 && wolf.mode !== 'hunt') gaveUp = true;
+  }
+  check('a hunter that cannot close gives up rather than pushing forever',
+    gaveUp, `wolf still in mode ${wolf.mode} after ${ticks} ticks`);
+  check('...and the deer was never harmed by a fight that could not happen',
+    deer.hp === SPECIES_DEFS.deer.hp);
+}
+
+// ---------------------------------------------------------------------------
+// M6. Wildlife attacks NPCs.
+// ---------------------------------------------------------------------------
+
+{
+  const bear = makeEntity('bear', 0, 0);
+  const villager = { id: 'npc:tam', x: 9, z: 0 };
+  let npcHits = 0;
+  simulate([bear], 20, () => ({
+    onAttackNpc: () => { npcHits++; },
+  }), [villager]);
+  check('a bear will maul a villager', npcHits > 0, `${npcHits} hits`);
+
+  // Pairing: with no NPCs supplied, the same bear finds nothing to do.
+  const bear2 = makeEntity('bear', 0, 0);
+  let hits2 = 0;
+  simulate([bear2], 20, () => ({ onAttackNpc: () => { hits2++; } }), null);
+  check('...and does not invent one when there is nobody there', hits2 === 0);
+}
+
+// ---------------------------------------------------------------------------
+// M7. Goblins and skeletons fight wildlife; a warband never fights itself.
+// ---------------------------------------------------------------------------
+
+{
+  const skel = makeEntity('skeleton', 0, 0);
+  const deer = makeEntity('deer', 10, 0);
+  let hits = 0;
+  simulate([skel, deer], 20, (e) => ({
+    onAttackEntity: (id: string, dmg: number) => {
+      if (id !== deer.id || deer.mode === 'dead') return;
+      hits++;
+      deer.hp = Math.max(0, deer.hp - dmg);
+      if (deer.hp <= 0) deer.mode = 'dead';
+      else onEntityDamaged(deer, { id: e.id, kind: 'entity', x: e.x, z: e.z });
+    },
+  }));
+  check('a skeleton attacks a living creature', hits > 0, `${hits} hits`);
+
+  // The warband rule, which is what stops a boss killing his own guards.
+  const gt = { id: 'g', kind: 'entity' as const, x: 3, z: 0,
+    species: 'goblin' as Species, size: SPECIES_DEFS.goblin.size,
+    owned: false, faction: factionOf('goblin') };
+  check('the boss does not attack his own guards',
+    appetite('dread_king', 'undead', SPECIES_DEFS.dread_king.size, gt,
+      courageOf('dread_king', 0, true)) === 0);
+  check('goblins do not fight skeletons that came with them',
+    appetite('goblin', 'raider', SPECIES_DEFS.goblin.size,
+      { id: 's', kind: 'entity', x: 3, z: 0, species: 'skeleton',
+        size: SPECIES_DEFS.skeleton.size, owned: false, faction: factionOf('skeleton') },
+      courageOf('goblin', 0, false)) === 0);
+  check('...but a goblin and a bear are not allies',
+    appetite('goblin', 'raider', SPECIES_DEFS.goblin.size,
+      { id: 'b', kind: 'entity', x: 3, z: 0, species: 'bear',
+        size: SPECIES_DEFS.bear.size, owned: false, faction: factionOf('bear') },
+      courageOf('goblin', 6, false)) > 0);
+}
+
+// ---------------------------------------------------------------------------
+// M8. THE UNFORGIVABLE BUG: a mount must never turn on its rider.
+//
+// Two independent guarantees, tested separately so that losing either one
+// fails loudly:
+//   (a) the player is not in the combat index at all, so no target scan can
+//       ever return them;
+//   (b) `isOwned` short-circuits the aggro path, so an owned animal cannot
+//       enter combat with the player even if something else set it up.
+// ---------------------------------------------------------------------------
+
+{
+  const mount = makeEntity('wyvern', 0, 0);
+  mount.owned = true;
+  const deer = makeEntity('deer', 6, 0);
+
+  let touchedPlayer = false;
+  let touchedAnything = false;
+  const ix = new CombatIndex();
+  for (let t = 0; t < 15; t += 1 / 30) {
+    ix.rebuild([mount, deer], [{ id: 'npc:x', x: 4, z: 4 }], 0, 0);
+    stepAnimal(mount, 1 / 30, makeCtx({
+      playerX: 1, playerZ: 0, playerDist: 1, // rider standing right beside it
+      speciesDef: SPECIES_DEFS.wyvern, combat: ix,
+      onAttackPlayer: () => { touchedPlayer = true; },
+      onAttackEntity: () => { touchedAnything = true; },
+      onAttackNpc: () => { touchedAnything = true; },
+    }));
+  }
+  check('a tamed mount NEVER attacks its rider', !touchedPlayer);
+  check('a tamed mount does not pick its own fights either', !touchedAnything);
+  check('a tamed mount never enters hunt mode', mount.mode !== 'hunt',
+    `mode ${mount.mode}`);
+
+  // (a) stated directly.
+  const ix2 = indexOf(makeEntity('wolf', 1, 1));
+  check('the player is not a combat target', ix2.get('player') === null);
+
+  // An owned animal that gets clipped by its owner still does not retaliate.
+  const pet = makeEntity('horse', 0, 0);
+  pet.owned = true;
+  onEntityDamaged(pet);
+  check('an owned animal hit by its owner does not turn on them',
+    pet.mode !== 'aggro' && pet.mode !== 'hunt', `mode ${pet.mode}`);
+}
+
+// ---------------------------------------------------------------------------
+// M9. Territory: a wild flier fights a tamed rival only on its own ground.
+//
+// "That is the risk of exploring" — losing a mount has to be a consequence of
+// where the player took it, not an attrition tax on ordinary business.
+// ---------------------------------------------------------------------------
+
+{
+  const tamedT = {
+    id: 'tame', kind: 'entity' as const, x: 5, z: 0, species: 'wyvern' as Species,
+    size: SPECIES_DEFS.wyvern.size, owned: true, faction: factionOf('wyvern'),
+  };
+  const wildT = { ...tamedT, id: 'wild', owned: false };
+  check('a wild wyvern will drive off a TAMED wyvern',
+    appetite('wyvern', 'predator', SPECIES_DEFS.wyvern.size, tamedT,
+      courageOf('wyvern', 0, false)) > 0);
+  check('...but ignores another WILD one of its own kind',
+    appetite('wyvern', 'predator', SPECIES_DEFS.wyvern.size, wildT,
+      courageOf('wyvern', 0, false)) === 0);
+
+  // And the range gate: the wild one only acts inside its own territory.
+  // A tamed mount parked 120 m from a nest is not attacked.
+  const wild = makeEntity('wyvern', 0, 0);   // home is (0,0)
+  const tamed = makeEntity('wyvern', 120, 0);
+  tamed.owned = true;
+  let struck = false;
+  simulate([wild, tamed], 12, () => ({ onAttackEntity: () => { struck = true; } }));
+  check('a wild flier ignores a tamed one far outside its territory', !struck,
+    `wild mode ${wild.mode}`);
+}
+
+// ---------------------------------------------------------------------------
+// M10. Morale: a lone goblin breaks, a pack does not.
+// ---------------------------------------------------------------------------
+
+{
+  const lone = makeEntity('goblin', 0, 0);
+  lone.mode = 'aggro';
+  lone.hp = 3; // below morale 0.34 * 12
+  const ixL = indexOf(lone);
+  stepAnimal(lone, 1 / 30, makeCtx({
+    playerDist: 5, speciesDef: SPECIES_DEFS.goblin, combat: ixL,
+  }));
+  check('a lone goblin at low health runs', lone.mode === 'flee', `mode ${lone.mode}`);
+
+  const brave = makeEntity('goblin', 0, 0);
+  brave.mode = 'aggro';
+  brave.hp = 3;
+  const mates = [makeEntity('goblin', 1, 0), makeEntity('goblin', 0, 1),
+    makeEntity('goblin', 1, 1)];
+  const ixB = indexOf(brave, ...mates);
+  stepAnimal(brave, 1 / 30, makeCtx({
+    playerDist: 5, speciesDef: SPECIES_DEFS.goblin, combat: ixB,
+  }));
+  check('the same goblin with friends beside it holds', brave.mode === 'aggro',
+    `mode ${brave.mode}`);
+
+  // The undead never break, whatever the arithmetic says.
+  const skel = makeEntity('skeleton', 0, 0);
+  skel.mode = 'aggro';
+  skel.hp = 1;
+  stepAnimal(skel, 1 / 30, makeCtx({
+    playerDist: 5, speciesDef: SPECIES_DEFS.skeleton, combat: indexOf(skel),
+  }));
+  check('a skeleton at 1 hp does not run', skel.mode === 'aggro', `mode ${skel.mode}`);
+}
+
+// ---------------------------------------------------------------------------
+// M11. The player does not interrupt a fight already in progress.
+// ---------------------------------------------------------------------------
+
+{
+  const wolf = makeEntity('wolf', 0, 0);
+  const deer = makeEntity('deer', 6, 0);
+  const ix = new CombatIndex();
+  // Get the hunt started with the player far away.
+  for (let t = 0; t < 3; t += 1 / 30) {
+    ix.rebuild([wolf, deer], null, WATCH_X, WATCH_Z);
+    stepAnimal(wolf, 1 / 30, makeCtx({
+      playerX: WATCH_X, playerZ: WATCH_Z,
+      playerDist: Math.hypot(wolf.x - WATCH_X, wolf.z - WATCH_Z),
+      speciesDef: SPECIES_DEFS.wolf, combat: ix,
+      onAttackEntity: () => {},
+    }));
+  }
+  check('the wolf is hunting', wolf.mode === 'hunt', `mode ${wolf.mode}`);
+  // Now walk right up to it.
+  for (let t = 0; t < 1; t += 1 / 30) {
+    ix.rebuild([wolf, deer], null, wolf.x, wolf.z);
+    stepAnimal(wolf, 1 / 30, makeCtx({
+      playerX: wolf.x, playerZ: wolf.z, playerDist: 1,
+      speciesDef: SPECIES_DEFS.wolf, combat: ix, onAttackEntity: () => {},
+    }));
+  }
+  check('walking up to a hunting wolf does not make the world revolve around you',
+    wolf.mode === 'hunt', `mode ${wolf.mode}`);
+  // But hitting it does, which is the honest way to get its attention.
+  onEntityDamaged(wolf);
+  check('...hitting it, however, does', wolf.mode === 'aggro');
+}
+
+// ---------------------------------------------------------------------------
+// M12. Cost: the scan must not dominate the tick.
+// ---------------------------------------------------------------------------
+
+{
+  const herd: EntityState[] = [];
+  for (let i = 0; i < 40; i++) {
+    const sp: Species = i % 4 === 0 ? 'wolf' : 'deer';
+    herd.push(makeEntity(sp, (i % 8) * 6 - 24, Math.floor(i / 8) * 6 - 15));
+  }
+  const ix = new CombatIndex();
+  const FRAMES = 600;
+  const t0 = performance.now();
+  for (let f = 0; f < FRAMES; f++) {
+    ix.rebuild(herd, null, WATCH_X, WATCH_Z);
+    for (const e of herd) {
+      stepAnimal(e, 1 / 60, makeCtx({
+        playerX: WATCH_X, playerZ: WATCH_Z,
+        playerDist: Math.hypot(e.x - WATCH_X, e.z - WATCH_Z),
+        speciesDef: SPECIES_DEFS[e.species], combat: ix,
+        onAttackEntity: () => {},
+      }));
+    }
+  }
+  const perFrame = (performance.now() - t0) / FRAMES;
+  console.log(`  [perf] 40 entities, full mob-combat tick: ${perFrame.toFixed(3)} ms/frame`);
+  // One creature MESH rebuild costs ~1.8 ms and the renderer allows 8 of them.
+  // The entire AI for a full LIVE_CAP of entities has to be small against that.
+  check('mob combat for 40 entities costs well under one mesh rebuild',
+    perFrame < 1.0, `${perFrame.toFixed(3)} ms/frame`);
+  check('the index only holds what is near the player',
+    ix.size <= herd.length);
+}
+
+// ---------------------------------------------------------------------------
+// M13. The airborne signal (consumed by main.ts's flier altitude controller).
+// ---------------------------------------------------------------------------
+
+{
+  const wyv = makeEntity('wyvern', 0, 0);
+  wyv.mode = 'aggro';
+  stepAnimal(wyv, 1 / 30, makeCtx({
+    playerX: 40, playerZ: 0, playerDist: 40, speciesDef: SPECIES_DEFS.wyvern,
+  }));
+  check('a wild flier crossing open ground wants to be airborne',
+    wantsAirborne(wyv));
+
+  const owned = makeEntity('wyvern', 0, 0);
+  owned.owned = true;
+  stepAnimal(owned, 1 / 30, makeCtx({
+    playerX: 40, playerZ: 0, playerDist: 40, speciesDef: SPECIES_DEFS.wyvern,
+  }));
+  // Owned fliers stay on the ground so the player can walk up and mount them.
+  check('a tamed flier never asks to take off', !wantsAirborne(owned));
 }
 
 // ---------------------------------------------------------------------------

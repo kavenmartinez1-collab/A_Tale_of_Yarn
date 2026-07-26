@@ -4,7 +4,7 @@
  * call sites like dungeon entrances).
  *
  * Roll order per cell: presence (45 %) → kind (ruins 40 / ranch 22 /
- * village 15 / town 13 / castle 10 %) → up to 6 jittered candidates, accepted above the
+ * village 15 / town 13 / castle 10 %) → up to 8 jittered candidates, accepted above the
  * sand line on ground flat enough for the kind (ring of heightAt samples).
  * A candidate near the same cell's dungeon entrance is rejected so arches
  * never poke through buildings (cells are 512 m in both systems).
@@ -24,14 +24,25 @@ const RING_SAMPLES = 8;
 
 export type SettlementKind = 'ruins' | 'ranch' | 'village' | 'town' | 'castle';
 
+/**
+ * Footprint radius per kind. This is not decoration: tree and resource
+ * scatter carve a clearing of `radius + 3`, so it has to cover the furthest
+ * pad or a mill ends up inside an oak. The castle grew from 50 to 68 when it
+ * gained a *town* outside its north gate — the approach street, market and
+ * churchyard now reach ~66 m from the centre.
+ */
 export const SETTLEMENT_RADIUS: Record<SettlementKind, number> = {
-  ruins: 10, ranch: 20, village: 28, town: 40, castle: 50,
+  ruins: 10, ranch: 20, village: 28, town: 40, castle: 68,
 };
 
 /** Max |Δh| across the footprint ring. Generous — buildings sit on platform
- * skirts (C-M3), so big kinds get a bigger budget for their bigger ring. */
+ * skirts (C-M3), so big kinds get a bigger budget for their bigger ring.
+ * The castle's ring is sampled at 0.7·68 = 47.6 m, over ground that is
+ * naturally less flat than a 35 m ring, so its budget rose with its radius:
+ * every pad is grounded independently, so undulation costs nothing but the
+ * skirt depth. */
 const MAX_RING_DH: Record<SettlementKind, number> = {
-  ruins: 4, ranch: 4, village: 5, town: 6, castle: 7,
+  ruins: 4, ranch: 4, village: 5, town: 6, castle: 9,
 };
 
 export interface SettlementSite {
@@ -59,7 +70,7 @@ function rollKind(r: number): SettlementKind {
  * trade, first-visit questioning...) is testable right at the start.
  *
  * Position was validated offline against seed 1337: h=10.7 m (above sand),
- * ring Δh=4.3 m (castle budget 7), 143 m clear of the cell's dungeon
+ * ring Δh=4.3 m (castle budget 9), 143 m clear of the cell's dungeon
  * entrance, ~260 m from spawn (32, 32).
  */
 const FORCED_SITES = new Map<string, { kind: SettlementKind; x: number; z: number }>([

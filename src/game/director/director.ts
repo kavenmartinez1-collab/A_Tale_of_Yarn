@@ -29,8 +29,39 @@ import {
 } from './director-llm';
 import { createSpecStore, type SpecStore } from './director-store';
 
-export const DIRECTOR_MODEL_ID = 'local/flux2-te-qwen3-4b-q4_k_m';
-export const DIRECTOR_GGUF_FILE = 'flux2-te-qwen3-4b-q4_k_m.gguf';
+/**
+ * The Director runs the SAME stock Qwen3-1.7B as the NPCs (NPC_MODELS.fast).
+ *
+ * Was `local/flux2-te-qwen3-4b-q4_k_m` — an unlabelled 2.5 GB checkpoint whose
+ * GGUF header carries 29 keys and not one licence or base-model field
+ * (`general.name = "Te Gguf Staging"`). It was traced to FLUX.2-klein-4B's text
+ * encoder, which is Apache-2.0, but its sibling repos are non-commercial and
+ * gated, and nothing in the artefact says which one it came from. That is not a
+ * provenance chain, and "probably Apache-2.0 based on matching hyperparameters"
+ * is not a position to ship from. See docs/AI_MODEL_LICENSING.md §4.2.
+ *
+ * `unsloth/Qwen3-1.7B-GGUF` is checkable end to end: the repo declares
+ * apache-2.0 with a license_link and `base_model: Qwen/Qwen3-1.7B`, it is
+ * ungated, and the GGUF self-identifies (`general.name = Qwen3-1.7B`,
+ * `general.quantized_by = Unsloth`). sha256 of the shipped artefact is pinned
+ * in THIRD_PARTY_NOTICES.md.
+ *
+ * Sharing one model with NPC chat is not just a licensing tidy-up: the GGUF
+ * session dedups on `repo::file`, so the Director and the chat panel now hold
+ * ONE set of weights (~1.1 GB) instead of 1.1 + 2.5 GB, and a player who talks
+ * to an NPC pays no second cold-start. Each consumer still gets its own KV
+ * fork, so their caches never contend.
+ *
+ * The flux2 checkpoint stays on disk — src/diffusion/flux2-image.ts still uses
+ * it as an image text encoder, which is what it actually is.
+ */
+export const DIRECTOR_MODEL_ID = 'unsloth/Qwen3-1.7B-GGUF';
+export const DIRECTOR_GGUF_FILE = 'Qwen3-1.7B-Q4_K_M.gguf';
+
+/** Thrown when a generation is cut short because the Director was paused. */
+class PauseAbort extends Error {
+  constructor() { super('director generation aborted by pause'); }
+}
 
 /** Smaller prefill submissions while the game renders (existing engine hook;
  *  default 512 stalls the frame for the whole prompt). 64 keeps each GPU
@@ -78,6 +109,10 @@ export class DungeonDirector implements SpecProvider {
   private paused = false;
   private cooldownUntil = 0;
   private loading = false;
+  /** Handle for the generation currently on the GPU, so a pause can abort it. */
+  private inflight: { abort(): void } | null = null;
+  /** Set when setPaused(true) aborted a job — that job is re-queued, not failed. */
+  private abortedByPause = false;
   private loadNote = '';
   private dreamingName: string | null = null;
   private _generation = 0;
@@ -110,11 +145,26 @@ export class DungeonDirector implements SpecProvider {
    * Pause/resume background generation. While paused, doors still get
    * deterministic fixtures instantly and jobs stay queued; generation resumes
    * on unpause. Used to give NPC chat exclusive GPU time.
+   *
+   * Pausing ABORTS the generation already in flight — it does not merely stop
+   * the next one from starting. That distinction became load-bearing when the
+   * Director moved onto the same GGUF session as NPC chat: one session means
+   * one engine and one `chainGen`, so a Director job that is mid-generation
+   * blocks the player's chat turn completely rather than just competing with it
+   * for the GPU. Measured before this abort existed: the first chat turn sat
+   * behind a 38 s Director prefill, blew the 20 s TTFT watchdog, and the player
+   * got a canned line while the model sat there working on a dungeon.
+   *
+   * Cheap to do: an aborted cell is re-queued and regenerated on unpause, and
+   * every door has a deterministic fixture in the meantime.
    */
   setPaused(paused: boolean): void {
     if (this.paused === paused) return;
     this.paused = paused;
-    if (!paused && this.queue.length > 0) void this.pump();
+    if (paused) {
+      this.abortedByPause = this.inflight !== null;
+      this.inflight?.abort();
+    } else if (this.queue.length > 0) void this.pump();
   }
 
   /** Player is waiting at this door — move its job to the queue front. */
@@ -225,13 +275,23 @@ export class DungeonDirector implements SpecProvider {
         console.warn(`[Director] cell ${cell.dcx},${cell.dcz} fell back:`, result.errors);
       }
     } catch (err) {
+      if (err instanceof PauseAbort) {
+        // Yielded the GPU to NPC chat mid-job. Put the cell back and pick it up
+        // on unpause; the door is showing a deterministic fixture meanwhile.
+        this.queue.unshift(cell);
+        this.abortedByPause = false;
+        return;
+      }
       // Model load/GPU failure — degrade to fixtures for the whole session.
       console.error('[Director] disabled:', err);
       this.failed = true;
       this.queue.length = 0;
       this.queued.clear();
     } finally {
-      this.queued.delete(`${cell.dcx},${cell.dcz}`);
+      // A re-queued cell must stay in `queued` or enqueue() would re-add it.
+      const stillQueued = this.queue.some(
+        (c) => c.dcx === cell.dcx && c.dcz === cell.dcz);
+      if (!stillQueued) this.queued.delete(`${cell.dcx},${cell.dcz}`);
       this.dreamingName = null;
       this.busy = false;
       this.cooldownUntil = Date.now() + GEN_COOLDOWN_MS;
@@ -255,11 +315,14 @@ export class DungeonDirector implements SpecProvider {
     try {
       // Dynamic import: game.html pays for the engine only on first use.
       const { createGGUFInferenceSession } = await import('../../engine/gguf-session');
-      // local/ and ollama/ repos exist only on the dev server — route hf-hub
-      // through it, or config fetches hit the HF CDN and 401.
-      if (this.modelId.startsWith('local/') || this.modelId.startsWith('ollama/')) {
-        (await import('../../model/hf-hub')).useLocalCache();
-      }
+      // Route hf-hub through the dev server unconditionally. It is local-first
+      // with a CDN fallback on 404, so this is strictly better for every repo
+      // shape: local/ and ollama/ aliases exist ONLY here, and a cached HF repo
+      // loads from disk instead of re-downloading a gigabyte. Previously this
+      // was gated on the local/ prefix, which meant the winner depended on load
+      // order — NPC chat calls useLocalCache() unconditionally, so whichever
+      // consumer loaded first decided whether the other hit the network.
+      (await import('../../model/hf-hub')).useLocalCache();
       const session = await createGGUFInferenceSession({
         repo: this.modelId,
         ggufFile: DIRECTOR_GGUF_FILE,
@@ -281,8 +344,17 @@ export class DungeonDirector implements SpecProvider {
           // background consumer WITHOUT leaking into concurrent NPC chat
           // prefill (the old global override was racy across awaits).
           { enableThinking: false, emptyThink: true, prefillChunk: DIRECTOR_PREFILL_CHUNK });
-        const r = await handle.result;
-        return { text: r.text, stopReason: r.stopReason };
+        this.inflight = handle;
+        try {
+          const r = await handle.result;
+          // A pause-abort is not a model failure. Surfacing it as one would
+          // send pump() down the disable path and leave the whole session on
+          // fixtures — i.e. opening a chat panel once would kill the Director.
+          if (r.stopReason === 'aborted' && this.abortedByPause) throw new PauseAbort();
+          return { text: r.text, stopReason: r.stopReason };
+        } finally {
+          this.inflight = null;
+        }
       };
       return this.chat;
     } finally {

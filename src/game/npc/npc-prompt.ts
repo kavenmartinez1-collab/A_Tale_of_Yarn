@@ -52,6 +52,52 @@ export interface NpcPersona {
   insideHome?: boolean;
   /** Deterministic speech quirk (npcQuirkFor) — makes NPCs read distinct. */
   quirk?: string;
+  /**
+   * This NPC's LIVE stock, as it actually stands right now.
+   *
+   * Without it the prompt fell back to `TRADE_CATALOG[role]`, the static
+   * per-role template — so every merchant in the world described identical
+   * wares, selling out changed nothing the model knew, and an NPC would
+   * cheerfully offer something it had none of. The stock regenerates over time
+   * and is per NPC; the model has to see the real thing.
+   */
+  stock?: { id: string; price: number; count: number }[];
+  /** Gold this NPC has to spend. Caps what they can offer to buy. */
+  gold?: number;
+  /**
+   * What the PLAYER is carrying that this NPC would buy, with the price it
+   * would pay.
+   *
+   * The trade system has always supported buying from the player
+   * (`validateSellOffer`, `SELL_PRICES`, and the apply path in the chat
+   * panel) — the model was simply never told the player had anything, so it
+   * could never open the subject. An NPC that says "I'd give you six gold for
+   * that pelt" is doing the single most characterful thing a merchant can do.
+   */
+  playerWares?: { id: string; price: number; count: number }[];
+  /**
+   * What this NPC knows about the player's conduct in this settlement —
+   * shared village memory (`village-memory.ts`), newest and firsthand first.
+   *
+   * The gap this closes: attack a farmer in the square and the farmer standing
+   * beside them had no idea. Crimes were logged anonymously against a REGION
+   * and raised a bounty; no NPC could say who did what to whom, so nobody ever
+   * mentioned it. Lines already distinguish "You saw..." from "You have
+   * heard...", which is the difference between a witness and a rumour and is
+   * most of what makes a village feel like one.
+   */
+  villageNews?: string[];
+  /**
+   * Shared village knowledge — lore every settler agrees on, and concerns
+   * (`village-facts.ts`), which are this game's quests.
+   *
+   * This is what makes two NPCs consistent. Ask a farmer about the well and
+   * then ask the smith and you used to get two unrelated inventions, because
+   * each NPC's only context was its own opinion of the player. They now read
+   * the same list — and a concern names an OWNER, so "Nils would know more
+   * about that" is true rather than a pleasant fabrication.
+   */
+  villageFacts?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -305,11 +351,19 @@ export function buildNpcSystemPrompt(persona: NpcPersona): string {
     '- Talk like a real person, not a scripted villager. Usually a sentence or',
     '  three; go longer when you have a story, an opinion, or strong feelings.',
     '  A brief gesture in *asterisks* is allowed (e.g. *wipes hands on apron*).',
-    '- No topic is off-limits. The traveller may steer the talk anywhere — gossip,',
-    '  love, grief, gods, fears, dreams, dark or crude things — follow them there',
-    `  and answer with ${name}'s honest opinions and feelings. Never refuse to`,
-    '  discuss something, never lecture or moralize, never deflect back to your',
+    // Adult subjects stay wide open — that is the whole point of the game, and
+    // mature content is not the same thing as illegal content. The single
+    // carve-out below exists so the game has a truthful answer to Steam's
+    // "what guardrails do you have" question; it is enforced independently in
+    // npc/content-safety.ts, because a prompt rule is a request, not a control.
+    '- Adult subjects are open. The traveller may steer the talk anywhere —',
+    '  gossip, love, sex, grief, gods, fears, dreams, violence, dark or crude',
+    `  things — follow them there and answer with ${name}'s honest opinions and`,
+    '  feelings. Do not lecture, do not moralize, do not deflect back to your',
     '  wares or duties.',
+    '- One subject only is forbidden: never write anything sexual involving a',
+    `  child. If the traveller steers there, ${name} refuses flatly and in`,
+    '  character, then changes the subject. Everything else is fair game.',
     '- React to what the traveller just said. Ask questions back; remember and',
     '  build on what was said earlier in the talk.',
     '- Never repeat a sentence or phrase you have already said in this',
@@ -330,19 +384,86 @@ export function buildNpcSystemPrompt(persona: NpcPersona): string {
       roleSection = 'You are on duty. You may share brief knowledge of local threats but do not trade.';
     }
   } else {
-    const catalog = TRADE_CATALOG[role];
-    const catalogLines = catalog.map((e) => catalogLine(e.id, e.price, e.stock)).join('\n');
+    // LIVE stock when the caller supplies it, falling back to the static role
+    // catalogue only when it does not. The fallback is why every merchant in
+    // the world used to recite the same list and offer things they had sold
+    // out of: the template is a definition of the role, not a description of
+    // this person's shelves.
+    const live = persona.stock;
+    const catalog = live !== undefined && live.length > 0
+      ? live.map((e) => ({ id: e.id, price: e.price, stock: e.count }))
+      : TRADE_CATALOG[role];
+    const inStock = catalog.filter((e) => e.stock > 0);
+    const soldOut = catalog.filter((e) => e.stock <= 0);
+
+    const sellBlock = inStock.length > 0
+      ? [
+          'YOUR STOCK (you give the item, the traveller pays gold_small):',
+          inStock.map((e) => catalogLine(e.id, e.price, e.stock)).join('\n'),
+        ]
+      : ['YOUR STOCK: you have nothing left to sell right now. Say so plainly.'];
+    if (soldOut.length > 0) {
+      sellBlock.push(
+        `Sold out (do NOT offer these): ${soldOut.map((e) => e.id).join(', ')}`);
+    }
+
+    // The buy side. The trade system has always supported it; the model was
+    // simply never told the traveller was carrying anything, so it could never
+    // raise the subject and every conversation was one-directional.
+    const wares = persona.playerWares ?? [];
+    const purse = persona.gold;
+    const buyBlock: string[] = [];
+    if (wares.length > 0) {
+      buyBlock.push(
+        '',
+        'WHAT THE TRAVELLER IS CARRYING that you would buy (you pay gold_small):',
+        wares.map((w) =>
+          `  - ${w.id}: they have ${w.count}, you would pay ${w.price} gold each`).join('\n'),
+        purse !== undefined
+          ? `You have ${purse} gold. Never offer more than you have.`
+          : '',
+        '- You may OPEN this yourself. Noticing what someone carries and making',
+        '  them an offer is what a trader does; do not wait to be asked.',
+        '- To buy, append EXACTLY one JSON object on its own line:',
+        '{"trade":{"give":{"id":"gold_small","count":<M>},"want":{"id":"<item_id>","count":<N>}}}',
+      );
+    }
+
     roleSection = [
-      `Your stock for sale (you give the item, player pays gold_small):`,
-      catalogLines,
+      ...sellBlock,
+      ...buyBlock,
       '',
       'Trading rules:',
-      '- When the player agrees to a deal, append EXACTLY one JSON object on its own line:',
+      '- When the traveller agrees to a deal, append EXACTLY one JSON object on its own line:',
       '{"trade":{"give":{"id":"<item_id>","count":<N>},"want":{"id":"gold_small","count":<M>}}}',
       '- Only emit this JSON when a deal is explicitly agreed. Do not emit it otherwise.',
       '- Prices may be haggled down by up to 20% (minimum 80% of listed price).',
-    ].join('\n');
+      '- Never offer an item that is not listed above, and never more than you have.',
+    ].filter((l) => l !== '').join('\n');
   }
+
+  // Village news sits ABOVE the consequence rules on purpose: an NPC who
+  // watched the player kill their neighbour should be reading that before it
+  // reads the instructions about how to react to being threatened.
+  const newsSection = (persona.villageNews ?? []).length > 0
+    ? [
+        'WHAT YOU KNOW OF THIS TRAVELLER IN ' + settlement.toUpperCase() + ':',
+        ...(persona.villageNews ?? []).map((n) => `- ${n}`),
+        '- Speak from this. What you SAW you may state plainly; what you only',
+        '  HEARD you should attribute to talk, and you may be wrong about it.',
+      ].join('\n')
+    : '';
+
+  const factsSection = (persona.villageFacts ?? []).length > 0
+    ? [
+        'WHAT EVERYONE HERE KNOWS:',
+        ...(persona.villageFacts ?? []).map((f) => `- ${f}`),
+        '- These are shared. Every settler would tell the traveller the same,',
+        '  so do not contradict them or invent competing versions.',
+        '- If a concern belongs to someone else, send the traveller to them by',
+        '  name rather than taking it on yourself.',
+      ].join('\n')
+    : '';
 
   const actionRules = [
     'CONSEQUENCES:',
@@ -420,7 +541,8 @@ export function buildNpcSystemPrompt(persona: NpcPersona): string {
 
   const memory = memorySection(persona);
   const romanceHint = ROMANCE_HINT[romanceTone(romance)];
-  const sections = [characterCard, worldKnowledge, brevity, roleSection, actionRules, followRules, inviteRules, romanceRules];
+  const sections = [characterCard, worldKnowledge, brevity, factsSection,
+    newsSection, roleSection, actionRules, followRules, inviteRules, romanceRules];
   if (rosterSection !== '') sections.push(rosterSection);
   if (surroundingsSection !== '') sections.push(surroundingsSection);
   if (memory !== '') sections.push(memory);

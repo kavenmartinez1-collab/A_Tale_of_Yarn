@@ -134,7 +134,7 @@ function errors(r: ReturnType<typeof validateEcologySpec>): string[] {
   const rNoMood = validateEcologySpec({ version: 1, herds: [] }, plains);
   check('reject: missing mood', !ok(rNoMood));
 
-  // herds > 5
+  // herds > 7 (the cap was 5 before the density pass; 6 is now legal, 8 is not)
   const rHerdsLen = validateEcologySpec(
     {
       version: 1,
@@ -146,11 +146,13 @@ function errors(r: ReturnType<typeof validateEcologySpec>): string[] {
         { species: 'horse', count: 1 },
         { species: 'cow', count: 1 },
         { species: 'donkey', count: 1 },
+        { species: 'wolf', count: 1 },
+        { species: 'bear', count: 1 },
       ],
     },
     ['plains', 'forest', 'desert', 'beach'],
   );
-  check('reject: 6 herds', !ok(rHerdsLen));
+  check('reject: 8 herds', !ok(rHerdsLen));
 
   // Unknown species
   const rUnknown = validateEcologySpec(
@@ -168,12 +170,12 @@ function errors(r: ReturnType<typeof validateEcologySpec>): string[] {
   );
   check('reject: count=0', !ok(rCount0));
 
-  // count = 7
-  const rCount7 = validateEcologySpec(
-    { version: 1, mood: 'x', herds: [{ species: 'rabbit', count: 7 }] },
+  // count = 13 (per-herd cap was 6 before the density pass, now 12)
+  const rCount13 = validateEcologySpec(
+    { version: 1, mood: 'x', herds: [{ species: 'rabbit', count: 13 }] },
     plains,
   );
-  check('reject: count=7', !ok(rCount7));
+  check('reject: count=13', !ok(rCount13));
 
   // Non-integer count
   const rCountFloat = validateEcologySpec(
@@ -182,22 +184,22 @@ function errors(r: ReturnType<typeof validateEcologySpec>): string[] {
   );
   check('reject: non-integer count', !ok(rCountFloat));
 
-  // Total > 14
+  // Total > 34 (was 14 before the density pass)
   const rTotal = validateEcologySpec(
     {
       version: 1,
       mood: 'x',
       herds: [
-        { species: 'rabbit', count: 6 },
-        { species: 'deer', count: 6 },
-        { species: 'horse', count: 3 },
+        { species: 'rabbit', count: 12 },
+        { species: 'deer', count: 12 },
+        { species: 'horse', count: 11 },
       ],
     },
     ['plains', 'forest'],
   );
-  check('reject: total > 14', !ok(rTotal));
-  check('reject: total > 14 error mentions total',
-    errors(rTotal).some((e) => e.includes('14')));
+  check('reject: total > 34', !ok(rTotal));
+  check('reject: total > 34 error mentions total',
+    errors(rTotal).some((e) => e.includes('34')));
 
   // Two rare herds
   const rTwoRare = validateEcologySpec(

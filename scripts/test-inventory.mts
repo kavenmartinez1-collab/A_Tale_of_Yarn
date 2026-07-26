@@ -8,6 +8,7 @@ import { KNOWN_ITEMS } from '../src/game/dungeon/dungeon-spec';
 import {
   PACK_SIZE, HOTBAR_SIZE, INVENTORY_KEY, LEGACY_INVENTORY_KEY,
   createInventory, addItem, removeItem, countItem, moveSlot, equipped,
+  dropSlot, isFull,
   equipArmor, unequipArmor, totalDefense, totalWarmth,
   deserializeInventory, migrateV1,
 } from '../src/game/inventory';
@@ -270,6 +271,67 @@ check('bad selected index falls back to 0', (() => {
   const badCount = { ...v2inv, armor: { head: { id: 'iron_helm', count: 2 }, body: null, legs: null } };
   check('armor slot count != 1 rejected',
     deserializeInventory(JSON.stringify(badCount)) === null);
+}
+
+
+// ---------------------------------------------------------------------------
+// dropSlot / isFull — the escape hatch from a full pack.
+//
+// A full inventory used to be a dead end: crafting needs a free slot for its
+// output, so with all 33 slots occupied the player could neither craft nor
+// make room. Discarding is irreversible, so the exact counts matter.
+// ---------------------------------------------------------------------------
+
+{
+  const inv = createInventory();
+  inv.pack[0] = { id: 'logs', count: 5 };
+  inv.hotbar[1] = { id: 'stone', count: 1 };
+
+  // Single-item drop decrements, keeps the stack.
+  const one = dropSlot(inv, { area: 'pack', index: 0 });
+  check('dropSlot returns what it dropped',
+    one?.id === 'logs' && one?.count === 1);
+  check('dropSlot(1) decrements the stack', inv.pack[0]?.count === 4);
+
+  // Whole-stack drop empties the slot.
+  const all = dropSlot(inv, { area: 'pack', index: 0 }, true);
+  check('dropSlot(whole) reports the full remaining count', all?.count === 4);
+  check('dropSlot(whole) empties the slot', inv.pack[0] === null);
+
+  // Dropping the last item of a stack of 1 clears the slot, not a 0-count ghost.
+  dropSlot(inv, { area: 'hotbar', index: 1 });
+  check('dropping the last item clears the slot (no zero-count ghost)',
+    inv.hotbar[1] === null);
+
+  // Empty slots and out-of-range indices are no-ops, not crashes.
+  check('dropping an empty slot returns null',
+    dropSlot(inv, { area: 'pack', index: 3 }) === null);
+  check('out-of-range index returns null',
+    dropSlot(inv, { area: 'pack', index: 999 }) === null);
+  check('negative index returns null',
+    dropSlot(inv, { area: 'hotbar', index: -1 }) === null);
+
+  // Dropping must never damage a neighbouring slot.
+  const inv2 = createInventory();
+  inv2.pack[4] = { id: 'logs', count: 2 };
+  inv2.pack[5] = { id: 'stone', count: 7 };
+  dropSlot(inv2, { area: 'pack', index: 4 }, true);
+  check('dropping one slot leaves its neighbour untouched',
+    inv2.pack[5]?.id === 'stone' && inv2.pack[5]?.count === 7);
+}
+
+{
+  // isFull, and the round trip out of the dead end.
+  const inv = createInventory();
+  check('a fresh inventory is not full', !isFull(inv));
+  for (let i = 0; i < inv.pack.length; i++) inv.pack[i] = { id: 'stone', count: 1 };
+  for (let i = 0; i < inv.hotbar.length; i++) inv.hotbar[i] = { id: 'stone', count: 1 };
+  check('every slot occupied reports full', isFull(inv));
+  check('a full inventory rejects new items', addItem(inv, 'logs', 1) === 1);
+
+  dropSlot(inv, { area: 'pack', index: 0 }, true);
+  check('dropping frees the inventory', !isFull(inv));
+  check('and the freed slot accepts a new item', addItem(inv, 'logs', 1) === 0);
 }
 
 console.log(`${passed} passed, ${failed} failed`);

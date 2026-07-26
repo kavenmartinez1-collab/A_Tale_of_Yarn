@@ -1,142 +1,55 @@
-// Dungeon: torch-lit stylized flat shading for underground interiors and
-// their surface entrance structures.
+// Dungeon / props — the palette-batched pipeline. Serves underground
+// interiors, settlement structures, resource nodes, fires, tents and building
+// interiors, all batched by palette into a handful of draw calls.
 //
-// Differences from terrain.wgsl (do NOT merge them):
-// - Flat normals from dpdx/dpdy are flipped TOWARD THE CAMERA, not to +Y —
-//   ceilings legitimately face down. With back-face culling every visible
-//   fragment's true geometric normal faces the camera, so this is exact.
-// - Group 2 carries up to 32 torch point lights (interiors are sunless).
-// - Material rides object.offset.w:  w >= 100 -> surface path (sun + fog,
-//   entrance structures);  w < 100 -> interior path (ambient + torches).
-//   (w % 100) selects the palette: 0 stone, 1 wood, 2 torch glow (emissive),
-//   3 portal glow (emissive), 4 thatch roof, 5 plaster wall (settlement
-//   buildings), 6 bush leaf, 7 berry red (resource nodes) — 4..7 are lit.
-//   Building-interior additions (all lit): 8 rich furniture wood, 9 warm
-//   fabric/blanket red, 10 hearth firebrick, 11 wool/linen off-white.
-// - lights.count.y is a "cozy interior" flag: 0 = dungeon (faint 0.10 ambient,
-//   dark dense fog), 1 = settlement building (warm lifted ambient + lighter
-//   warmer fog). All other lights buffers are zero-filled, so this only
-//   activates for building-interior draws.
+// Material rides object.offset.w:  w >= 100 -> surface path (sun, shadows,
+// fog);  w < 100 -> interior path (ambient + up to 32 torch point lights).
+// (w % 100) selects the palette:
+//   0 stone   1 wood        2 torch glow*  3 portal glow*  4 thatch roof
+//   5 plaster 6 bush leaf   7 berry red    8 furniture wood
+//   9 fabric  10 firebrick  11 wool/linen                  (* emissive)
+// 12..22 were appended for building interiors and must stay append-only:
+//  12 iron   13 blue wool  14 green wool  15 clay      16 leather
+//  17 brass  18 soot       19 pale timber 20 beeswax   21 felt wall
+//  22 window pane*
+//
+// lights.count.y is a "cozy interior" ambient floor: 0 = dungeon (faint
+// ambient, dark dense fog), 1 = fully lifted. Building interiors pick a value
+// per kind (see COZY in building/building-manager.ts) so a smithy stays dark
+// enough for its forge to matter.
 
-// Keep in sync with the packing in renderer.ts (same 240-byte Frame).
-struct Frame {
-  viewProj: mat4x4<f32>,
-  invViewProj: mat4x4<f32>,
-  cameraPos: vec3<f32>,
-  sunDir: vec3<f32>,
-  fogColor: vec3<f32>,
-  fogDensity: f32,
-  time: f32,
-  sunColor: vec3<f32>,
-  ambient: f32,
-  skyZenith: vec3<f32>,
-  starVis: f32,
-  cloudCover: f32,
-  rainLevel: f32,
-  envPad: vec2<f32>,
-}
-
-struct ObjectData {
-  offset: vec4<f32>, // xyz world offset, w material mode (see header)
-}
+#include "common.wgsl"
 
 struct Light {
   pos: vec4<f32>,         // xyz world position (w unused)
-  colorRadius: vec4<f32>, // rgb color, w radius (m)
+  colorRadius: vec4<f32>, // rgb colour, w radius (m)
 }
 
 struct Lights {
-  count: vec4<f32>,       // x = active light count (0 -> bright-ambient debug)
+  count: vec4<f32>,       // x = active light count, y = cozy flag
   lights: array<Light, 32>,
 }
 
-@group(0) @binding(0) var<uniform> frame: Frame;
 @group(1) @binding(0) var<uniform> object: ObjectData;
 @group(2) @binding(0) var<uniform> lights: Lights;
 
 struct VSOut {
   @builtin(position) pos: vec4<f32>,
   @location(0) worldPos: vec3<f32>,
+  @location(1) normal: vec3<f32>,
 }
 
 @vertex
-fn vs_main(@location(0) position: vec3<f32>) -> VSOut {
+fn vs_main(
+  @location(0) position: vec3<f32>,
+  @location(1) normal: vec3<f32>,
+) -> VSOut {
   let world = position + object.offset.xyz;
   var out: VSOut;
   out.pos = frame.viewProj * vec4<f32>(world, 1.0);
   out.worldPos = world;
+  out.normal = normal;
   return out;
-}
-
-// --- procedural surface detail (matches terrain.wgsl helpers) ---------------
-
-fn hash2(p: vec2<f32>) -> f32 {
-  return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
-}
-
-fn vnoise(p: vec2<f32>) -> f32 {
-  let i = floor(p);
-  let f = fract(p);
-  let u = f * f * (3.0 - 2.0 * f);
-  let a = hash2(i);
-  let b = hash2(i + vec2<f32>(1.0, 0.0));
-  let c = hash2(i + vec2<f32>(0.0, 1.0));
-  let d = hash2(i + vec2<f32>(1.0, 1.0));
-  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-}
-
-/** Per-palette brightness modulation; emissives (2/3) never reach this. */
-fn texFactor(palIndex: f32, wp: vec3<f32>, detail: f32) -> f32 {
-  let g = hash2(floor(wp.xz * 6.0) + vec2<f32>(floor(wp.y * 6.0) * 7.31));
-  var f = 0.0;
-  if (palIndex < 0.5) {         // stone: strata + speckle
-    f = (vnoise(vec2<f32>((wp.x + wp.z) * 0.8, wp.y * 0.9)) - 0.5) * 0.30
-      + (g - 0.5) * 0.12;
-  } else if (palIndex < 1.5) {  // wood: vertical grain streaks
-    f = (vnoise(vec2<f32>((wp.x + wp.z) * 3.0, wp.y * 0.7)) - 0.5) * 0.35;
-  } else if (palIndex < 4.5) {  // thatch: packed horizontal rows
-    f = (vnoise(vec2<f32>((wp.x + wp.z) * 0.7, wp.y * 7.0)) - 0.5) * 0.35;
-  } else if (palIndex < 5.5) {  // plaster: soft mottle
-    f = (vnoise(wp.xz * 0.9 + vec2<f32>(wp.y, 0.0)) - 0.5) * 0.12;
-  } else if (palIndex < 6.5) {  // bush leaves: clumps + dither
-    f = (vnoise(wp.xz * 1.6 + vec2<f32>(wp.y * 1.1, 0.0)) - 0.5) * 0.35
-      + (g - 0.5) * 0.15;
-  } else if (palIndex < 7.5) {  // berries: subtle speckle
-    f = (g - 0.5) * 0.10;
-  } else if (palIndex < 8.5) {  // furniture wood: plank grain
-    f = (vnoise(vec2<f32>((wp.x + wp.z) * 3.0, wp.y * 0.7)) - 0.5) * 0.30;
-  } else if (palIndex < 9.5) {  // fabric: fine weave mottle
-    f = (vnoise(wp.xz * 5.0 + vec2<f32>(wp.y * 5.0, 0.0)) - 0.5) * 0.16;
-  } else if (palIndex < 10.5) { // firebrick: courses + speckle
-    f = (vnoise(vec2<f32>((wp.x + wp.z) * 1.3, wp.y * 1.6)) - 0.5) * 0.24
-      + (g - 0.5) * 0.10;
-  } else {                      // wool/linen: soft mottle
-    f = (vnoise(wp.xz * 3.0 + vec2<f32>(wp.y * 3.0, 0.0)) - 0.5) * 0.10;
-  }
-  return 1.0 + detail * f;
-}
-
-// --- shared stylized lighting helpers (keep identical across scene shaders) --
-
-// Hemispheric ambient (cool sky above, warm bounce below) + half-Lambert sun
-// + a weak cool moon fill at night (starVis-gated, mirrored sun direction).
-fn sceneLight(albedo: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-  let up = n.y * 0.5 + 0.5;
-  let ambTint = mix(vec3<f32>(1.06, 0.98, 0.88), vec3<f32>(0.86, 0.96, 1.14), up);
-  let diff = dot(n, frame.sunDir) * 0.5 + 0.5;
-  let sun = (0.26 * diff + 0.62 * diff * diff) * frame.sunColor;
-  let moonDir = normalize(vec3<f32>(-frame.sunDir.x, abs(frame.sunDir.y), -frame.sunDir.z));
-  let moon = max(dot(n, moonDir), 0.0) * frame.starVis * vec3<f32>(0.05, 0.06, 0.10);
-  return albedo * (frame.ambient * ambTint + sun + moon);
-}
-
-// Gentle filmic-ish grade: lifts shadows, rolls off highlights, +10% sat.
-fn grade(c: vec3<f32>) -> vec3<f32> {
-  let x = max(c, vec3<f32>(0.0));
-  let toned = x * (vec3<f32>(1.25) + x * 0.45)
-            / (vec3<f32>(1.0) + x * (vec3<f32>(0.90) + x * 0.45));
-  let l = dot(toned, vec3<f32>(0.2126, 0.7152, 0.0722));
-  return mix(vec3<f32>(l), toned, 1.10);
 }
 
 fn palette(index: f32) -> vec3<f32> {
@@ -151,68 +64,147 @@ fn palette(index: f32) -> vec3<f32> {
   if (index < 8.5) { return vec3<f32>(0.34, 0.22, 0.12); } // furniture wood
   if (index < 9.5) { return vec3<f32>(0.55, 0.18, 0.16); } // fabric/blanket red
   if (index < 10.5) { return vec3<f32>(0.30, 0.28, 0.27); } // hearth firebrick
-  return vec3<f32>(0.78, 0.72, 0.62);                      // wool/linen
+  if (index < 11.5) { return vec3<f32>(0.78, 0.72, 0.62); } // wool/linen
+  // 12..20: building interiors. Appended, never reordered — the CPU mirror in
+  // render/material-table.ts and building-interior-mesh.ts index these by name.
+  if (index < 12.5) { return vec3<f32>(0.31, 0.33, 0.37); } // dark iron
+  if (index < 13.5) { return vec3<f32>(0.24, 0.31, 0.45); } // blue-dyed wool
+  if (index < 14.5) { return vec3<f32>(0.27, 0.38, 0.25); } // green-dyed wool
+  if (index < 15.5) { return vec3<f32>(0.58, 0.35, 0.24); } // terracotta clay
+  if (index < 16.5) { return vec3<f32>(0.42, 0.29, 0.18); } // tanned leather
+  if (index < 17.5) { return vec3<f32>(0.76, 0.60, 0.26); } // brass / gold
+  if (index < 18.5) { return vec3<f32>(0.12, 0.11, 0.11); } // soot / charcoal
+  if (index < 19.5) { return vec3<f32>(0.60, 0.49, 0.34); } // pale limewashed timber
+  if (index < 20.5) { return vec3<f32>(0.87, 0.78, 0.50); } // beeswax / tallow
+  if (index < 21.5) { return vec3<f32>(0.84, 0.78, 0.68); } // limewashed felt wall
+  // Emissive, so this value is pre-multiplier: x4 lands near 1.0 and blooms
+  // gently, where palette 3 punches a white hole through the wall.
+  return vec3<f32>(0.24, 0.31, 0.40);                      // daylight window pane
+}
+
+/**
+ * Palette index -> material ID. Mirrors `paletteMaterial()` in
+ * render/material-table.ts — keep the two in sync. It lives in both places
+ * because props batch by palette through the object uniform (mode = 100 +
+ * palette), so the CPU never resolves the material itself.
+ *
+ * `surface` is the one case where a palette index means two different things:
+ * rough boulders outdoors, cut masonry underground.
+ */
+fn paletteMaterialId(index: f32, surface: bool) -> i32 {
+  if (index < 0.5)  { return select(MAT_ID_MASONRY, MAT_ID_STONE, surface); }
+  if (index < 1.5)  { return MAT_ID_WOOD; }
+  if (index < 2.5)  { return MAT_ID_EMBER; }
+  if (index < 3.5)  { return MAT_ID_PORTAL; }
+  if (index < 4.5)  { return MAT_ID_THATCH; }
+  if (index < 5.5)  { return MAT_ID_MASONRY; }
+  if (index < 7.5)  { return MAT_ID_LEAF; }
+  if (index < 8.5)  { return MAT_ID_WOOD; }
+  if (index < 9.5)  { return MAT_ID_CLOTH; }
+  if (index < 10.5) { return MAT_ID_MASONRY; }
+  if (index < 11.5) { return MAT_ID_CLOTH; }
+  if (index < 12.5) { return MAT_ID_IRON; }
+  if (index < 14.5) { return MAT_ID_CLOTH; }        // dyed wools
+  if (index < 15.5) { return MAT_ID_MASONRY; }      // fired clay
+  if (index < 16.5) { return MAT_ID_LEATHER; }
+  if (index < 17.5) { return MAT_ID_GOLD; }
+  if (index < 18.5) { return MAT_ID_STONE; }        // soot on rough rock
+  if (index < 19.5) { return MAT_ID_WOOD; }
+  if (index < 20.5) { return MAT_ID_CLOTH; }        // wax reads as matte tallow
+  if (index < 21.5) { return MAT_ID_FELT; }         // interior walls are felt
+  return MAT_ID_PORTAL;                             // window pane: soft daylight
+}
+
+/** Torch point lights: inverse-square falloff windowed to a finite radius. */
+fn torchLighting(worldPos: vec3<f32>, n: vec3<f32>, V: vec3<f32>, rough: f32) -> vec3<f32> {
+  let count = u32(lights.count.x);
+  var lit = vec3<f32>(0.0);
+  for (var i = 0u; i < count; i = i + 1u) {
+    let light = lights.lights[i];
+    let toLight = light.pos.xyz - worldPos;
+    let d = length(toLight);
+    let radius = max(light.colorRadius.w, 0.001);
+    if (d >= radius) { continue; }
+    let L = toLight / max(d, 1e-4);
+    // Physical 1/d^2 with a smooth window so it reaches zero at the radius.
+    let window = pow(clamp(1.0 - pow(d / radius, 4.0), 0.0, 1.0), 2.0);
+    let atten = window / (1.0 + d * d * 0.35);
+    let ndl = max(dot(n, L), 0.0);
+    // Firelight flicker, keyed on world position (see common.wgsl) so it
+    // matches the same torch's contribution to the world-light set exactly.
+    let flicker = fireFlicker(light.pos.xyz, 0.28);
+    let H = normalize(L + V);
+    let spec = distGGX(max(dot(n, H), 0.0), max(rough, 0.12)) * 0.05;
+    lit = lit + light.colorRadius.rgb * ((ndl + spec) * atten * flicker * 3.2);
+  }
+  return lit;
 }
 
 @fragment
-fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
-  // Flat face normal; derivative handedness varies by backend, so flip
-  // toward the camera (exact for every visible cull-back fragment).
-  var n = normalize(cross(dpdx(in.worldPos), dpdy(in.worldPos)));
+fn fs_main(in: VSOut) -> SceneOut {
+  var n = normalize(in.normal);
+  // Dungeon interiors wind their normals inward and props outward; either way
+  // every visible back-face-culled fragment faces the camera.
   if (dot(n, frame.cameraPos - in.worldPos) < 0.0) { n = -n; }
 
   let mode = object.offset.w;
   let surface = mode >= 100.0;
   let palIndex = mode - select(0.0, 100.0, surface);
-  var albedo = palette(palIndex);
+  let baseColor = palette(palIndex);
+  let matId = paletteMaterialId(palIndex, surface);
+  let row = materialTable.rows[clamp(matId, 0, 31)];
+  var out: SceneOut;
 
-  // Emissive palettes (torch/portal glow) skip lighting entirely.
-  if (palIndex >= 1.5 && palIndex < 3.5) {
-    let flicker = select(1.0, 0.9 + 0.1 * sin(frame.time * 9.0), palIndex < 2.5);
-    return vec4<f32>(albedo * flicker, 1.0);
+  // Emissive materials (torch and portal glow) skip lighting entirely and sit
+  // well above 1.0 so the bloom chain catches them. These are wicks and ember
+  // beds now — the visible flame on top is a billboard from render/fire-fx.ts.
+  // The flicker is world-position keyed, so every emissive surface in the
+  // scene no longer pulses in perfect lockstep the way a global sin(time) made
+  // them, and each wick matches the light its own fixture casts.
+  if (row.b.y > 0.0) {
+    let flicker = select(1.0, fireFlicker(in.worldPos, 0.26), palIndex < 2.5);
+    out.color = vec4<f32>(baseColor * row.b.y * flicker, 1.0);
+    out.normal = packNormal(n, 0.0);
+    return out;
   }
 
-  // Per-pixel material detail, faded with distance (no shimmer far away).
-  let dist = distance(in.worldPos, frame.cameraPos);
-  albedo *= texFactor(palIndex, in.worldPos, exp(-dist * 0.02));
+  // Outdoors, the shared material path handles everything.
+  if (surface) {
+    return shadeMaterialId(matId, baseColor, in.worldPos, in.worldPos, n, 1.0);
+  }
+
+  // Interiors keep their own lighting: the group-2 torch set holds up to 32
+  // lights (twice the world set) and the ambient/fog are tuned per interior
+  // kind. Only the *material* comes from the table here.
+  let surf = sampleMaterial(i32(row.a.x), in.worldPos, n, row.a.y);
+  let albedo = baseColor * clamp(luminance(surf.albedo) / 0.33, 0.62, 1.45);
+  let V = normalize(frame.cameraPos - in.worldPos);
+  let viewDist = distance(in.worldPos, frame.cameraPos);
+  let rough = clamp(surf.roughness * row.a.z, 0.03, 1.0);
 
   var color: vec3<f32>;
-  if (surface) {
-    // Entrance structures stand in daylight: same look as terrain objects.
-    color = sceneLight(albedo, n);
+  var ambientRatio = 1.0;
+  let count = u32(lights.count.x);
+  if (count == 0u) {
+    // Preview fallback: no torches uploaded yet, so keep faces readable.
+    color = albedo * (0.55 + 0.45 * (dot(n, frame.sunDir) * 0.5 + 0.5));
   } else {
-    let count = u32(lights.count.x);
-    if (count == 0u) {
-      // Debug/preview fallback: no torches uploaded yet -> flat bright,
-      // with a touch of sun shading so faces stay distinguishable.
-      let diff = dot(n, frame.sunDir) * 0.5 + 0.5;
-      color = albedo * (0.55 + 0.45 * diff);
-    } else {
-      // Base ambient: faint for dungeons; warm and lifted for settlement
-      // building interiors (lights.count.y = cozy flag, 0 elsewhere).
-      var lit = mix(vec3<f32>(0.10, 0.10, 0.11), vec3<f32>(0.34, 0.30, 0.26),
-                    clamp(lights.count.y, 0.0, 1.0));
-      for (var i = 0u; i < count; i = i + 1u) {
-        let light = lights.lights[i];
-        let toLight = light.pos.xyz - in.worldPos;
-        let dist = length(toLight);
-        let atten = pow(clamp(1.0 - dist / light.colorRadius.w, 0.0, 1.0), 2.0);
-        if (atten <= 0.0) { continue; }
-        let diff = max(dot(n, toLight / max(dist, 1e-4)), 0.0);
-        let flicker = 0.85 + 0.15 * sin(frame.time * 7.0 + f32(i) * 1.7);
-        lit += light.colorRadius.rgb * (diff * atten * flicker);
-      }
-      color = albedo * lit;
-    }
+    // Faint for dungeons, warm and lifted for cozy building interiors.
+    let cozy = clamp(lights.count.y, 0.0, 1.0);
+    let base = mix(vec3<f32>(0.085, 0.085, 0.095),
+                   vec3<f32>(0.30, 0.26, 0.22), cozy);
+    let torch = torchLighting(in.worldPos, surf.normal, V, rough);
+    color = albedo * (base * surf.ao + torch * surf.ao);
+    // Torchlight is direct, so keep SSAO mostly off the lit areas.
+    ambientRatio = clamp(1.0 - luminance(torch), 0.15, 1.0);
   }
 
-  // Exponential distance fog (dark + dense inside, set per-frame by main).
-  // Cozy building interiors thin the fog and warm its tint (cozy = 0 for
-  // dungeons, surface structures, and every other lights-buffer user).
   let cozy = clamp(lights.count.y, 0.0, 1.0);
   let fogDensity = frame.fogDensity * mix(1.0, 0.35, cozy);
   let fogCol = mix(frame.fogColor, vec3<f32>(0.16, 0.12, 0.08), cozy);
-  let fog = 1.0 - exp(-fogDensity * dist);
-  color = mix(color, fogCol, fog);
-  return vec4<f32>(grade(color), 1.0);
+  color = mix(color, fogCol, 1.0 - exp(-fogDensity * viewDist));
+
+  out.color = vec4<f32>(color, 1.0);
+  out.normal = packNormal(surf.normal, ambientRatio);
+  return out;
 }

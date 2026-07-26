@@ -11,6 +11,8 @@ import {
   cellOf,
   RESPAWN_S,
   LIVE_CAP,
+  LIVE_RADIUS,
+  RELEASE_RADIUS,
   ENTITY_KILLED_KEY,
   loadKilledRegistry,
   saveKilledRegistry,
@@ -407,6 +409,61 @@ function fnv32a(str: string): number {
   // Remove scale on grown-up.
   e.scaleOverride = undefined;
   check('scaleOverride cleared (adult)', e.scaleOverride === undefined);
+}
+
+// ---------------------------------------------------------------------------
+// 16. Distance-based streaming (LIVE_RADIUS / RELEASE_RADIUS)
+//
+// Entities used to be materialised a whole 512 m cell at a time and then
+// culled back to LIVE_CAP farthest-first. That spread the entire budget over
+// a ~690 m radius while the renderer only draws to 120 m, and — because a cell
+// was only ever populated once, on load — anything culled while distant never
+// came back as the player walked toward it. Both properties are asserted here.
+// ---------------------------------------------------------------------------
+
+{
+  const mgr = new EntityManager(4242, flatHeight, plainsAt);
+  // Stand in the middle of cell (0,0).
+  const midX = ECELL / 2, midZ = ECELL / 2;
+  mgr.update(midX, midZ);
+
+  const live = [...mgr.entities.values()].filter((e) => !e.owned && !e.npcOwned);
+  check('streaming materialises something near the player', live.length > 0,
+    `live=${live.length}`);
+
+  const beyond = live.filter(
+    (e) => Math.hypot(e.x - midX, e.z - midZ) > RELEASE_RADIUS);
+  check('nothing live beyond RELEASE_RADIUS', beyond.length === 0,
+    `${beyond.length} of ${live.length} past ${RELEASE_RADIUS} m`);
+
+  const within = live.filter(
+    (e) => Math.hypot(e.x - midX, e.z - midZ) <= LIVE_RADIUS);
+  check('the live set is the near set', within.length === live.length,
+    `${within.length}/${live.length} within ${LIVE_RADIUS} m`);
+}
+
+{
+  // Walk away far enough to release, then come back: the same animals must
+  // return. This is the regression that made the world feel empty — walking
+  // toward where animals were found nothing there.
+  const mgr = new EntityManager(99, flatHeight, plainsAt);
+  const homeX = ECELL / 2, homeZ = ECELL / 2;
+  mgr.update(homeX, homeZ);
+  const before = [...mgr.entities.keys()].filter((id) => id.startsWith('0,0:e')).sort();
+  check('near cell populated before leaving', before.length > 0, `${before.length}`);
+
+  // Move well outside RELEASE_RADIUS but stay inside the same 3×3 neighbourhood,
+  // so no cell unload/reload can mask the behaviour.
+  mgr.update(homeX, homeZ + RELEASE_RADIUS + 60);
+  const away = [...mgr.entities.keys()].filter((id) => before.includes(id));
+  check('distant entities are released', away.length < before.length,
+    `still live: ${away.length}/${before.length}`);
+
+  mgr.update(homeX, homeZ);
+  const after = [...mgr.entities.keys()].filter((id) => id.startsWith('0,0:e')).sort();
+  check('returning to the same spot restores the same entities',
+    after.length === before.length && after.every((id, i) => id === before[i]),
+    `before=${before.length} after=${after.length}`);
 }
 
 // ---------------------------------------------------------------------------

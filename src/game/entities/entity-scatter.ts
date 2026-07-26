@@ -6,8 +6,8 @@
  *   SALT = 0xec0517a7
  *   rng  = mulberry32(mix32(seed ^ SALT, cx, cz))
  *
- *   COMMON PASS — 2–5 groups per cell:
- *     groupCount = 2 + floor(rng() * 4)           // 2, 3, 4, or 5
+ *   COMMON PASS — 7–11 groups per cell:
+ *     groupCount = 7 + floor(rng() * 5)           // 7, 8, 9, 10, or 11
  *     For each group:
  *       anchor x = cx*ECELL + rng()*ECELL          // uniformly in [0, ECELL)
  *       anchor z = cz*ECELL + rng()*ECELL
@@ -15,7 +15,7 @@
  *       eligible = common species whose .biomes includes this biome
  *       if none → skip group (no draws consumed beyond anchor + biome)
  *       species  = eligible[floor(rng() * eligible.length)]
- *       indivCount = 1 + floor(rng() * 3)          // 1, 2, or 3
+ *       indivCount = 2 + floor(rng() * 4)          // 2, 3, 4, or 5
  *       For each individual:
  *         jx = anchor.x + (rng()*2 - 1)*12         // ±12 m
  *         jz = anchor.z + (rng()*2 - 1)*12
@@ -89,10 +89,27 @@ export function entitiesForCell(
   const prefix = `${cx},${cz}:e`;
 
   // ---- COMMON PASS --------------------------------------------------------
-  const groupCount = 2 + Math.floor(rng() * 4); // 2–5
+  // Was 2–5 groups of 1–3 (mean ~7 animals per 512 m cell — one per 37,000 m2).
+  // Measured in-game that left 90% of land positions with nothing within 60 m
+  // and a median nearest animal of 146 m, against a renderer that draws to
+  // 120 m. Both knobs matter and they do different jobs: group *count* is
+  // spatial coverage (each group is a ±12 m cluster, so few groups means large
+  // dead stretches whatever their size), group *size* is how a herd reads once
+  // found. Raised together to ~31 per cell.
+  const groupCount = 7 + Math.floor(rng() * 5); // 7–11
   for (let g = 0; g < groupCount; g++) {
-    const ax = cx * ECELL + rng() * ECELL;
-    const az = cz * ECELL + rng() * ECELL;
+    // Anchors used to be a single uniform draw over the whole cell, so in a
+    // cell that is half ocean, half the groups landed in water and were
+    // dropped outright by the h < 1 test below. That is the coastline the
+    // player spawns on and walks along — the emptiest ground in the game was
+    // the ground most often seen. Give each group a few tries at finding land.
+    let ax = 0, az = 0, onLand = false;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      ax = cx * ECELL + rng() * ECELL;
+      az = cz * ECELL + rng() * ECELL;
+      if (heightAt(ax, az) >= 1) { onLand = true; break; }
+    }
+    if (!onLand) continue;
     const biome = biomeAt(ax, az);
 
     const eligible = COMMON_SPECIES.filter((s) =>
@@ -101,7 +118,7 @@ export function entitiesForCell(
     if (eligible.length === 0) continue;
 
     const species = eligible[Math.floor(rng() * eligible.length)];
-    const indivCount = 1 + Math.floor(rng() * 3); // 1–3
+    const indivCount = 2 + Math.floor(rng() * 4); // 2–5
 
     for (let k = 0; k < indivCount; k++) {
       const jx = ax + (rng() * 2 - 1) * 12;
@@ -127,12 +144,27 @@ export function entitiesForCell(
     const eligibleRare = RARE_SPECIES.filter((s) => {
       if (s === 'dragon') return biome === 'alpine' || biome === 'mountain_forest';
       if (s === 'griffin') return biome === 'alpine' || biome === 'mountain_forest';
+      // The wyvern claims the crags AND the warm biomes, which previously had
+      // no rare beast at all — that habitat spread is most of why a wyvern is
+      // the flier a player actually meets.
+      if (s === 'wyvern') return SPECIES_DEFS.wyvern.biomes.includes(biome);
       if (s === 'sea_serpent') return biome === 'ocean' && rh < -8;
       return false;
     });
 
     if (eligibleRare.length > 0) {
-      const species = eligibleRare[Math.floor(rng() * eligibleRare.length)];
+      // Weighted pick, not uniform: a wyvern carries `rareWeight` 4 against
+      // everything else's 1, so where both are admissible it outnumbers the
+      // dragon four to one. Deliberately still ONE rng() draw, so the stream
+      // position — and therefore every other cell's contents — is unchanged.
+      let total = 0;
+      for (const s of eligibleRare) total += SPECIES_DEFS[s].rareWeight ?? 1;
+      let roll = rng() * total;
+      let species = eligibleRare[eligibleRare.length - 1];
+      for (const s of eligibleRare) {
+        roll -= SPECIES_DEFS[s].rareWeight ?? 1;
+        if (roll < 0) { species = s; break; }
+      }
       spawns.push({ id: `${prefix}${spawns.length}`, species, x: rx, z: rz });
     }
   }

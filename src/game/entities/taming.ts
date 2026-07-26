@@ -107,6 +107,56 @@ export function needsTaming(species: Species): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Per-species taming difficulty
+// ---------------------------------------------------------------------------
+
+/**
+ * The three knobs that actually grade how hard a creature is to tame.
+ *
+ * Until now all of them were global constants, so "rare and mountable" was a
+ * single difficulty tier: dragon and griffin cost exactly the same effort.
+ * That stops working the moment a species is supposed to be COMMON and
+ * HARDER — a wyvern you meet ten times as often has to be worth something
+ * more than a dragon to break, or its abundance simply devalues the mount.
+ *
+ * Existing species keep the global constants exactly, so this adds a tier
+ * rather than re-tuning the ones that already shipped.
+ */
+export interface TameProfile {
+  /** Probability of being bucked on each untamed mount attempt. */
+  buckChance: number;
+  /** Temper gained per buck survived. */
+  temperPerBuck: number;
+  /** Temper gained per favourite-food feed. */
+  temperPerFeed: number;
+}
+
+export const DEFAULT_TAME_PROFILE: TameProfile = {
+  buckChance: BUCK_CHANCE,
+  temperPerBuck: TEMPER_PER_BUCK,
+  temperPerFeed: TEMPER_PER_FEED,
+};
+
+export const TAME_PROFILES: Partial<Record<Species, TameProfile>> = {
+  // Harder than a dragon on every axis: it throws you more often, you learn
+  // less from each throw, and each feed buys less ground. 16 feeds to the
+  // dragon's 10, at a 0.72 buck chance against 0.50.
+  wyvern: { buckChance: 0.72, temperPerBuck: 3, temperPerFeed: 5 },
+};
+
+export function tameProfile(species: Species): TameProfile {
+  return TAME_PROFILES[species] ?? DEFAULT_TAME_PROFILE;
+}
+
+/**
+ * Feeds required to tame from temper 0 with no bucking — the single number
+ * that expresses "harder to tame" and the one a test can assert on.
+ */
+export function feedsToTame(species: Species): number {
+  return Math.ceil(TAME_THRESHOLD / tameProfile(species).temperPerFeed);
+}
+
+// ---------------------------------------------------------------------------
 // TamedState factory
 // ---------------------------------------------------------------------------
 
@@ -160,12 +210,13 @@ export function attemptMount(
     return { result: 'mounted', state: { ...state } };
   }
 
-  // Rare mountable — untamed: temper-based interaction.
+  // Rare mountable — untamed: temper-based interaction, graded per species.
+  const prof = tameProfile(species);
   let temper = state.temper;
   let bucked: boolean;
 
-  if (rng() < BUCK_CHANCE) {
-    temper  = Math.min(100, temper + TEMPER_PER_BUCK);
+  if (rng() < prof.buckChance) {
+    temper  = Math.min(100, temper + prof.temperPerBuck);
     bucked  = true;
   } else {
     bucked  = false;
@@ -199,7 +250,7 @@ export function feed(
   if (!fav || itemId !== fav) {
     return { accepted: false, state: { ...state } };
   }
-  const temper = Math.min(100, state.temper + TEMPER_PER_FEED);
+  const temper = Math.min(100, state.temper + tameProfile(species).temperPerFeed);
   const tamed  = temper >= TAME_THRESHOLD;
   return { accepted: true, state: { temper, tamed } };
 }
@@ -287,7 +338,8 @@ export function serializeTamingRegistry(r: TamingRegistry): string {
 }
 
 const VALID_SPECIES = new Set<string>([
-  'rabbit', 'deer', 'bird', 'horse', 'cow', 'donkey', 'dragon', 'griffin', 'sea_serpent',
+  'rabbit', 'deer', 'bird', 'horse', 'cow', 'donkey', 'dragon', 'wyvern',
+  'griffin', 'sea_serpent',
 ]);
 const VALID_EGG_SPECIES = new Set<string>(['bird', 'dragon', 'griffin']);
 

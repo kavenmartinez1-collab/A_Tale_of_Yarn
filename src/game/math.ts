@@ -111,6 +111,25 @@ export function perspectiveZO(fovY: number, aspect: number, near: number, far: n
   return m;
 }
 
+/**
+ * Right-handed orthographic projection with [0, 1] clip-Z (WebGPU/D3D) —
+ * the shadow-cascade projection.
+ */
+export function orthoZO(
+  left: number, right: number, bottom: number, top: number,
+  near: number, far: number,
+): Mat4 {
+  const m = new Float32Array(16);
+  m[0] = 2 / (right - left);
+  m[5] = 2 / (top - bottom);
+  m[10] = 1 / (near - far);
+  m[12] = -(right + left) / (right - left);
+  m[13] = -(top + bottom) / (top - bottom);
+  m[14] = near / (near - far);
+  m[15] = 1;
+  return m;
+}
+
 /** General 4x4 inverse (adjugate method). Returns identity if singular. */
 export function invert(a: Mat4): Mat4 {
   const b00 = a[0] * a[5] - a[1] * a[4];

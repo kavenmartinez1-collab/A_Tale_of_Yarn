@@ -26,7 +26,12 @@ function torchXZ(cell: [number, number], wallDir: number): [number, number] {
 export interface TorchProps {
   /** Handle geometry (palette 1, wood). */
   wood: Float32Array<ArrayBuffer>;
-  /** Flame geometry (palette 2, emissive torch glow). */
+  /**
+   * Emissive flame geometry (palette 2). Now only a small glowing wick nub:
+   * the visible flame is an additive billboard emitted per frame by
+   * render/fire-fx.ts at the point-light position below. The nub stays so a
+   * torch still reads as lit from any angle even before the billboard pass.
+   */
   flame: Float32Array<ArrayBuffer>;
   /** Point-light positions (local), one per torch, at the flame center. */
   lights: [number, number, number][];
@@ -39,8 +44,8 @@ export function buildTorchProps(layout: DungeonLayout): TorchProps {
   for (const t of layout.torches) {
     const [x, z] = torchXZ(t.cell, t.wallDir);
     box(wood, x - 0.04, 1.15, z - 0.04, x + 0.04, 1.65, z + 0.04);
-    box(flame, x - 0.09, 1.65, z - 0.09, x + 0.09, 1.83, z + 0.09);
-    lights.push([x, 1.74, z]);
+    box(flame, x - 0.035, 1.65, z - 0.035, x + 0.035, 1.71, z + 0.035);
+    lights.push([x, 1.72, z]);
   }
   return {
     wood: Float32Array.from(wood) as Float32Array<ArrayBuffer>,

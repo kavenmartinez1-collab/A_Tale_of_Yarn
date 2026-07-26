@@ -15,6 +15,9 @@ import {
   validateTradeAgainstCatalog,
   validateSellOffer,
   applyStock,
+  threatActionFor,
+  memoryFactForAction,
+  extractNpcAction,
   type CatalogEntry,
   type TradeOffer,
 } from '../src/game/npc/npc-trade';
@@ -28,6 +31,7 @@ import {
   type NpcPersona,
 } from '../src/game/npc/npc-prompt';
 
+import { readFileSync } from 'node:fs';
 import { ITEM_DEFS } from '../src/game/items';
 import type { ChatMessage } from '../src/game/director/director-prompt';
 
@@ -61,7 +65,7 @@ function fnv1a(str: string): number {
 // 1. NPC_PROMPT_VERSION
 // ---------------------------------------------------------------------------
 
-check('NPC_PROMPT_VERSION === 9', NPC_PROMPT_VERSION === 9);
+check('NPC_PROMPT_VERSION === 13', NPC_PROMPT_VERSION === 13);
 
 // ---------------------------------------------------------------------------
 // 2. TRADE_CATALOG — all ids valid, prices and stock positive
@@ -119,7 +123,18 @@ for (const role of ALL_ROLES) {
 
   check('system prompt: contains name', prompt.includes('Petra'));
   check('system prompt: contains settlement', prompt.includes('Ashford'));
-  check('system prompt: open-topic rule present', prompt.includes('No topic is off-limits'));
+  // Adult subjects stay open — this is the game's premise and a real
+  // regression risk, since it would be easy to "improve" the guardrail into a
+  // general politeness filter and quietly neuter every NPC.
+  check('system prompt: adult subjects stay open',
+    prompt.includes('Adult subjects are open'));
+  check('system prompt: no moralizing rule survives',
+    prompt.includes('do not moralize'));
+  // ...and exactly one carve-out, so the game has a truthful answer to Steam's
+  // AI-guardrails question. Enforced independently in npc/content-safety.ts;
+  // this only checks the model is asked as well.
+  check('system prompt: minor-safety carve-out present',
+    prompt.includes('never write anything sexual involving a'));
   check('system prompt: fourth-wall rule', prompt.includes('fourth wall'));
   check('system prompt: anti-repeat rule', prompt.includes('Never repeat a sentence'));
   check('system prompt: follow rules present', prompt.includes('FOLLOWING:'));
@@ -456,8 +471,37 @@ const TRAILING_OFFER = CLEAN_OFFER + '\nHave a safe journey!';
  * Update GOLDEN_NPC_HASH when NPC_PROMPT_VERSION is bumped.
  */
 // Old hashes: v1 0xb6d76501, v2 (memory/consequences) 0xab926a81, v3 0x0fb48232,
-// v5 0xd36f4148, v6/v7 0x0f0f15b9, v8 (invite_home hospitality) 0xfbfd22e5.
-const GOLDEN_NPC_HASH: number | null = 0x76fdc275; // v9: open-topic conversation rules
+// v5 0xd36f4148, v6/v7 0x0f0f15b9, v8 (invite_home hospitality) 0xfbfd22e5,
+// v9 (open-topic, no blocks at all) 0x76fdc275.
+// v10 replaces the blanket "No topic is off-limits / Never refuse" with the
+// same adult freedom plus exactly ONE carve-out (nothing sexual involving a
+// child), so the game has a truthful answer to Steam's AI-guardrails question.
+// The prompt is only the polite half; npc/content-safety.ts enforces it on
+// both the player's input and the model's output, because a prompt rule is a
+// request and an abliterated model has had its refusal behaviour removed.
+// v11 gives the model the LIVE trade context it never had. Before this the
+// prompt built its wares from TRADE_CATALOG[role] — the static per-role
+// template — so every merchant in the world recited an identical list, selling
+// out changed nothing the model knew, and an NPC would offer things it had
+// none of. It also never learned what the traveller was carrying, so although
+// buying from the player was fully implemented (validateSellOffer,
+// SELL_PRICES, and the apply path), the model could not raise the subject and
+// every trade was one-directional.
+// v12 adds SHARED VILLAGE MEMORY. Before it, every memory in the game was
+// dyadic — one NPC's opinion of the player — so nobody witnessed anything.
+// Attack a farmer in the square and the farmer beside them had no idea: the
+// crime system logged an anonymous {kind, t} row against a REGION and raised a
+// bounty, and threw away WHO saw it. NPCs now carry what they saw and what
+// they were told, phrased differently, and a killing sours a witness far more
+// than it sours someone who only heard about it.
+// v13 adds SHARED VILLAGE FACTS. Ask a farmer about the well and then ask the
+// smith and you used to get two unrelated inventions, because each NPC's only
+// context was its own opinion of the player. They now read one generated,
+// persistent list, so they agree — and a concern names an OWNER, which makes
+// "Nils would know more about that" true rather than a pleasant fabrication.
+// Concerns carry a completable task, so the same store that gives consistency
+// also gives the game its quests.
+const GOLDEN_NPC_HASH: number | null = 0xeb856807; // v13: village facts
 
 const goldenPersona: NpcPersona = {
   role: 'merchant',
@@ -836,6 +880,74 @@ if (GOLDEN_NPC_HASH === null) {
       // GOLD_POOL_START is not exported; verify farmer can buy at least 1 wool.
       const e = TRADE_CATALOG.farmer.find((c) => c.id === 'wool')!;
       return e !== undefined && e.price <= 60; // 60 = farmer gold pool
+    })());
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic threat floor (threatActionFor)
+// ---------------------------------------------------------------------------
+//
+// The live LLM path leans on this because a 1.7B does not reliably emit the
+// action verb when threatened (0/4 measured — scripts/test-npc-live.mts). The
+// mapping must stay in step with stubReply's, or threatening an NPC would have
+// different consequences depending on whether the model happened to be loaded.
+{
+  check('threat floor: merchant threatened -> afraid',
+    threatActionFor('merchant', 'threat').action === 'afraid');
+  check('threat floor: merchant insulted -> hostile (stands ground over words)',
+    threatActionFor('merchant', 'insult').action === 'hostile');
+  check('threat floor: guard threatened -> hostile',
+    threatActionFor('guard', 'threat').action === 'hostile');
+  check('threat floor: farmer threatened -> hostile',
+    threatActionFor('farmer', 'threat').action === 'hostile');
+  check('threat floor: villager insulted -> hostile',
+    threatActionFor('villager', 'insult').action === 'hostile');
+  check('threat floor: always carries a reason',
+    (['farmer', 'villager', 'merchant', 'guard'] as const).every((r) =>
+      (['threat', 'insult'] as const).every((k) => {
+        const a = threatActionFor(r, k);
+        return typeof a.reason === 'string' && a.reason.trim() !== '';
+      })));
+  // The floor's output must survive the same parser the model's own JSON goes
+  // through, or it would be silently dropped at the call site.
+  check('threat floor: result round-trips through extractNpcAction',
+    (() => {
+      const a = threatActionFor('merchant', 'threat');
+      const round = extractNpcAction(`Stay back!
+${JSON.stringify({ action: a.action, reason: a.reason })}`);
+      return round !== null && round.action === 'afraid';
+    })());
+}
+
+// ---------------------------------------------------------------------------
+// Persisted memory must never contain model-generated prose
+// ---------------------------------------------------------------------------
+//
+// The chat panel used to write the model's own `action.reason` string into
+// localStorage, where it became permanent prompt context AND broke a condition
+// of the Art. 50(2) exemption route ("not recorded, stored or disseminated
+// further"). memoryFactForAction is the closed first-party replacement.
+{
+  const KINDS = ['hostile', 'afraid', 'end', 'charmed', 'accept_proposal',
+    'reject_proposal', 'follow', 'stay', 'invite_home'] as const;
+  check('memory facts: every action kind maps to a non-empty first-party line',
+    KINDS.every((k) => {
+      const f = memoryFactForAction(k);
+      return typeof f === 'string' && f.trim().length > 3;
+    }));
+  check('memory facts: distinct per kind (no accidental collisions)',
+    new Set(KINDS.map((k) => memoryFactForAction(k))).size === KINDS.length);
+  check('memory facts: deterministic — same input, same output',
+    KINDS.every((k) => memoryFactForAction(k) === memoryFactForAction(k)));
+  // The panel must not pass the model's reason through. Guarded here because
+  // the call site is DOM code that these node tests cannot execute.
+  check('memory facts: panel never persists action.reason',
+    (() => {
+      const src = readFileSync(
+        new URL('../src/game/ui/npc-chat-panel.ts', import.meta.url), 'utf-8');
+      // `remember(` must never be handed the raw reason variable.
+      return !/remember\(\s*reason/.test(src)
+        && !/remember\(\s*action\.reason/.test(src);
     })());
 }
 
