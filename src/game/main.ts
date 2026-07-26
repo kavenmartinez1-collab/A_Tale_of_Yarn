@@ -14,9 +14,11 @@
 import { initWebGPU } from '../engine/gpu-device';
 import { reportError } from '../utils/metrics';
 import {
-  Renderer, LIGHTS_BUFFER_SIZE,
+  Renderer, LIGHTS_BUFFER_SIZE, DEFAULT_POST, STRIDE_CREATURE, STRIDE_PROP,
+  MAX_WORLD_LIGHTS,
   type FrameUniforms, type TerrainDraw, type DungeonDraw,
 } from './renderer';
+import { MATERIALS } from './render/materials';
 import { layoutDungeon, mix32 } from './dungeon/dungeon-layout';
 import { buildInteriorMesh } from './dungeon/dungeon-mesh';
 import { DUNGEON_FIXTURES } from './dungeon/dungeon-fixtures';
@@ -36,12 +38,19 @@ import {
 } from './character/character-mesh';
 import { loadCustomization, saveCustomization } from './character/customization';
 import { isGameItemId, itemDef, ITEM_DEFS, type GameItemId } from './items';
+import {
+  loadVillageMemory, saveVillageMemory, recordVillageEvent, witnessesNear,
+  spreadVillageNews, newsFor, dispositionFromNews,
+} from './npc/village-memory';
+import {
+  loadVillageFacts, saveVillageFacts, factsFor, factLinesFor, advanceTasks,
+} from './npc/village-facts';
 import { loadNodeRegistry, saveNodeRegistry } from './resource-nodes';
 import { ResourceManager, type WorldNode, type NodeType } from './resource-manager';
 import { RESOURCE_DROPS, REQUIRES_PICKAXE } from './resource-scatter';
 import {
-  addItem, countItem, removeItem, equipped, loadInventory, saveInventory, totalWarmth,
-  equipArmor, unequipArmor, totalDefense,
+  addItem, countItem, removeItem, dropSlot, equipped, loadInventory, saveInventory,
+  totalWarmth, equipArmor, unequipArmor, totalDefense,
   type Inventory, type SlotRef,
 } from './inventory';
 import {
@@ -51,6 +60,7 @@ import {
   addBurningTree, tickBurningTrees, getBurningTrees,
   BUSH_BURN_S, FIRE_IGNITE_RADIUS, TORCH_IGNITE_RADIUS,
   FIRE_SPREAD_RADIUS, FIRE_SPREAD_CHANCE,
+  BREATH_RANGE, BREATH_HALF_ANGLE,
   type PlacedFire,
 } from './fire';
 import {
@@ -64,11 +74,8 @@ import {
   loadTents, saveTents,
   type PlacedTent,
 } from './shelter';
-import {
-  buildFireMeshes, buildTentMeshes, buildBreathMesh, buildBurningVegMesh,
-  BREATH_RANGE, BREATH_HALF_ANGLE, BREATH_MAX_FLOATS, BURNING_VEG_MAX_FLOATS,
-  PAL_FIRE_FLAME,
-} from './fire-mesh';
+import { buildFireMeshes, buildTentMeshes } from './fire-mesh';
+import { emitWorldFire } from './render/fire-fx';
 import { Hotbar, buildInventoryPanel } from './ui/inventory-ui';
 import { buildCraftingPanel } from './ui/crafting-ui';
 import { PanelManager } from './ui/panel-manager';
@@ -91,7 +98,7 @@ import {
   createVitals, loadVitals, saveVitals,
   stepVitals, damagePlayer, healPlayer, drinkPlayer, drainStamina,
   CLIMB_SLOPE_DEG, CLIMB_DRAIN_PER_S, CLIMB_DRAIN_STAFF_PER_S, SPRINT_DRAIN_PER_S,
-  STAMINA_REGEN_PER_S, MAX_STAMINA,
+  STAMINA_REGEN_PER_S, MAX_STAMINA, MAX_HP,
   type Vitals, type StepEnv,
 } from './vitals';
 import {
@@ -103,7 +110,7 @@ import {
   nestsForCell, nestEggItem, type NestSite,
 } from './entities/nest-scatter';
 import { add, multiply, normalize, perspectiveZO, type Vec3 } from './math';
-import { createHeightField } from './noise';
+import { createHeightField, SEA_LEVEL } from './noise';
 import { createBiomeField } from './biome';
 import { CHUNK_SIZE } from './terrain/chunk-mesh';
 import { ChunkManager } from './terrain/chunk-manager';
@@ -111,9 +118,23 @@ import { FlyCamera } from './fly-camera';
 import { OrbitCamera } from './camera';
 import { PlayerController } from './controller';
 import { DebugCapture } from './debug-capture';
+import { castleGateLocal } from './settlement/settlement-layout';
 import { EntityManager } from './entities/entity-manager';
 import { EntityRenderer, DEAD_SHOW_S } from './entities/entity-renderer';
-import { stepAnimal, onEntityDamaged, FOLLOW_RADIUS } from './entities/animal-ai';
+import {
+  stepAnimal, onEntityDamaged, FOLLOW_RADIUS, DEFEND_GIVEUP_DIST,
+  type DefendTarget,
+  CombatIndex, wantsAirborne,
+} from './entities/animal-ai';
+import {
+  createProjectilePool, spawnProjectile, stepProjectiles, followAnchors,
+  inFlightCount, activeCount,
+  PROJECTILE_CAPACITY, type Projectile,
+} from './projectiles';
+import {
+  buildProjectileMesh, projectileMeshFloats, PROJECTILE_FLOATS_PER_VERT,
+} from './projectile-mesh';
+import { routePlayerDamage, type RiderState } from './attack-routing';
 import { SPECIES_DEFS, DRAGON_FLIGHT_ENABLED, ECELL, type Species } from './entities/entity-types';
 import { rollDrops } from './entities/animal-drops';
 import { box, mulberry32 } from './mesh-utils';
@@ -160,6 +181,8 @@ declare global {
       attackT?: number;
       gathered?: number;
       burningTreeCount?: number;
+      /** Fire billboards queued on the last frame (render/fire-fx.ts). */
+      fireBillboards?: number;
       // Phase J
       entityCount?: number;
       entityDrawn?: number;
@@ -169,10 +192,22 @@ declare global {
       mountAltitude?: number | null;
       // Phase L
       npcCount?: number;
+      /** Arrows/stones currently flying (visible as moving geometry). */
+      projectilesInFlight?: number;
+      /** Arrows currently stuck in the ground or in a body. */
+      projectilesStuck?: number;
+      /** Bow draw pose weight 0..1. */
+      bowAim?: number;
+      /** Hit points of the mount the player is riding, null when on foot. */
+      mountHp?: number | null;
       // Phase M
       bounty?: number;
       jailed?: boolean;
       jailRemainS?: number;
+      /** Ground-clutter instances currently submitted (graphics debugging). */
+      grassInstances?: number;
+      /** Point lights submitted to the world-light set (graphics debugging). */
+      worldLightCount?: number;
     };
     __gameError?: string | null;
     __gameDebug?: {
@@ -191,6 +226,21 @@ declare global {
       nearestResource(): WorldNode | null;
       teleportToNearestResource(type: string): boolean;
       setCamera(yaw: number, pitch: number, distance: number): void;
+      /**
+       * Orbit the given entity instead of the player, hide the player mesh and
+       * hold all animals at idle. Pass null to restore normal play.
+       */
+      setPortraitSubject(entityId: string | null): void;
+      /** Terrain height at a world XZ — lets harnesses find flat ground. */
+      heightAt(x: number, z: number): number;
+      /** Locomotion state — whether the player is grounded, swimming, falling. */
+      playerMotion(): { grounded: boolean; swimming: boolean; velY: number };
+      /** Equip/clear armor slots by item id (null clears) — character capture. */
+      setArmor(slots: { head?: string | null; body?: string | null; legs?: string | null }): void;
+      /** Patch the character customisation (hair style/colour, body, tones). */
+      setCustomization(partial: Partial<CharacterCustomization>): void;
+      /** Force sun shadows on/off, or null to restore automatic. */
+      setShadows(on: boolean | null): void;
       freezeAttackT(t: number | null): void;
       equipItem(id: string): boolean;
       vitals(): Vitals;
@@ -231,6 +281,39 @@ declare global {
       injectProjectile(x: number, y: number, z: number, kind: 'stone' | 'arrow', damage: number): number;
       /** Count of projectiles currently in flight. */
       projectileCount(): number;
+      /** Count of arrows stuck in the ground or in a body. */
+      stuckProjectileCount(): number;
+      /**
+       * Loose an arrow at an exact yaw/pitch (degrees) and draw power, without
+       * needing a mouse or the fire-rate limiter. Harnesses cannot aim a bow
+       * headlessly; this is how an arrow's flight gets photographed.
+       */
+      fireArrow(yawDeg: number, pitchDeg: number, power?: number): boolean;
+      /** Every live projectile: position, direction, and whether it has stuck. */
+      projectiles(): {
+        kind: string; team: string; stuck: boolean;
+        x: number; y: number; z: number;
+        dx: number; dy: number; dz: number;
+        anchorId: string | null;
+      }[];
+      /** Bow draw state — { drawing, t (seconds held), aim (0..1 pose weight) }. */
+      bowDraw(): { drawing: boolean; t: number; aim: number };
+      /** Pin the archer's draw pose for capture; null restores live behaviour. */
+      freezeBowAim(a: number | null): void;
+      /**
+       * Point the player's body at a fixed yaw (radians, 0 = -Z). Capture only:
+       * without it the only way to change the doll's facing is to orbit the
+       * camera, which turns the doll with it and guarantees a back view.
+       */
+      facePlayer(yawRad: number): void;
+      /**
+       * Run the real left-click resolver (gather / bow draw / throw / swing).
+       * The listener is gated on pointer lock, which headless Chrome will not
+       * grant, so without this no automated check can exercise an attack.
+       */
+      leftClick(): void;
+      /** Loose a bow that `leftClick` started drawing. */
+      releaseBow(): void;
       // Phase L
       /** Nearby NPCs within 200 m — id, role, name, x, z, hp. */
       npcs(): { id: string; role: string; name: string; x: number; z: number; hp: number }[];
@@ -358,12 +441,13 @@ function createPlayerCharacter(renderer: Renderer): {
 } {
   const vertexBuffer = renderer.device.createBuffer({
     label: 'character-mesh',
-    size: CHARACTER_MAX_VERTS * 24, // interleaved pos3+color3
+    size: CHARACTER_MAX_VERTS * STRIDE_CREATURE, // pos3+normal3+colour3+materialId
     usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
   });
-  const { bindGroup, buffer } = renderer.createObjectBindGroup(0, 0, 0, 1);
+  const { bindGroup, buffer, shadowBindGroup } =
+    renderer.createObjectBindGroup(0, 0, 0, 1, undefined, MATERIALS.KNIT);
   return {
-    draw: { vertexBuffer, indexBuffer: null, count: 0, bindGroup },
+    draw: { vertexBuffer, indexBuffer: null, count: 0, bindGroup, shadowBindGroup },
     vertexBuffer,
     objectBuffer: buffer,
   };
@@ -421,13 +505,33 @@ async function boot() {
   const settlementManager =
     new SettlementManager(renderer, heightField, WORLD_SEED);
   // Outdoor world = terrain + settlement walls/platforms layered on top.
+  //
+  // Ground CONTACT reads `chunkManager.ground`, the height field with roads
+  // graded into it — not the base one. A road cuts and fills up to 2.5 m, and
+  // against the uncarved field the player floats above or sinks into every
+  // cutting (measured mean error 0.52-1.34 m, worst 3.24 m).
+  //
+  // `SettlementManager` above and the raw `heightField` deliberately keep the
+  // BASE field. Feeding the carved one to settlement placement is circular:
+  // `settlementSiteAt` accepts the first candidate clearing a height and
+  // flatness budget, so 2.5 m of road fill can flip a previously-rejected
+  // candidate and the game then places the settlement somewhere the road was
+  // never built to. Measured at roughly 1 cell in 800 before the split.
   const terrainWorld = settlementGround(
-    terrainGround(heightField), () => settlementManager.nearby());
+    terrainGround(chunkManager.ground), () => settlementManager.nearby());
   const controller = new PlayerController(terrainWorld,
     resumeState !== null ? [resumeState.x, resumeState.y, resumeState.z] : SPAWN_POS);
-  const orbitCam = new OrbitCamera(heightField);
+  // Carved ground too: the camera clamps against terrain, and on the base
+  // field it would clip into the walls of a road cutting.
+  const orbitCam = new OrbitCamera(chunkManager.ground);
   const flyCam = new FlyCamera(add(controller.pos, [0, 20, 30]));
   let flyMode = false;
+
+  // Portrait mode (debug/harness only): orbit a creature instead of the player,
+  // hide the player mesh, and hold every animal at idle. Without it the capture
+  // harness photographs the back of the player's head, and spawning a dragon
+  // for its portrait mauls the photographer before the shutter fires.
+  let portraitEntityId: string | null = null;
 
   // Character customization: persisted palette choices, panel on C.
   let custom = loadCustomization();
@@ -537,6 +641,21 @@ async function boot() {
   }
 
   let crimeState: CrimeState = loadCrimeState();
+  /**
+   * Spatial index of who is fighting whom, rebuilt once per tick.
+   *
+   * Shared by every entity's target selection so mob-to-mob combat is one
+   * pass rather than an O(n^2) scan per creature per tick. The PLAYER is
+   * deliberately absent from it — that is one of the two things stopping a
+   * tamed mount from ever turning on its rider (the other is `isOwned`
+   * short-circuiting the aggro path), and both are tested.
+   */
+  const combatIndex = new CombatIndex();
+
+  /** Shared, per-settlement memory of what the player did in front of whom. */
+  const villageMemory = loadVillageMemory();
+  /** Shared knowledge a settlement holds in common — lore, and its concerns. */
+  const villageFacts = loadVillageFacts();
   let jailRecord: JailRecord | null = loadJailState();
 
   /** Stable region id from nearest settlement (name-based). */
@@ -628,6 +747,19 @@ async function boot() {
   const GUARD_MELEE_DMG      = 2;    // hp per hit
   const GUARD_MELEE_PERIOD   = 1.2;  // seconds between hits
   const GUARD_MELEE_DIST     = 2.5;  // m
+
+  // --- guard archery -------------------------------------------------------
+  // The world had no ranged attacker at all, which made "melee cannot reach a
+  // mounted rider" a strictly-better deal with no downside: climb onto
+  // anything and nothing in the world could touch you. A hostile guard who
+  // cannot close now looses arrows instead, and an arrow reaches the saddle
+  // (attack-routing.ts). That is what turns flight into a trade-off — you are
+  // out of reach of teeth, and squarely in the open for anything with a bow.
+  const GUARD_BOW_RANGE      = 34;   // m — max shooting distance
+  const GUARD_BOW_MIN_RANGE  = 4;    // m — inside this a guard just swings
+  const GUARD_BOW_PERIOD     = 2.4;  // seconds between shots per guard
+  const GUARD_ARROW_DMG      = 3;    // hp per arrow
+  const GUARD_ARROW_SPEED    = 30;   // m/s
 
   /** Whether any guard is currently hostile (after player resisted arrest). */
   let guardsHostile = false;
@@ -840,6 +972,52 @@ async function boot() {
     setGatherNotice(`Jailed for ${sentenceS.toFixed(0)} seconds. (A rusty key was left by a previous prisoner.)`);
   }
 
+  /**
+   * Loose an arrow from a hostile guard at the player.
+   *
+   * Aimed with a ballistic lead rather than a straight line: at 30 m the drop
+   * over the flight is about 1.5 m, so a flat shot passes under a standing
+   * player and a long way under a mounted one. Solving for the launch pitch
+   * that lands on the target is what makes a guard on the ground a credible
+   * threat to a rider in the air instead of a source of arrows in the dirt.
+   */
+  function fireGuardArrow(rt: NpcRuntime): void {
+    const tx = controller.pos[0];
+    const ty = controller.pos[1] + 1.0; // chest
+    const tz = controller.pos[2];
+    const sx = rt.wx;
+    const sy = rt.wy + 1.3; // shoulder height
+    const sz = rt.wz;
+    const dx = tx - sx, dy = ty - sy, dz = tz - sz;
+    const horiz = Math.hypot(dx, dz);
+    if (horiz < 0.01) return;
+    const v = GUARD_ARROW_SPEED;
+    // Ballistic solution for the low-arc launch angle. Falls back to a direct
+    // line when the target is out of the projectile's reach entirely.
+    const g = 9.8;
+    const disc = v * v * v * v - g * (g * horiz * horiz + 2 * dy * v * v);
+    let pitch: number;
+    if (disc >= 0) {
+      pitch = Math.atan((v * v - Math.sqrt(disc)) / (g * horiz));
+    } else {
+      pitch = Math.atan2(dy, horiz);
+    }
+    const yaw = Math.atan2(dx / horiz, -(dz / horiz));
+    const cp = Math.cos(pitch);
+    rt.yaw = yaw;
+    spawnProjectile(projectilePool, {
+      kind: 'arrow',
+      team: 'enemy',
+      x: sx, y: sy, z: sz,
+      vx: Math.sin(yaw) * cp * v,
+      vy: Math.sin(pitch) * v,
+      vz: -Math.cos(yaw) * cp * v,
+      damage: GUARD_ARROW_DMG,
+      nowS: simTime,
+    });
+    audio.play('swing', { dist: Math.hypot(dx, dz) });
+  }
+
   /** Tick guard enforcement AI (called once per sim step). */
   function tickGuardEnforcement(dtS: number): void {
     if (jailRecord !== null) return; // Already jailed — skip enforcement
@@ -874,9 +1052,20 @@ async function boot() {
           if (dist <= GUARD_MELEE_DIST && guardMeleeAccum >= GUARD_MELEE_PERIOD &&
               vitals.alive && !panels.isOpen) {
             guardMeleeAccum = 0;
-            damagePlayer(vitals, GUARD_MELEE_DMG, 'guard', totalDefense(inventory));
-            triggerDamageFlash();
-            saveVitals(vitals);
+            // Routed: a guard's sword cannot reach a rider in the saddle —
+            // it lands on the mount instead (attack-routing.ts).
+            applyAttackOnPlayer(GUARD_MELEE_DMG, 'guard', 'melee', 1.7,
+              heightField.heightAt(rt.wx, rt.wz));
+          }
+          // Bow: the answer to a target the guard cannot reach — up a cliff,
+          // sprinting away, or thirty metres up on a dragon.
+          if (dist > GUARD_BOW_MIN_RANGE && dist <= GUARD_BOW_RANGE
+              && vitals.alive && !panels.isOpen) {
+            rt.bowCooldown = (rt.bowCooldown ?? Math.random() * GUARD_BOW_PERIOD) - dtS;
+            if (rt.bowCooldown <= 0) {
+              rt.bowCooldown = GUARD_BOW_PERIOD;
+              fireGuardArrow(rt);
+            }
           }
         }
       } else if (bounty > 0) {
@@ -965,13 +1154,17 @@ async function boot() {
     return fireZeroLightsBindGroup;
   }
 
-  /** Rebuild GPU draw batches for all fires (called after any placement/fuel change). */
-  function rebuildFireDraws(nowS = 0): void {
+  /**
+   * Rebuild GPU draw batches for all fires (called after any placement).
+   * Hearth furniture only — stone ring, logs, forge chimney. Flames are
+   * per-frame billboards from render/fire-fx.ts and never come through here,
+   * so this no longer has to run when a fire merely lights or burns out.
+   */
+  function rebuildFireDraws(_nowS = 0): void {
     for (const b of fireGpuBuffers) b.destroy();
     fireGpuBuffers = [];
     fireDraws = [];
-    const litSet = new Set<string>(fires.filter(f => isLit(f, nowS)).map(f => f.id));
-    const batches = buildFireMeshes(fires, litSet);
+    const batches = buildFireMeshes(fires);
     const lg = getFireLightsBindGroup();
     for (const { palette, verts } of batches) {
       if (verts.length === 0) continue;
@@ -981,64 +1174,51 @@ async function boot() {
         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
       });
       renderer.device.queue.writeBuffer(vb, 0, verts);
-      const { bindGroup } = renderer.createObjectBindGroup(0, 0, 0, 100 + palette);
+      const { bindGroup, shadowBindGroup } = renderer.createObjectBindGroup(0, 0, 0, 100 + palette);
       fireDraws.push({
-        draw: { vertexBuffer: vb, indexBuffer: null, count: verts.length / 3, bindGroup },
+        draw: { vertexBuffer: vb, indexBuffer: null, count: verts.length / (STRIDE_PROP / 4), bindGroup, shadowBindGroup },
         lightsBindGroup: lg,
       });
       fireGpuBuffers.push(vb);
     }
   }
 
-  // --- Dragon fire-breath VFX: one fixed-size buffer rewritten per frame ----
-  let breathVb: GPUBuffer | null = null;
-  let breathBindGroup: GPUBindGroup | null = null;
-  /** Vertex count to draw this frame (0 = breath not visible). */
-  let breathVertCount = 0;
-
   /**
-   * Rebuild the breath-cone mesh for this frame (jittered emissive boxes,
-   * torch-glow palette). Cheap: one writeBuffer into a pre-sized buffer.
+   * Queue every flame in the world into the renderer's billboard system and
+   * return the point lights they cast (nearest first). One call replaces the
+   * old `updateBreathVfx` / `updateBurningVegVfx` per-frame vertex-buffer
+   * rewrites and the hand-rolled campfire light list — see render/fire-fx.ts.
    */
-  function updateBreathVfx(): void {
-    breathVertCount = 0;
-    if (!breathActive || breathJaw < 0.3) return;
-    const ray = getBreathRay();
-    if (ray === null) return;
-    if (breathVb === null) {
-      breathVb = renderer.device.createBuffer({
-        label: 'dragon-breath',
-        size: BREATH_MAX_FLOATS * 4,
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-      });
-      breathBindGroup = renderer.createObjectBindGroup(0, 0, 0, 100 + PAL_FIRE_FLAME).bindGroup;
-    }
-    const verts = buildBreathMesh(ray.mouth, ray.dir, simTime);
-    renderer.device.queue.writeBuffer(breathVb, 0, verts);
-    breathVertCount = verts.length / 3;
-  }
-
-  // --- Burning-vegetation flames: one fixed-size buffer rewritten per frame -
-  let burnVegVb: GPUBuffer | null = null;
-  let burnVegBindGroup: GPUBindGroup | null = null;
-  let burnVegVertCount = 0;
-
-  /** Rebuild flame boxes over every burning tree/bush (cheap writeBuffer). */
-  function updateBurningVegVfx(): void {
-    burnVegVertCount = 0;
-    const burning = getBurningTrees();
-    if (burning.length === 0) return;
-    if (burnVegVb === null) {
-      burnVegVb = renderer.device.createBuffer({
-        label: 'burning-veg',
-        size: BURNING_VEG_MAX_FLOATS * 4,
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-      });
-      burnVegBindGroup = renderer.createObjectBindGroup(0, 0, 0, 100 + PAL_FIRE_FLAME).bindGroup;
-    }
-    const verts = buildBurningVegMesh(burning, simTime);
-    renderer.device.queue.writeBuffer(burnVegVb, 0, verts);
-    burnVegVertCount = verts.length / 3;
+  let lastFireBillboards = 0;
+  function emitFireVfx(eye: Vec3, indoors: boolean): ReturnType<typeof emitWorldFire> {
+    renderer.fire.begin(simTime, eye);
+    const ray = breathActive && breathJaw >= 0.25 ? getBreathRay() : null;
+    // Which flier is breathing decides how the jet looks, not just how far it
+    // reaches — see BREATH_SPEC.
+    const mountedNow = mountedEntityId === null
+      ? undefined : entityManager.entities.get(mountedEntityId);
+    const breathVfxSpec = mountedNow === undefined
+      ? undefined : BREATH_SPEC[mountedNow.species];
+    const lights = emitWorldFire(renderer.fire, {
+      fires: indoors ? [] : fires,
+      burning: indoors ? [] : getBurningTrees(),
+      breath: ray !== null ? {
+        mouth: ray.mouth, dir: ray.dir, jaw: breathJaw,
+        reach: breathVfxSpec?.reach ?? 1, spark: breathVfxSpec?.spark ?? false,
+      } : null,
+      // Wild fliers attacking, collected during this frame's AI pass.
+      extraBreaths: indoors ? [] : wildBreaths,
+      interiorLights: indoors
+        ? (dungeonManager.isInside
+          ? dungeonManager.activeLights()
+          : buildingManager.activeLights())
+        : null,
+      settlementFlames: indoors ? [] : settlementManager.flamePoints(),
+      nowS: simTime,
+      eye,
+    });
+    lastFireBillboards = renderer.fire.count;
+    return lights;
   }
 
   /** Rebuild GPU draw batches for all tents (called after any placement). */
@@ -1056,9 +1236,9 @@ async function boot() {
         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
       });
       renderer.device.queue.writeBuffer(vb, 0, verts);
-      const { bindGroup } = renderer.createObjectBindGroup(0, 0, 0, 100 + palette);
+      const { bindGroup, shadowBindGroup } = renderer.createObjectBindGroup(0, 0, 0, 100 + palette);
       tentDraws.push({
-        draw: { vertexBuffer: vb, indexBuffer: null, count: verts.length / 3, bindGroup },
+        draw: { vertexBuffer: vb, indexBuffer: null, count: verts.length / (STRIDE_PROP / 4), bindGroup, shadowBindGroup },
         lightsBindGroup: lg,
       });
       tentGpuBuffers.push(vb);
@@ -1542,11 +1722,12 @@ async function boot() {
   // Shares the game's GPU device; failures degrade to fixtures, never __gameError.
   const directorOff = new URLSearchParams(location.search).get('director') === 'off';
 
-  // NPC dialogue model: defaults to the abliterated Qwen3-1.7B Q4_K_M —
-  // conversations can go anywhere without safety boilerplate, and the small
-  // model keeps replies snappy. ?npcllm=abliterated picks the smarter/slower
-  // 4B; ?npcllm=default reuses the Director model. See NPC_MODELS in
-  // npc-chat-panel.ts.
+  // NPC dialogue model: defaults to STOCK Qwen3-1.7B Q4_K_M (Apache-2.0), the
+  // same model the Dungeon Director runs — one download, one set of resident
+  // weights. ?npcllm=large picks the slower stock 4B (measured TTFT ~45s vs a
+  // 20s watchdog — expect canned replies); ?npcllm=abliterated is for
+  // comparison only and must not become the default. See NPC_MODELS in
+  // npc-chat-panel.ts and docs/AI_GUARDRAILS.md.
   const npcLlmParam = new URLSearchParams(location.search).get('npcllm');
   const npcModelKey: import('./ui/npc-chat-panel').NpcModelKey =
     npcLlmParam !== null && isNpcModelKey(npcLlmParam) ? npcLlmParam : 'fast';
@@ -1557,7 +1738,8 @@ async function boot() {
     ? new DungeonDirector({
         seed: WORLD_SEED,
         gpu,
-        heightAt: (x, z) => heightField.heightAt(x, z),
+        // Carved ground: creatures walking a road should be ON it.
+        heightAt: (x, z) => chunkManager.ground.heightAt(x, z),
       })
     : null;
 
@@ -1613,6 +1795,31 @@ async function boot() {
     vitalsHud.update(vitals);
   };
 
+  // Bed rental (tavern guest rooms). BuildingManager owns the interaction and
+  // the "rented until you sleep" state; these three seams give it the economy
+  // and the clock. All three are optional — unwired, renting is free and
+  // sleeping falls back to `onRest`, so it can never be a dead end.
+  buildingManager.getGold = () => countItem(inventory, 'gold_small');
+  buildingManager.spendGold = (amount: number) => {
+    if (countItem(inventory, 'gold_small') < amount) return false;
+    removeItem(inventory, 'gold_small', amount);
+    invChanged();
+    return true;
+  };
+  buildingManager.onSleep = () => {
+    // Advance to ~07:00 and charge the night's thirst, so a full heal is not
+    // also a free skipped night.
+    const tod = (simTime / DAY_LENGTH_S + TOD_START) % 1;
+    const frac = (0.29 - tod + 1) % 1;
+    simTime += frac * DAY_LENGTH_S;
+    vitals.thirst = Math.max(0, vitals.thirst - frac * 24 * 2.5);
+    healPlayer(vitals, 999);
+    vitals.stamina = 100;
+    saveVitals(vitals);
+    vitalsHud.update(vitals);
+    audio.play('chest_open');
+  };
+
   // -------------------------------------------------------------------------
   // Phase J: entity manager + renderer
   // -------------------------------------------------------------------------
@@ -1623,6 +1830,10 @@ async function boot() {
   );
   entityManager.ecologyDirector = directorOff ? null : ecologyDirector;
   const entityRenderer = new EntityRenderer(renderer);
+  // Lets winged creatures detect flight from height above ground rather than
+  // from vertical velocity, so a dragon holding level altitude keeps beating
+  // its wings instead of folding them because it happens not to be climbing.
+  entityRenderer.terrainHeightAt = (x, z) => chunkManager.ground.heightAt(x, z);
   let entityDrawnCount = 0;
 
   // -------------------------------------------------------------------------
@@ -1698,6 +1909,11 @@ async function boot() {
     attitude: 'calm' | 'hostile' | 'afraid' | 'approach';
     /** Phase N2: seconds until this NPC may melee again. */
     attackCooldown: number;
+    /**
+     * Seconds until this NPC may loose another arrow. Undefined until the
+     * first shot so guards stagger themselves instead of volleying in unison.
+     */
+    bowCooldown?: number;
     /** Phase N8: convinced to walk with the player (companion follow). */
     following?: boolean;
     /** simTime (s) when this NPC died — drives the corpse-sink visual. */
@@ -1713,8 +1929,47 @@ async function boot() {
     vertexBuffer: GPUBuffer;
     objectBuffer: GPUBuffer;
     bindGroup: GPUBindGroup;
+    shadowBindGroup: GPUBindGroup;
   }
   const npcPool: NpcPoolEntry[] = [];
+  /** Debug: force shadows on/off (null = follow weather). */
+  let shadowOverride: boolean | null = null;
+  /**
+   * Scratch mesh buffers. buildCharacterMesh used to allocate a fresh array
+   * per call — about 2 MB per character per frame, which at a settlement full
+   * of NPCs was over 100 MB/s of pure GC garbage. NPCs build and upload one at
+   * a time, so they can share one buffer.
+   */
+  /**
+   * Clamp a character mesh to the GPU buffer it is about to be written into.
+   *
+   * These buffers are sized CHARACTER_MAX_VERTS and rewritten every frame. When
+   * a mesh grew past that cap the writeBuffer overran its allocation and the
+   * ENTIRE FRAME rendered black — a total, silent failure from a 6% budget
+   * overshoot in one rare costume combination. test-character-mesh.mts now
+   * sweeps the whole option space to stop that reaching here, but a dropped
+   * limb is a far better failure than a black screen, so clamp anyway.
+   */
+  const FLOATS_PER_VERT = STRIDE_CREATURE / 4;
+  let overflowWarned = false;
+  function fitCharacterMesh(
+    verts: Float32Array<ArrayBuffer>,
+  ): Float32Array<ArrayBuffer> {
+    const cap = CHARACTER_MAX_VERTS * FLOATS_PER_VERT;
+    if (verts.length <= cap) return verts;
+    if (!overflowWarned) {
+      overflowWarned = true;
+      console.error(`[character] mesh of ${verts.length / FLOATS_PER_VERT} verts ` +
+        `exceeds CHARACTER_MAX_VERTS=${CHARACTER_MAX_VERTS}; truncating`);
+    }
+    // Whole triangles only — a partial triangle would render as garbage.
+    return verts.subarray(0, Math.floor(cap / (3 * FLOATS_PER_VERT)) * 3 * FLOATS_PER_VERT);
+  }
+
+  const npcMeshScratch =
+    new Float32Array(CHARACTER_MAX_VERTS * (STRIDE_CREATURE / 4));
+  const playerMeshScratch =
+    new Float32Array(CHARACTER_MAX_VERTS * (STRIDE_CREATURE / 4));
 
   const NPC_WALK_SPEED = 1.2;  // m/s
   const NPC_RENDER_DIST = 120; // m
@@ -1726,12 +1981,12 @@ async function boot() {
     while (npcPool.length <= i) {
       const vertexBuffer = renderer.device.createBuffer({
         label: `npc-mesh-${npcPool.length}`,
-        size: CHARACTER_MAX_VERTS * 24,
+        size: CHARACTER_MAX_VERTS * STRIDE_CREATURE,
         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
       });
-      const { bindGroup, buffer: objectBuffer } =
-        renderer.createObjectBindGroup(0, 0, 0, 1);
-      npcPool.push({ vertexBuffer, objectBuffer, bindGroup });
+      const { bindGroup, buffer: objectBuffer, shadowBindGroup } =
+        renderer.createObjectBindGroup(0, 0, 0, 1, undefined, MATERIALS.KNIT);
+      npcPool.push({ vertexBuffer, objectBuffer, bindGroup, shadowBindGroup });
     }
     return npcPool[i];
   }
@@ -1988,9 +2243,8 @@ async function boot() {
           if (dist <= CIVILIAN_MELEE_DIST && rt.attackCooldown <= 0 && vitals.alive &&
               !panels.isOpen) {
             rt.attackCooldown = CIVILIAN_MELEE_PERIOD;
-            damagePlayer(vitals, CIVILIAN_MELEE_DMG, 'combat', totalDefense(inventory));
-            triggerDamageFlash();
-            saveVitals(vitals);
+            applyAttackOnPlayer(CIVILIAN_MELEE_DMG, 'combat', 'melee', 1.7,
+              heightField.heightAt(rt.wx, rt.wz));
           }
           continue;
         }
@@ -2136,7 +2390,7 @@ async function boot() {
         walkPhase: rt.walkPhase,
         walkAmp: rt.hp <= 0 ? 0 : rt.walkAmp,
         attackT: 1,
-      }, null, opts);
+      }, null, opts, npcMeshScratch);
       // Corpse-sink: dead NPCs slide below ground over NPC_CORPSE_SINK_S.
       let drawY = rt.wy;
       if (rt.hp <= 0 && rt.deadAtS !== undefined) {
@@ -2144,7 +2398,8 @@ async function boot() {
         drawY = rt.wy - p * 1.9;
       }
       const entry = getNpcPoolEntry(i);
-      renderer.device.queue.writeBuffer(entry.vertexBuffer, 0, verts);
+      const npcVerts = fitCharacterMesh(verts);
+      renderer.device.queue.writeBuffer(entry.vertexBuffer, 0, npcVerts);
       renderer.device.queue.writeBuffer(
         entry.objectBuffer, 0,
         new Float32Array([rt.wx, drawY, rt.wz, 1]),
@@ -2152,8 +2407,9 @@ async function boot() {
       draws.push({
         vertexBuffer: entry.vertexBuffer,
         indexBuffer: null,
-        count: verts.length / 6,
+        count: npcVerts.length / (STRIDE_CREATURE / 4),
         bindGroup: entry.bindGroup,
+        shadowBindGroup: entry.shadowBindGroup,
       });
     }
     return draws;
@@ -2309,6 +2565,16 @@ async function boot() {
       mount: mountName,
     }));
 
+    // Let the village talk before this conversation starts. One pass per
+    // opened conversation is a rate that feels like time passing: what you did
+    // in front of one farmer has usually reached their spouse by the time you
+    // reach the next house, but not the whole settlement at once.
+    spreadVillageNews(villageMemory, settName,
+      buildNpcRelations(npcRuntimes.map((r) => ({
+        id: r.npc.id, name: r.npc.name, role: r.npc.role,
+      }))), 1);
+    saveVillageMemory(villageMemory);
+
     const persona: import('./npc/npc-prompt').NpcPersona = {
       role: npcRt.npc.role,
       name: npcRt.npc.name,
@@ -2318,6 +2584,25 @@ async function boot() {
       worldFacts,
       following: npcRt.following === true,
       quirk: npcQuirkFor(npcRt.npc.id),
+      // What this NPC saw or has been told. `newsFor` puts firsthand first.
+      villageNews: newsFor(villageMemory, settName, npcRt.npc.id)
+        .map((n) => n.text),
+      // Shared knowledge, generated once per settlement and then persistent —
+      // so two NPCs cannot describe the same concern differently, and "ask
+      // Nils" points at the NPC who actually owns it.
+      villageFacts: factLinesFor(
+        factsFor(villageFacts, settName, WORLD_SEED,
+          npcRuntimes.map((r) => ({
+            id: r.npc.id, name: r.npc.name, role: r.npc.role,
+          })),
+          [...new Set([...entityManager.entities.values()]
+            .filter((e) => Math.hypot(e.x - npcRt.wx, e.z - npcRt.wz) < 220)
+            .map((e) => e.species))]),
+        npcRt.npc.id),
+      // Witnessing a killing should sour someone regardless of how politely
+      // the player has traded with them before, so this is added to the stored
+      // dyadic disposition rather than replacing it.
+      disposition: dispositionFromNews(villageMemory, settName, npcRt.npc.id),
     };
     panels.toggle('npc-chat', () => buildNpcChatPanel({
       persona,
@@ -2388,13 +2673,17 @@ async function boot() {
   // -------------------------------------------------------------------------
   let tamingRegistry: TamingRegistry = loadTamingRegistry();
 
-  // DEMO: starter tamed dragon at spawn (user request for testing).
+  // DEMO: starter tamed WYVERN at spawn (user request for testing).
   // Live entities are not persisted across reloads, so each boot re-ensures
-  // one owned, fully-tamed dragon beside the spawn point. Owned entities
+  // one owned, fully-tamed flier beside the spawn point. Owned entities
   // follow the player, never aggro, and are exempt from cap/unload.
+  //
+  // Was a dragon. The wyvern is the better starter mount: it is the common
+  // flier rather than the apex encounter, so handing the player one at spawn
+  // does not give away the top of the ladder before they have climbed it.
   {
     const sd = entityManager.spawnEntity(
-      'dragon', SPAWN_POS[0] + 6, SPAWN_POS[2] + 6);
+      'wyvern', SPAWN_POS[0] + 6, SPAWN_POS[2] + 6);
     if (sd !== null) {
       sd.owned = true;
       sd.mode = 'follow';
@@ -2451,6 +2740,197 @@ async function boot() {
    */
   let dragonFlightY = 0;
 
+  /**
+   * True while riding a creature that can fly.
+   *
+   * The flight controls (Space ascend, Q/C/Ctrl descend) overlap keys that do
+   * other things on foot, so several handlers need to stand down while a rider
+   * is in the air. Kept as one predicate rather than repeating the lookup, so
+   * a new flier cannot be added and quietly miss one of them.
+   */
+  function mountedOnFlier(): boolean {
+    if (mountedEntityId === null) return false;
+    const m = entityManager.entities.get(mountedEntityId);
+    return m !== undefined && SPECIES_DEFS[m.species].canFly === true;
+  }
+
+  // -------------------------------------------------------------------------
+  // Wild flier flight + breath
+  //
+  // Dragons, wyverns and griffins used to walk everywhere. Flight existed only
+  // inside the mounted controller, so an untamed one was a very large lizard
+  // that happened to have wings, and the wing-beat animation played over a
+  // walking gait. Their breath had the same shape of problem: the pose opens
+  // the jaw, but only the ridden path ever emitted fire or dealt damage.
+  // -------------------------------------------------------------------------
+
+  /** Cruise height above terrain while patrolling, in metres. */
+  const FLY_CRUISE_MIN = 11;
+  const FLY_CRUISE_MAX = 26;
+  /** How high above the player a hunting flier holds before it strikes. */
+  const FLY_STRIKE_ABOVE = 6;
+  /** Vertical speed for wild fliers (slower than the ridden 6 m/s — a wild
+   *  animal is not being urged). */
+  const WILD_CLIMB_SPEED = 3.2;
+  /** Seconds between a wild flier's breath attacks. */
+  const WILD_BREATH_COOLDOWN_S = 4.5;
+  /** How long one wild breath lasts. */
+  const WILD_BREATH_S = 1.1;
+
+  /** Per-entity flight/breath state, keyed by entity id. */
+  interface FlierState {
+    cruise: number; breathUntil: number; nextBreath: number;
+    /**
+     * Height above terrain, owned by this controller.
+     *
+     * Has to be state, not a delta applied to `e.y`. `moveToward` ends every
+     * AI tick with `e.y = heightAt(x, z)`, so an incremental "+= climb * dt"
+     * is wiped each tick and the creature hovers at exactly one frame's worth
+     * of climb — measured at 0.1 m, which is what the first version did.
+     */
+    alt: number;
+  }
+  const flierState = new Map<string, FlierState>();
+
+  /** Wild fliers currently breathing, rebuilt each frame for the VFX pass. */
+  let wildBreaths: {
+    mouth: [number, number, number]; dir: [number, number, number];
+    jaw: number; reach: number; spark: boolean;
+  }[] = [];
+
+  /**
+   * Give an un-ridden flier its altitude, and let it use its breath.
+   *
+   * Runs AFTER `stepAnimal`, which pins `e.y` to the terrain — see the call
+   * site.
+   *
+   * TAMED fliers stay on the ground. The first version let them cruise too, on
+   * the theory that a tamed wyvern jogging along behind the player looks
+   * absurd — which is true, and completely beside the point. An owned flier
+   * that drifts up to twenty metres is one the player cannot walk up to and
+   * mount, so the animal they own spends its life out of reach. A companion
+   * that is where you left it beats a companion that looks majestic.
+   *
+   * They still rise when the player does, so a tamed flier follows you up
+   * while you are riding another one rather than being left on the ground.
+   */
+  /** True for tamed/owned animals (hatched babies, tamed mounts). */
+  function isOwnedEntity(
+    e: import('./entities/entity-manager').EntityState,
+  ): boolean {
+    return (e as import('./entities/entity-manager').EntityState
+      & { owned?: boolean }).owned === true;
+  }
+
+  function tickWildFlier(
+    e: import('./entities/entity-manager').EntityState,
+    dtS: number, playerDist: number,
+  ): void {
+    const def = SPECIES_DEFS[e.species as Species];
+    if (def.canFly !== true) return;
+    if (e.id === mountedEntityId) return;   // the ridden controller owns it
+    if (e.mode === 'dead') { flierState.delete(e.id); return; }
+    // Out of sight is out of mind: no point flying something nobody can see,
+    // and it keeps this off the per-frame budget for a whole map of creatures.
+    if (playerDist > 160) return;
+
+    let st = flierState.get(e.id);
+    if (st === undefined) {
+      // Deterministic cruise height per individual, so a flight of wyverns
+      // stacks at different altitudes instead of forming a flat sheet.
+      let h = 0x811c9dc5;
+      for (let i = 0; i < e.id.length; i++) {
+        h ^= e.id.charCodeAt(i); h = Math.imul(h, 0x01000193);
+      }
+      const u = ((h >>> 0) % 1000) / 1000;
+      st = {
+        cruise: FLY_CRUISE_MIN + u * (FLY_CRUISE_MAX - FLY_CRUISE_MIN),
+        breathUntil: -1, nextBreath: simTime + u * WILD_BREATH_COOLDOWN_S,
+        alt: Math.max(0, e.y - heightField.heightAt(e.x, e.z)),
+      };
+      flierState.set(e.id, st);
+    }
+
+    const groundY = heightField.heightAt(e.x, e.z);
+    // Everything below works in HEIGHT ABOVE TERRAIN and writes `e.y` at the
+    // end, so following ground that rises under the creature is free.
+    let targetAlt: number;
+    if (e.mode === 'aggro') {
+      // Hunting: hold above the player and stoop. Measured against the
+      // player's own height, not the terrain, so it stays overhead when they
+      // are on a cliff or a roof.
+      targetAlt = (controller.pos[1] - groundY) + FLY_STRIKE_ABOVE;
+      // Close enough to bite: come all the way down, or it hovers out of reach
+      // and the fight never resolves.
+      if (playerDist < 7) targetAlt = Math.max(0, controller.pos[1] - groundY);
+    } else if (isOwnedEntity(e)) {
+      // Reachable, always. The only time an owned flier leaves the ground is
+      // to keep up with a player who is already airborne on something else.
+      const playerAlt = controller.pos[1] - heightField.heightAt(
+        controller.pos[0], controller.pos[2]);
+      targetAlt = playerAlt > 6 ? Math.max(0, playerAlt - 1.5) : 0;
+    } else if (e.mode === 'graze' || (e.sit ?? 0) > 0.3) {
+      targetAlt = 0;       // feeding or resting animals are on the ground
+    } else if (wantsAirborne(e)) {
+      // The AI has committed this flier to crossing open ground — hunting
+      // something at a distance, or leaving. It set the flag; this owns the
+      // altitude. Neither side has to know how the other works, and
+      // `wantsAirborne` is never true for an owned animal, which is what keeps
+      // a tamed mount reachable.
+      targetAlt = st.cruise;
+    } else {
+      targetAlt = st.cruise;
+    }
+
+    const dAlt = targetAlt - st.alt;
+    const step = WILD_CLIMB_SPEED * dtS;
+    st.alt += Math.abs(dAlt) <= step ? dAlt : Math.sign(dAlt) * step;
+    if (st.alt < 0) st.alt = 0;
+    e.y = groundY + st.alt;
+
+    // --- breath ----------------------------------------------------------
+    const spec = BREATH_SPEC[e.species as Species];
+    if (spec === undefined || e.mode !== 'aggro' || !vitals.alive) return;
+    const range = BREATH_RANGE * spec.reach;
+    if (simTime >= st.nextBreath && playerDist < range * 0.8 && playerDist > 3) {
+      st.breathUntil = simTime + WILD_BREATH_S;
+      st.nextBreath = simTime + WILD_BREATH_COOLDOWN_S + WILD_BREATH_S;
+      audio.play('dragon_roar', { dist: playerDist });
+    }
+    if (simTime < st.breathUntil) {
+      const s = def.size;
+      const fx = Math.sin(e.yaw), fz = -Math.cos(e.yaw);
+      const mouth: [number, number, number] = [
+        e.x + fx * s * spec.mouth[0],
+        e.y + s * spec.mouth[1],
+        e.z + fz * s * spec.mouth[0],
+      ];
+      // Aim at the player's chest rather than straight ahead, so a flier
+      // overhead actually hits instead of breathing over their head.
+      const tx = controller.pos[0] - mouth[0];
+      const ty = (controller.pos[1] + PLAYER_HEIGHT * 0.5) - mouth[1];
+      const tz = controller.pos[2] - mouth[2];
+      const tl = Math.hypot(tx, ty, tz) || 1;
+      const dir: [number, number, number] = [tx / tl, ty / tl, tz / tl];
+      wildBreaths.push({
+        mouth, dir, jaw: 1, reach: spec.reach, spark: spec.spark,
+      });
+      entityRenderer.jawOverride = { id: e.id, jawOpen: 1 };
+      // Damage on the same cadence the mounted breath uses.
+      breathTickAccum += dtS;
+      if (breathTickAccum >= BREATH_TICK_S) {
+        breathTickAccum = 0;
+        if (inBreathCone(mouth, dir,
+          controller.pos[0], controller.pos[1] + PLAYER_HEIGHT * 0.5,
+          controller.pos[2], spec.reach)) {
+          applyAttackOnPlayer(
+            Math.max(1, Math.round(BREATH_DMG_NPC * spec.dmg)),
+            'animal', 'ranged', def.size, e.y);
+        }
+      }
+    }
+  }
+
   /** Vertical ascent/descent speed (m/s) for dragon flight. */
   const DRAGON_FLIGHT_SPEED = 6;
   /** Minimum epsilon above terrain when on the ground (m). */
@@ -2471,6 +2951,70 @@ async function boot() {
   /** Damage applied per breath tick to animals / NPCs in the cone. */
   const BREATH_DMG_ENTITY = 3;
   const BREATH_DMG_NPC = 4;
+
+  /**
+   * Per-species mounted breath weapon.
+   *
+   * A wyvern is the common flier, not the apex one, and its breath should say
+   * so before the damage numbers do: a short spray of sparks and embers rather
+   * than the dragon's sustained jet. `reach` and `dmg` scale the shared cone,
+   * and `spark` switches the VFX to hot fragments that scatter and die instead
+   * of a coherent flame. Only the dragon sets vegetation alight.
+   */
+  const BREATH_SPEC: Partial<Record<Species, {
+    reach: number; dmg: number; spark: boolean;
+    /**
+     * What the breath can set alight.
+     *   'all'    — trees and brush; a dragon starts forest fires.
+     *   'tinder' — brush only. Sparks landing in dry scrub catch; a standing
+     *              tree does not go up from a shower of embers.
+     *   'none'   — damage only.
+     */
+    ignites: 'all' | 'tinder' | 'none';
+    /**
+     * Where the breath leaves the head, as multiples of the species' `size`:
+     * `[forward, up]` from the entity origin.
+     *
+     * Per species, because these are read off the actual mesh. They were
+     * hardcoded to the dragon's 1.27/1.61, which on a wyvern put the origin a
+     * full metre above its skull — the sparks appeared to burst around the
+     * RIDER's head rather than come out of the animal's mouth. The wyvern's
+     * snout tip is at 1.16 forward / 1.18 up (wyvern-mesh.ts: `snoutTip`,
+     * `crY = headY + 0.008s`, `headY = 1.22s`).
+     */
+    mouth: [number, number];
+  }>> = {
+    dragon: { reach: 1.00, dmg: 1.00, spark: false, ignites: 'all',
+              mouth: [1.27, 1.61] },
+    wyvern: { reach: 0.42, dmg: 0.55, spark: true,  ignites: 'tinder',
+              mouth: [1.16, 1.18] },
+  };
+
+  /** Bite: both fliers have jaws, and a bite is the close-range answer when
+   *  the breath is on cooldown or the target is already on top of you. */
+  const BITE_DMG = 6;
+  const BITE_RANGE = 4.0;
+  const BITE_COOLDOWN_S = 0.9;
+  const BITE_STAMINA = 4;
+  let biteCooldown = 0;
+
+  /**
+   * The ridden mount fights back on its own.
+   *
+   * `animal-ai.ts` has a `defend` mode for owned animals, but it deliberately
+   * excludes the mount the player is RIDING — a defender breaks off and
+   * charges its target, and a mount doing that under you would fight the
+   * reins. The line skipping it is in the AI loop.
+   *
+   * So a ridden mount retaliates instead of intercepting: it never moves, and
+   * it never picks a fight. It only answers something that is already coming
+   * for its rider and already close enough to reach. The player keeps the
+   * steering; the animal keeps its teeth.
+   */
+  const RETALIATE_COOLDOWN_S = 1.5;
+  /** Reach beyond the mount's own size. */
+  const RETALIATE_REACH = 2.6;
+  let retaliateCooldown = 0;
   /** Seconds between breath damage ticks. */
   const BREATH_TICK_S = 0.25;
   /** Non-dragon mount stomp attack (F): damage, reach, cost, cooldown. */
@@ -2489,11 +3033,86 @@ async function boot() {
   let stompCooldown = 0;
 
   /**
+   * How close to the player a hostile must be before the player's owned
+   * animals break off and intercept it.
+   *
+   * Kept comfortably inside animal-ai's DEFEND_GIVEUP_DIST so a defender never
+   * accepts a target it will immediately abandon, and short enough that pets
+   * guard their owner rather than roaming the map looking for a fight.
+   */
+  const DEFEND_CALL_RADIUS = Math.min(28, DEFEND_GIVEUP_DIST);
+
+  /**
    * Saddle offset: player sits at entity's shoulder height.
    * Saddle y = entity.y + SPECIES_DEFS[species].size.
    */
   function saddleY(species: Species, entityY: number): number {
     return entityY + SPECIES_DEFS[species].size;
+  }
+
+  // -------------------------------------------------------------------------
+  // Attack routing — who takes a hit aimed at the player (see attack-routing.ts)
+  // -------------------------------------------------------------------------
+
+  /** Snapshot the player's mounted state for the routing rules. */
+  function riderState(): RiderState {
+    const e = mountedEntityId !== null
+      ? entityManager.entities.get(mountedEntityId) : undefined;
+    if (e === undefined) return { mountId: null, mountBaseY: 0, mountSize: 0 };
+    return {
+      mountId: e.id,
+      mountBaseY: e.y,
+      mountSize: SPECIES_DEFS[e.species].size,
+    };
+  }
+
+  /**
+   * Put damage into the mount the player is riding. This is where a bear's
+   * swipe at a mounted rider actually lands.
+   *
+   * A mount killed under its rider dismounts them — tickMount already
+   * auto-dismounts on a dead mount, and a rider dropped from altitude takes
+   * the fall like anyone else. That consequence is the point: mounts are no
+   * longer free protection.
+   */
+  function damageMount(dmg: number): void {
+    if (mountedEntityId === null) return;
+    const e = entityManager.entities.get(mountedEntityId);
+    if (e === undefined || e.mode === 'dead') return;
+    e.hp = Math.max(0, e.hp - dmg);
+    triggerDamageFlash();
+    audio.play('hit');
+    if (e.hp <= 0) {
+      e.mode = 'dead';
+      if (e.deadAtS === undefined) e.deadAtS = simTime;
+      entityManager.killEntity(e.id);
+      setGatherNotice(`Your ${SPECIES_DEFS[e.species].name} was killed under you!`);
+    } else {
+      setGatherNotice(`Your ${SPECIES_DEFS[e.species].name} takes the blow (${Math.round(e.hp)} hp)`);
+    }
+  }
+
+  /**
+   * Apply an attack aimed at the player through the routing rules.
+   * Returns true when the player themself was hit.
+   */
+  function applyAttackOnPlayer(
+    dmg: number,
+    cause: import('./vitals').DamageCause,
+    reach: 'melee' | 'ranged',
+    attackerSize: number,
+    attackerY: number,
+  ): boolean {
+    const routing = routePlayerDamage(reach, { size: attackerSize, y: attackerY }, riderState());
+    if (routing.target === 'player') {
+      damagePlayer(vitals, dmg, cause, totalDefense(inventory));
+      triggerDamageFlash();
+      audio.play('hurt');
+      saveVitals(vitals);
+      return true;
+    }
+    if (routing.target === 'mount') damageMount(dmg);
+    return false;
   }
 
   /** Dismount the player from the currently-mounted entity. */
@@ -2515,7 +3134,7 @@ async function boot() {
       // entity's follow-mode AI (which uses heightAt) will lerp it down naturally.
       // We store the target as a property on the entity so tickEntities can
       // ease it down; if dragonFlightY > 0 the entity is airborne.
-      if (e.species === 'dragon' && DRAGON_FLIGHT_ENABLED && dragonFlightY > 0) {
+      if (SPECIES_DEFS[e.species].canFly === true && DRAGON_FLIGHT_ENABLED && dragonFlightY > 0) {
         // Dragon starts descending immediately: set its own velY-like descent
         // by flagging it for ground-return.
         (e as import('./entities/entity-manager').EntityState & { _landingY?: number })._landingY =
@@ -2719,6 +3338,11 @@ async function boot() {
       doDisMount();
       return;
     }
+    // Freeze the reins while a panel is up. WASD belongs to the panel then,
+    // and steering a mount from behind an open inventory means typing a
+    // quantity and flying into a mountain. The mount holds position rather
+    // than dismounting — the player has not let go, they are just busy.
+    if (panels.isOpen) return;
 
     const def = SPECIES_DEFS[e.species];
     const baseSpeed = def.mountSpeed ?? def.speed;
@@ -2760,7 +3384,7 @@ async function boot() {
     // Dragon flight: Space = ascend, Q (or Ctrl/C) = descend. Only when
     // dragon + DRAGON_FLIGHT_ENABLED; all other mounts ignore vertical input.
     // -----------------------------------------------------------------------
-    const isDragonFlight = e.species === 'dragon' && DRAGON_FLIGHT_ENABLED;
+    const isDragonFlight = SPECIES_DEFS[e.species].canFly === true && DRAGON_FLIGHT_ENABLED;
 
     if (isDragonFlight) {
       const spaceHeld = controller.heldKeys.has('Space');
@@ -2877,17 +3501,21 @@ async function boot() {
   } | null {
     if (mountedEntityId === null) return null;
     const e = entityManager.entities.get(mountedEntityId);
-    if (!e || e.species !== 'dragon' || e.mode === 'dead') return null;
-    const s = SPECIES_DEFS.dragon.size;
+    if (!e || e.mode === 'dead') return null;
+    const bs = BREATH_SPEC[e.species];
+    if (bs === undefined) return null;
+    // Sized AND offset from the mount's OWN species: hardcoding the dragon's
+    // numbers put the wyvern's breath origin about a metre above its skull.
+    const s = SPECIES_DEFS[e.species].size;
     const fx = Math.sin(e.yaw);   // dragon facing (mesh forward = local -Z)
     const fz = -Math.cos(e.yaw);
     const f = orbitCam.forward(); // unit vector, camera → look target
     const horiz = Math.hypot(f[0], f[2]); // camera pitch split: cos(pitch)
     const dir: [number, number, number] = [fx * horiz, f[1], fz * horiz];
     const mouth: [number, number, number] = [
-      e.x + fx * s * 1.27,
-      e.y + s * 1.61,
-      e.z + fz * s * 1.27,
+      e.x + fx * s * bs.mouth[0],
+      e.y + s * bs.mouth[1],
+      e.z + fz * s * bs.mouth[0],
     ];
     return { mouth, dir };
   }
@@ -2897,12 +3525,13 @@ async function boot() {
     mouth: [number, number, number],
     dir: [number, number, number],
     x: number, y: number, z: number,
+    reach = 1,
   ): boolean {
     const vx = x - mouth[0];
     const vy = y - mouth[1];
     const vz = z - mouth[2];
     const dist = Math.hypot(vx, vy, vz);
-    if (dist > BREATH_RANGE || dist < 0.001) return false;
+    if (dist > BREATH_RANGE * reach || dist < 0.001) return false;
     const dot = (vx * dir[0] + vy * dir[1] + vz * dir[2]) / dist;
     return dot >= Math.cos(BREATH_HALF_ANGLE);
   }
@@ -2947,6 +3576,47 @@ async function boot() {
    * Damage an NPC from a mount attack. Mirrors the melee NPC path:
    * flee + murder/assault crime when another NPC witnesses it.
    */
+  /**
+   * Record something the player did where the village can see it.
+   *
+   * The crime system already asked "did anyone see this?" — but only as a
+   * boolean, and then threw the answer away. It filed an anonymous
+   * `{kind, t}` row against a REGION and raised a bounty, so no NPC could ever
+   * say who did what to whom. Attack a farmer in the square and the farmer
+   * beside them had no idea it had happened.
+   *
+   * This keeps the witness LIST, so the bystander remembers, the victim's
+   * spouse hears about it, and both can speak about it in character.
+   */
+  /** Settlement a world position belongs to — the same key NPC memory uses. */
+  function nearestSettlementName(x: number, z: number): string {
+    for (const res of settlementManager.nearby()) {
+      if (Math.hypot(res.site.x - x, res.site.z - z) < 90) return res.name;
+    }
+    return 'Unknown';
+  }
+
+  function recordDeed(
+    kind: import('./npc/village-memory').VillageEventKind,
+    x: number, z: number,
+    subject?: { id: string; name: string },
+  ): void {
+    const settlement = nearestSettlementName(x, z);
+    const witnessed = witnessesNear(
+      npcRuntimes.filter((r) => r.hp > 0)
+        .map((r) => ({ id: r.npc.id, x: r.wx, z: r.wz })),
+      x, z, WITNESS_RADIUS);
+    recordVillageEvent(villageMemory, settlement, {
+      // Time plus kind plus subject makes a stable id, so the same blow
+      // reported down two code paths cannot be logged twice.
+      id: `${Math.round(simTime * 10)}:${kind}:${subject?.id ?? '-'}`,
+      t: simTime, kind,
+      subjectId: subject?.id, subjectName: subject?.name,
+      witnessed,
+    });
+    saveVillageMemory(villageMemory);
+  }
+
   function damageNpcFromMount(rt: NpcRuntime, dmg: number): void {
     const px = controller.pos[0];
     const pz = controller.pos[2];
@@ -2955,6 +3625,9 @@ async function boot() {
     const killedNpc = rt.hp <= 0;
     if (killedNpc) onNpcKilled(rt);
     const crimeKind = killedNpc ? 'murder' as const : 'assault' as const;
+    // The victim always knows, whoever else was watching.
+    recordDeed(killedNpc ? 'killed_npc' : 'attacked_npc', rt.wx, rt.wz,
+      { id: rt.npc.id, name: rt.npc.name });
     const witnessed = npcRuntimes.some(other => {
       if (other === rt) return false;
       return Math.hypot(other.wx - px, other.wz - pz) <= WITNESS_RADIUS;
@@ -2970,35 +3643,46 @@ async function boot() {
   function applyBreathDamage(
     mouth: [number, number, number],
     dir: [number, number, number],
+    spec: { reach: number; dmg: number; spark: boolean;
+            ignites: 'all' | 'tinder' | 'none' },
   ): void {
     // Animals (skip the mount itself and the dead).
     for (const e of entityManager.entities.values()) {
       if (e.id === mountedEntityId || e.mode === 'dead') continue;
       const def = SPECIES_DEFS[e.species];
-      if (!inBreathCone(mouth, dir, e.x, e.y + def.size * 0.5, e.z)) continue;
-      damageEntityFromMount(e, BREATH_DMG_ENTITY);
+      if (!inBreathCone(mouth, dir, e.x, e.y + def.size * 0.5, e.z, spec.reach)) continue;
+      damageEntityFromMount(e, Math.max(1, Math.round(BREATH_DMG_ENTITY * spec.dmg)));
     }
     // NPCs.
     for (const rt of npcRuntimes) {
       if (rt.hp <= 0) continue;
       const ny = heightField.heightAt(rt.wx, rt.wz) + 0.9;
-      if (!inBreathCone(mouth, dir, rt.wx, ny, rt.wz)) continue;
-      damageNpcFromMount(rt, BREATH_DMG_NPC);
+      if (!inBreathCone(mouth, dir, rt.wx, ny, rt.wz, spec.reach)) continue;
+      damageNpcFromMount(rt, Math.max(1, Math.round(BREATH_DMG_NPC * spec.dmg)));
     }
-    // Trees ignite (reuses the lightning burning-tree system).
-    const midX = mouth[0] + dir[0] * BREATH_RANGE * 0.5;
-    const midZ = mouth[2] + dir[2] * BREATH_RANGE * 0.5;
-    const trees = resourceManager.nearbyTreeRefs(midX, midZ, BREATH_RANGE * 0.7, Date.now());
+    // Ignition (reuses the lightning burning-tree system).
+    if (spec.ignites === 'none') return;
+    // Search radius follows the breath's OWN reach. Left at the dragon's, the
+    // wyvern would have set light to brush more than twice as far away as its
+    // sparks can actually fly.
+    const searchR = BREATH_RANGE * spec.reach * 0.7;
+    const midX = mouth[0] + dir[0] * BREATH_RANGE * spec.reach * 0.5;
+    const midZ = mouth[2] + dir[2] * BREATH_RANGE * spec.reach * 0.5;
     const burning = getBurningTrees();
-    for (const tr of trees) {
-      if (!inBreathCone(mouth, dir, tr.x, tr.y + 2, tr.z)) continue;
-      if (burning.some(b => b.x === tr.x && b.z === tr.z)) continue; // already alight
-      addBurningTree({ x: tr.x, y: tr.y, z: tr.z, untilS: simTime + TREE_BURN_S });
+    // Standing trees only go up under a sustained jet — a shower of embers is
+    // not enough to take hold on green timber.
+    if (spec.ignites === 'all') {
+      const trees = resourceManager.nearbyTreeRefs(midX, midZ, searchR, Date.now());
+      for (const tr of trees) {
+        if (!inBreathCone(mouth, dir, tr.x, tr.y + 2, tr.z, spec.reach)) continue;
+        if (burning.some(b => b.x === tr.x && b.z === tr.z)) continue; // already alight
+        addBurningTree({ x: tr.x, y: tr.y, z: tr.z, untilS: simTime + TREE_BURN_S });
+      }
     }
-    // Bushes in the cone catch too (quick tinder, shorter burn).
-    const bushes = resourceManager.nearbyBushRefs(midX, midZ, BREATH_RANGE * 0.7, Date.now());
+    // Brush is tinder: it catches from sparks as readily as from flame.
+    const bushes = resourceManager.nearbyBushRefs(midX, midZ, searchR, Date.now());
     for (const bu of bushes) {
-      if (!inBreathCone(mouth, dir, bu.x, bu.y + 0.5, bu.z)) continue;
+      if (!inBreathCone(mouth, dir, bu.x, bu.y + 0.5, bu.z, spec.reach)) continue;
       if (burning.some(b => b.x === bu.x && b.z === bu.z)) continue;
       addBurningTree({
         x: bu.x, y: bu.y, z: bu.z, kind: 'bush', untilS: simTime + BUSH_BURN_S,
@@ -3026,8 +3710,44 @@ async function boot() {
     const fHeld = controller.heldKeys.has('KeyF');
     if (mounted.stamina === undefined) mounted.stamina = 100;
 
-    if (mounted.species === 'dragon') {
-      // --- Fire breath ---
+    // --- the mount defends its rider ------------------------------------
+    // Answers whatever is already attacking the player and already in reach.
+    // Deliberately does NOT move or seek: the player is steering.
+    retaliateCooldown = Math.max(0, retaliateCooldown - dtS);
+    if (retaliateCooldown <= 0 && vitals.alive) {
+      const mSize = SPECIES_DEFS[mounted.species].size;
+      const reach = RETALIATE_REACH + mSize;
+      let best: import('./entities/entity-manager').EntityState | null = null;
+      let bestD2 = reach * reach;
+      for (const h of entityManager.entities.values()) {
+        // Only things hunting the player. A grazing deer beside the mount is
+        // not a threat, and a mount that mauls passing wildlife turns every
+        // journey into a massacre and every settlement into a crime scene.
+        if (h.mode !== 'aggro' || h.owned === true) continue;
+        if (h.id === mountedEntityId) continue;
+        const dx = h.x - mounted.x, dz = h.z - mounted.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < bestD2) { bestD2 = d2; best = h; }
+      }
+      if (best !== null) {
+        retaliateCooldown = RETALIATE_COOLDOWN_S;
+        // Reuse the manual bite's jaw snap so a retaliation looks exactly like
+        // one — same animation path, no second visual to keep in sync.
+        biteCooldown = BITE_COOLDOWN_S;
+        const dmg = SPECIES_DEFS[mounted.species].attackDmg
+          ?? Math.max(1, Math.round(mSize));
+        damageEntityFromMount(best, dmg);
+        audio.play('hit', { dist: Math.hypot(best.x - controller.pos[0],
+          best.z - controller.pos[2]) });
+        // Turn the head toward what it just bit, so the animal is visibly
+        // reacting rather than snapping at the air in front of it.
+        entityRenderer.jawOverride = { id: mounted.id, jawOpen: 1 };
+      }
+    }
+
+    const breathSpec = BREATH_SPEC[mounted.species];
+    if (breathSpec !== undefined) {
+      // --- Breath weapon (dragon: fire jet; wyvern: sparks) ---
       if (fHeld && mounted.stamina > BREATH_MIN_STAMINA) {
         breathActive = true;
         // Feature 10: dragon_roar SFX when breath starts.
@@ -3048,15 +3768,50 @@ async function boot() {
         if (breathTickAccum >= BREATH_TICK_S) {
           breathTickAccum = 0;
           const ray = getBreathRay();
-          if (ray !== null) applyBreathDamage(ray.mouth, ray.dir);
+          if (ray !== null) applyBreathDamage(ray.mouth, ray.dir, breathSpec);
         }
       } else {
         breathJaw = Math.max(0, breathJaw - dtS / 0.25);
         breathTickAccum = 0;
         prevBreathActive = false; // Feature 10: reset for next breath start
       }
-      entityRenderer.jawOverride = breathJaw > 0.01
-        ? { id: mounted.id, jawOpen: breathJaw } : null;
+      // --- Bite (G) ---
+      // Close-range answer when the breath is draining or a predator is
+      // already on top of you. Snaps the jaw shut through the same override
+      // the breath uses, so the two can never fight over the mouth.
+      biteCooldown = Math.max(0, biteCooldown - dtS);
+      let biteJaw = 0;
+      if (controller.heldKeys.has('KeyG') && biteCooldown <= 0
+          && mounted.stamina >= BITE_STAMINA) {
+        biteCooldown = BITE_COOLDOWN_S;
+        mounted.stamina = Math.max(0, mounted.stamina - BITE_STAMINA);
+        const fx = Math.sin(mounted.yaw), fz = -Math.cos(mounted.yaw);
+        const bx = mounted.x + fx * BITE_RANGE * 0.5;
+        const bz = mounted.z + fz * BITE_RANGE * 0.5;
+        let hit = false;
+        for (const e2 of entityManager.entities.values()) {
+          if (e2.id === mountedEntityId || e2.mode === 'dead') continue;
+          if (Math.hypot(e2.x - bx, e2.z - bz) > BITE_RANGE * 0.75) continue;
+          damageEntityFromMount(e2, BITE_DMG);
+          hit = true;
+        }
+        for (const rt of npcRuntimes) {
+          if (rt.hp <= 0) continue;
+          if (Math.hypot(rt.wx - bx, rt.wz - bz) > BITE_RANGE * 0.75) continue;
+          damageNpcFromMount(rt, BITE_DMG);
+          hit = true;
+        }
+        audio.play('dragon_roar');
+        if (hit) setGatherNotice(`The ${SPECIES_DEFS[mounted.species].name} bites!`);
+      }
+      // The bite snap: jaw opens fast at the start of the cooldown and shuts.
+      if (biteCooldown > 0) {
+        const u = 1 - biteCooldown / BITE_COOLDOWN_S;
+        biteJaw = u < 0.35 ? u / 0.35 : Math.max(0, 1 - (u - 0.35) / 0.35);
+      }
+      const jaw = Math.max(breathJaw, biteJaw);
+      entityRenderer.jawOverride = jaw > 0.01
+        ? { id: mounted.id, jawOpen: jaw } : null;
     } else {
       // --- Stomp (hooves / claws) ---
       entityRenderer.jawOverride = null;
@@ -3133,9 +3888,9 @@ async function boot() {
       });
       renderer.device.queue.writeBuffer(vb, 0, verts.buffer as ArrayBuffer, 0, verts.byteLength);
       // 101 = surface wood palette: sunlit brown twigs.
-      const { bindGroup } = renderer.createObjectBindGroup(0, 0, 0, 101);
+      const { bindGroup, shadowBindGroup } = renderer.createObjectBindGroup(0, 0, 0, 101);
       nestDraws.push({
-        draw: { vertexBuffer: vb, indexBuffer: null, count: verts.length / 3, bindGroup },
+        draw: { vertexBuffer: vb, indexBuffer: null, count: verts.length / (STRIDE_PROP / 4), bindGroup, shadowBindGroup },
         lightsBindGroup: lg,
       });
       nestGpuBuffers.push(vb);
@@ -3246,9 +4001,9 @@ async function boot() {
         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
       });
       renderer.device.queue.writeBuffer(vb, 0, verts.buffer as ArrayBuffer, 0, verts.byteLength);
-      const { bindGroup } = renderer.createObjectBindGroup(0, 0, 0, mode);
+      const { bindGroup, shadowBindGroup } = renderer.createObjectBindGroup(0, 0, 0, mode);
       eggDraws.push({
-        draw: { vertexBuffer: vb, indexBuffer: null, count: verts.length / 3, bindGroup },
+        draw: { vertexBuffer: vb, indexBuffer: null, count: verts.length / (STRIDE_PROP / 4), bindGroup, shadowBindGroup },
         lightsBindGroup: lg,
       });
       eggGpuBuffers.push(vb);
@@ -3381,10 +4136,33 @@ async function boot() {
       controller.velY = 0;
       return true;
     },
+    setShadows: (on: boolean | null) => { shadowOverride = on; },
     setCamera: (yaw: number, pitch: number, distance: number) => {
       orbitCam.yaw = yaw;
       orbitCam.pitch = pitch;
       orbitCam.distance = distance;
+    },
+    setPortraitSubject: (entityId: string | null) => {
+      portraitEntityId = entityId;
+    },
+    heightAt: (x: number, z: number) => heightField.heightAt(x, z),
+    playerMotion: () => ({
+      grounded: controller.grounded,
+      swimming: controller.swimming,
+      velY: controller.velY,
+    }),
+    setArmor: (slots) => {
+      for (const slot of ['head', 'body', 'legs'] as const) {
+        const id = slots[slot];
+        if (id === undefined) continue;
+        inventory.armor[slot] = id === null || !isGameItemId(id)
+          ? null : { id, count: 1 };
+      }
+      invChanged();
+    },
+    setCustomization: (partial) => {
+      custom = { ...custom, ...partial };
+      saveCustomization(custom);
     },
     freezeAttackT: (t: number | null) => {
       attackTOverride = t;
@@ -3543,10 +4321,41 @@ async function boot() {
       return dragonFlightY;
     },
     injectProjectile: (x: number, y: number, z: number, kind: 'stone' | 'arrow', damage: number) => {
-      projectiles.push({ x, y, z, vx: 0, vy: 0, vz: 0, born: simTime, kind, damage });
-      return projectiles.length;
+      spawnProjectile(projectilePool, {
+        kind, x, y, z, vx: 0, vy: 0, vz: 0, damage, nowS: simTime,
+      });
+      return inFlightCount(projectilePool);
     },
-    projectileCount: () => projectiles.length,
+    projectileCount: () => inFlightCount(projectilePool),
+    stuckProjectileCount: () => activeCount(projectilePool) - inFlightCount(projectilePool),
+    fireArrow: (yawDeg: number, pitchDeg: number, power = 1) => {
+      const heldId = equipped(inventory);
+      if (heldId !== 'hunter_bow' && heldId !== 'composite_bow') return false;
+      if (countItem(inventory, 'arrow') < 1) return false;
+      bowDrawing = true;
+      bowDrawT = BOW_DRAW_S * Math.max(0, Math.min(1, power));
+      const savedYaw = orbitCam.yaw;
+      const savedPitch = orbitCam.pitch;
+      orbitCam.yaw = -yawDeg * Math.PI / 180;
+      orbitCam.pitch = pitchDeg * Math.PI / 180;
+      lastBowShotS = -999; // debug hook ignores the fire-rate limiter
+      releaseBowDraw();
+      orbitCam.yaw = savedYaw;
+      orbitCam.pitch = savedPitch;
+      return true;
+    },
+    projectiles: () => projectilePool.slots
+      .filter(p => p.active)
+      .map(p => ({
+        kind: p.kind, team: p.team, stuck: p.stuck,
+        x: p.x, y: p.y, z: p.z, dx: p.dx, dy: p.dy, dz: p.dz,
+        anchorId: p.anchorId,
+      })),
+    bowDraw: () => ({ drawing: bowDrawing, t: bowDrawT, aim: bowAimAmount() }),
+    freezeBowAim: (a: number | null) => { bowAimOverride = a; },
+    facePlayer: (yawRad: number) => { controller.yaw = yawRad; },
+    leftClick: () => { resolveLeftClick(); },
+    releaseBow: () => { releaseBowDraw(); },
     // Phase L
     npcs: () => {
       const px = controller.pos[0];
@@ -3625,6 +4434,25 @@ async function boot() {
       return { jailedUntilMs: jailRecord.jailedUntilMs, regionId: jailRecord.regionId };
     },
     teleportToNearestSettlement: (kind?: string) => {
+      /**
+       * Put the player somewhere sensible for the kind of place it is.
+       *
+       * `site.x + 5` was fine when a castle was 50 m across; it is now 68 m and
+       * that lands the player INSIDE the keep's footprint. They get shoved out
+       * sideways by wall sliding, which looks like a bug. Arriving at a castle
+       * should mean arriving at its gate — which is also where the road
+       * network delivers you, so the two agree.
+       *
+       * Ground height comes from the CARVED field, so landing on the paved
+       * approach puts the player on the stones rather than under them.
+       */
+      const land = (site: { kind: string; x: number; z: number }): void => {
+        const gate = site.kind === 'castle' ? castleGateLocal() : null;
+        const x = site.x + (gate !== null ? gate.x : 5);
+        const z = site.z + (gate !== null ? gate.z - 6 : 0);
+        controller.pos = [x, chunkManager.ground.heightAt(x, z), z];
+        controller.velY = 0;
+      };
       const nearby = settlementManager.nearby();
       let best: import('./settlement/settlement-layout').ResolvedSettlement | null = null;
       let bestD = Infinity;
@@ -3639,12 +4467,10 @@ async function boot() {
           controller.pos[0], controller.pos[2], 6);
         if (site === null) return false;
         if (kind && site.kind !== kind) return false;
-        controller.pos = [site.x + 5, heightField.heightAt(site.x + 5, site.z), site.z];
-        controller.velY = 0;
+        land(site);
         return true;
       }
-      controller.pos = [best.site.x + 5, heightField.heightAt(best.site.x + 5, best.site.z), best.site.z];
-      controller.velY = 0;
+      land(best.site);
       return true;
     },
     serveFast: (ms: number) => {
@@ -3800,6 +4626,50 @@ async function boot() {
     buildingTeleportToBed: () => buildingManager.debugTeleportToBed(),
   };
 
+  /**
+   * `?spawn=<species>[&count=N]` — put creatures in front of the player.
+   *
+   * The console route (`__gameDebug.spawnEntity(...)`) works but is awkward in
+   * practice: the game holds pointer lock, so reaching devtools means breaking
+   * out of the game first, and calling it before `__gameReady` silently does
+   * nothing. It also takes a raw dx/dz in world axes, so "10 metres away" lands
+   * wherever north happens to be rather than in front of the camera.
+   *
+   * Called ONCE from the frame loop at the moment the game declares itself
+   * ready — not at module scope. The first version ran inline here and crashed
+   * boot outright with a temporal-dead-zone error, because `setGatherNotice`
+   * writes to a HUD element declared further down the file. Anything that
+   * touches the HUD has to wait until the HUD exists.
+   */
+  function debugSpawnFromUrl(): void {
+    const params = new URLSearchParams(location.search);
+    const want = params.get('spawn');
+    if (want === null) return;
+    if (!(want in SPECIES_DEFS)) {
+      setGatherNotice(`Unknown species "${want}" — try: ${
+        Object.keys(SPECIES_DEFS).join(', ')}`);
+      return;
+    }
+    const sp = want as Species;
+    const count = Math.min(8, Math.max(1, Number(params.get('count') ?? '1') || 1));
+    // Ahead of where the camera is looking, fanned out a little so a group
+    // does not stack into a single silhouette.
+    const dist = 6 + SPECIES_DEFS[sp].size * 2.2;
+    let spawned = 0;
+    for (let i = 0; i < count; i++) {
+      const spread = (i - (count - 1) / 2) * 3.5;
+      const yaw = orbitCam.yaw;
+      const dx = -Math.sin(yaw) * dist + Math.cos(yaw) * spread;
+      const dz = -Math.cos(yaw) * dist - Math.sin(yaw) * spread;
+      if (entityManager.spawnEntity(
+        sp, controller.pos[0] + dx, controller.pos[2] + dz) !== null) spawned++;
+    }
+    setGatherNotice(spawned > 0
+      ? `Spawned ${spawned}x ${SPECIES_DEFS[sp].name} in front of you`
+      : `Could not spawn ${want} here — try flatter ground away from water`);
+  }
+
+
   // --- ?dungeon=preview: fly around fixture 0's interior (M2 debug) --------
   // No collision/portals yet — fly cam only, dark fog, bright-ambient shader
   // fallback (zeroed lights buffer → count 0).
@@ -3815,14 +4685,15 @@ async function boot() {
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
     renderer.device.queue.writeBuffer(vertexBuffer, 0, verts);
-    const { bindGroup } = renderer.createObjectBindGroup(0, -300, 0, 0);
+    const { bindGroup, shadowBindGroup } =
+      renderer.createObjectBindGroup(0, -300, 0, 0);
     const lightsBuffer = renderer.device.createBuffer({
       label: 'dungeon-preview-lights',
       size: LIGHTS_BUFFER_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     dungeonDraws = [{
-      draw: { vertexBuffer, indexBuffer: null, count: verts.length / 3, bindGroup },
+      draw: { vertexBuffer, indexBuffer: null, count: verts.length / (STRIDE_PROP / 4), bindGroup, shadowBindGroup },
       lightsBindGroup: renderer.createLightsBindGroup(lightsBuffer),
     }];
     flyMode = true;
@@ -3871,7 +4742,9 @@ async function boot() {
         (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) {
       return;
     }
-    if (e.code === 'KeyC' && !flyMode) {
+    // Same collision as Q: C is a descend key on a flying mount, and opening
+    // the character sheet mid-flight is not what the player asked for.
+    if (e.code === 'KeyC' && !flyMode && !mountedOnFlier()) {
       audio.play('ui_click');
       panels.toggle('character', () => buildCharacterPanel(
         () => custom,
@@ -3920,10 +4793,13 @@ async function boot() {
           ['Space',      'Jump (or paddle while swimming)'],
           ['Mouse',      'Orbit camera / aim'],
           ['Wheel',      'Zoom camera'],
-          ['Left-click', 'Gather / attack / use / shoot'],
+          ['Left-click', 'Gather / attack / use  (hold with a bow to draw, release to shoot)'],
           ['Right-click','Toggle pet stay/follow'],
           ['E',          'Interact / talk / eat / drink / mount'],
+          ['Mounted',    'Left-click is still YOUR weapon or bow — F and G are the mount’s'],
           ['F',          'Dragon fire breath / mount stomp'],
+          ['G',          'Mount bite (dragon / wyvern)'],
+          ['Space / Q',  'Ascend / descend while flying'],
           ['I / Tab',    'Inventory'],
           ['B',          'Crafting'],
           ['C',          'Character customization'],
@@ -4021,6 +4897,25 @@ async function boot() {
     if (e.code === 'KeyR') {
       flyMode = !flyMode;
       if (flyMode) flyCam.pos = orbitCam.eye(add(controller.pos, [0, PLAYER_HEIGHT, 0]));
+    }
+    // Q drops the held item — one, or the whole stack with Shift.
+    //
+    // A full pack is otherwise a dead end: crafting needs a free slot for its
+    // output, so once all 33 slots are occupied the player can neither craft
+    // nor make room. Gated on !flyMode because Q is fly-mode descend.
+    // Q drops the held item — but Q is also DESCEND on a flying mount, so a
+    // rider losing altitude was throwing their sword away at the same time.
+    // Suppressed only for fliers: on a horse, Q has no other job.
+    if (e.code === 'KeyQ' && !flyMode && !mountedOnFlier()) {
+      const dropped = dropSlot(
+        inventory, { area: 'hotbar', index: inventory.selected }, e.shiftKey);
+      if (dropped !== null) {
+        setGatherNotice(`Dropped: ${dropped.count}× ${itemDef(dropped.id).name}`);
+        audio.play('pickup');
+        invChanged();
+      } else {
+        setGatherNotice('Nothing in hand to drop');
+      }
     }
     if (e.code === 'KeyE') {
       // Phase M: jail escape check first
@@ -4307,6 +5202,24 @@ async function boot() {
       for (const drop of drops) {
         addItem(inventory, drop.id, drop.count);
       }
+      // Village concerns advance here rather than at the moment of death,
+      // because looting is the point at which the player has actually gained
+      // the thing — and it covers both 'kill' tasks and the 'bring' tasks the
+      // drops satisfy, from one place.
+      {
+        const moved = [
+          ...advanceTasks(villageFacts, 'kill', e.species, 1),
+          ...drops.flatMap((d) => advanceTasks(villageFacts, 'bring', d.id, d.count)),
+        ];
+        if (moved.length > 0) {
+          saveVillageFacts(villageFacts);
+          const done = moved.filter((f) => f.task?.state === 'complete');
+          if (done.length > 0 && done[0].ownerName !== undefined) {
+            setGatherNotice(
+              `That is what ${done[0].ownerName} asked for — go and tell them.`);
+          }
+        }
+      }
       invChanged();
       if (drops.length > 0) {
         setGatherNotice(`Looted: ${drops.map(d => `${d.count}× ${d.id}`).join(', ')}`);
@@ -4325,18 +5238,46 @@ async function boot() {
   function tickEntities(dtS: number): void {
     const px = controller.pos[0];
     const pz = controller.pos[2];
+    // Rebuilt every sim step by `tickWildFlier`. Without this it never
+    // emptied: a single wyvern breathing pushed a jet per tick forever, and a
+    // probe measured 2,278 live flame billboards against a normal peak of ~34.
+    wildBreaths.length = 0;
 
     // Tick dungeon enemies when inside — replaces the normal overworld tick.
     if (dungeonManager.isInside) {
       dungeonManager.tickEnemies(dtS, px, pz, (damage: number) => {
-        damagePlayer(vitals, damage, 'animal', totalDefense(inventory));
-        triggerDamageFlash();
-        saveVitals(vitals);
+        // Mounts cannot be brought into a dungeon, so this always resolves to
+        // the player — routed anyway so there is exactly one damage path.
+        applyAttackOnPlayer(damage, 'animal', 'melee', 1.0, controller.pos[1]);
       });
       return;
     }
     // Update cell streaming.
     entityManager.update(px, pz);
+
+    // One scan per tick, shared by every creature's target selection.
+    combatIndex.rebuild(
+      entityManager.entities.values(),
+      npcRuntimes.filter((r) => r.hp > 0)
+        .map((r) => ({ id: r.npc.id, x: r.wx, z: r.wz })),
+      px, pz);
+
+    // Nominate a threat for the player's owned animals to intercept. One scan
+    // per tick, shared by every defender: whoever is closest to the player and
+    // currently coming after them. Only 'aggro' counts — a grazing bear is not
+    // a threat and a pet that picks fights turns every walk into a brawl.
+    // The ridden mount is deliberately NOT a defender: the player drives it
+    // with F/G, and having it charge off on its own would fight the reins.
+    let defendTarget: DefendTarget | null = null;
+    {
+      let bestD2 = DEFEND_CALL_RADIUS * DEFEND_CALL_RADIUS;
+      for (const h of entityManager.entities.values()) {
+        if (h.mode !== 'aggro' || h.owned || h.id === mountedEntityId) continue;
+        const hx = h.x - px, hz = h.z - pz;
+        const d2 = hx * hx + hz * hz;
+        if (d2 < bestD2) { bestD2 = d2; defendTarget = { id: h.id, x: h.x, z: h.z }; }
+      }
+    }
 
     for (const e of entityManager.entities.values()) {
       if (e.mode === 'dead') continue;
@@ -4346,7 +5287,7 @@ async function boot() {
       // Dragon flight: if a dragon was just dismounted while airborne, ease it
       // back down to terrain over the next few seconds before handing off to
       // the normal follow-mode AI (which already ground-snaps via heightAt).
-      if (DRAGON_FLIGHT_ENABLED && e.species === 'dragon') {
+      if (DRAGON_FLIGHT_ENABLED && SPECIES_DEFS[e.species].canFly === true) {
         const eExt = e as import('./entities/entity-manager').EntityState & { _landingY?: number };
         if (eExt._landingY !== undefined) {
           const groundY = heightField.heightAt(e.x, e.z);
@@ -4371,21 +5312,49 @@ async function boot() {
       );
       // Feature 10: growl SFX when wolf/bear transitions to aggro.
       const prevMode = e.mode;
+      // Portrait mode: hold everything at idle so the subject neither charges
+      // the camera nor bolts out of frame.
+      if (portraitEntityId !== null && (e.mode === 'aggro' || e.mode === 'flee')) {
+        e.mode = 'idle';
+        e.stateTimer = 0;
+      }
       stepAnimal(e, dtS, {
         playerX: px,
         playerZ: pz,
         playerDist,
         rng,
-        heightAt: (x, z) => heightField.heightAt(x, z),
+        // Carved ground, so animals walk on a road rather than through it.
+        heightAt: (x, z) => chunkManager.ground.heightAt(x, z),
         moveXZ: (x, z, dx, dz, r) => terrainWorld.moveXZ(x, z, dx, dz, r),
         speciesDef: SPECIES_DEFS[e.species],
+        defendTarget: e.owned === true ? defendTarget : null,
+        combat: combatIndex,
+        onAttackNpc: (npcId: string, damage: number) => {
+          const rt = npcRuntimes.find((r) => r.npc.id === npcId);
+          if (rt === undefined || rt.hp <= 0) return;
+          // Deliberately NOT damageNpcFromMount: that path reports a crime and
+          // raises the player's bounty. A bear mauling a farmer is a tragedy,
+          // not something the player should be fined for.
+          rt.hp = Math.max(0, rt.hp - damage);
+          rt.fleeing = true;
+          if (rt.hp <= 0) onNpcKilled(rt);
+          audio.play('hit', { dist: Math.hypot(rt.wx - px, rt.wz - pz) });
+        },
+        onAttackEntity: (targetId: string, damage: number) => {
+          const t = entityManager.entities.get(targetId);
+          if (t === undefined || t.mode === 'dead') return;
+          damageEntityFromMount(t, damage);
+          audio.play('hit', { dist: Math.hypot(t.x - px, t.z - pz) });
+        },
         onAttackPlayer: (damage: number) => {
+          if (portraitEntityId !== null) return; // portrait mode: no mauling
           // Phase K: cannot attack while the entity is owned (baby/tamed).
           if ((e as import('./entities/entity-manager').EntityState & { owned?: boolean }).owned) return;
-          damagePlayer(vitals, damage, 'animal', totalDefense(inventory));
-          triggerDamageFlash();
-          audio.play('hurt'); // Feature 10: player hurt SFX
-          saveVitals(vitals);
+          // Everything an animal does with teeth or claws is melee, so it can
+          // never reach a rider in the saddle: it hits the mount, or nothing
+          // at all if the mount is out of reach overhead (attack-routing.ts).
+          applyAttackOnPlayer(damage, 'animal', 'melee',
+            SPECIES_DEFS[e.species].size, e.y);
         },
       });
       // Growl/roar on entering aggro (wolf, bear, dragon, etc.).
@@ -4394,25 +5363,74 @@ async function boot() {
         const sfxName = def.aggro && e.species === 'dragon' ? 'dragon_roar' : 'growl';
         audio.play(sfxName, { dist: playerDist });
       }
+      // Airborne behaviour for wild fliers, AFTER the AI has run.
+      //
+      // Order is not incidental: `moveToward` ends with `e.y = heightAt(x, z)`,
+      // pinning every entity to the terrain. Flight has to be applied on top of
+      // that or the ground wins every frame — which is exactly why wild dragons,
+      // wyverns and griffins have always walked everywhere while only the
+      // MOUNTED controller could get one off the ground.
+      tickWildFlier(e, dtS, playerDist);
     }
   }
 
   // -------------------------------------------------------------------------
   // Phase H: active projectiles (thrown stones + arrows)
+  //
+  // Storage, integration and the stuck-in-something lifecycle live in
+  // projectiles.ts (pooled, zero per-shot allocation). What stays here is the
+  // part that needs the world: which things can be hit, and what happens to
+  // them — damage, kills, crime reports, audio.
   // -------------------------------------------------------------------------
-  interface Projectile {
-    x: number; y: number; z: number;
-    vx: number; vy: number; vz: number;
-    born: number; // simTime at spawn
-    /** 'stone' | 'arrow' — determines hit radius and damage */
-    kind: 'stone' | 'arrow';
-    /** Damage dealt on entity hit. */
-    damage: number;
-  }
-  const projectiles: Projectile[] = [];
+  const projectilePool = createProjectilePool(PROJECTILE_CAPACITY);
 
-  /** simTime of the last bow shot; enforces 0.6 s fire-rate limit. */
+  /** simTime of the last bow shot; enforces the fire-rate limit. */
   let lastBowShotS = -999;
+
+  // --- projectile rendering -------------------------------------------------
+  // ONE buffer, ONE draw call, sized for a completely full pool and rewritten
+  // in place every frame. No per-shot GPU allocation, and no possibility of
+  // overrunning the allocation (which would render the whole frame black — see
+  // CHARACTER_MAX_VERTS's history): buildProjectileMesh is bounded by the same
+  // constant this buffer is sized from and stops early regardless.
+  const projectileScratch = new Float32Array(projectileMeshFloats(PROJECTILE_CAPACITY));
+  const projectileVertexBuffer = renderer.device.createBuffer({
+    label: 'projectiles',
+    size: projectileScratch.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  const projectileBindGroups = renderer.createObjectBindGroup(0, 0, 0, 101); // 101 = wood
+  const projectileDraw: import('./renderer').DungeonDraw = {
+    draw: {
+      vertexBuffer: projectileVertexBuffer,
+      indexBuffer: null,
+      count: 0,
+      bindGroup: projectileBindGroups.bindGroup,
+      shadowBindGroup: projectileBindGroups.shadowBindGroup,
+    },
+    lightsBindGroup: getFireLightsBindGroup(),
+  };
+
+  /** Rewrite the arrow buffer for this frame. Returns the vertex count. */
+  function updateProjectileDraw(camX: number, camZ: number): number {
+    const built = buildProjectileMesh(projectilePool, projectileScratch, camX, camZ, 160);
+    // Clamp at the write site. `writeBuffer` takes its size through a WebIDL
+    // [EnforceRange] unsigned long long, so a NaN or an over-long value does
+    // not clip — it throws out of the frame loop and the game stops rendering.
+    // Passing the typed array (element counts, not bytes) removes the byte
+    // arithmetic that could produce one.
+    const verts = Number.isFinite(built)
+      ? Math.max(0, Math.min(
+        Math.floor(built), Math.floor(projectileScratch.length / PROJECTILE_FLOATS_PER_VERT)))
+      : 0;
+    projectileDraw.draw.count = verts;
+    if (verts > 0) {
+      renderer.device.queue.writeBuffer(
+        projectileVertexBuffer, 0, projectileScratch, 0,
+        verts * PROJECTILE_FLOATS_PER_VERT);
+    }
+    return verts;
+  }
 
   // -------------------------------------------------------------------------
   // Phase H: placement helpers
@@ -4614,85 +5632,237 @@ async function boot() {
     const vx = Math.sin(yaw) * Math.cos(pitch) * speed;
     const vy = Math.sin(pitch) * speed;
     const vz = -Math.cos(yaw) * Math.cos(pitch) * speed;
-    projectiles.push({
+    spawnProjectile(projectilePool, {
+      kind: 'stone',
       x: controller.pos[0],
       y: controller.pos[1] + 1.2, // launch from chest height
       z: controller.pos[2],
       vx, vy, vz,
-      born: simTime,
-      kind: 'stone',
       damage: 2,
+      nowS: simTime,
     });
     attackT = 0; // play swing animation
     return true;
   }
 
+  // -------------------------------------------------------------------------
+  // Bow: hold to draw, release to loose
+  //
+  // A click used to fire instantly, which is a large part of why a shot was
+  // unreadable — the arrow (invisible) and its cause (a generic axe chop)
+  // happened in the same frame with nothing in between. Holding the button
+  // draws the string: the archer's pose changes, an arrow appears nocked, and
+  // the shot leaves on release. Power scales with how long it was held, so a
+  // panicked tap is a weak lob and a held draw is a flat, fast shot.
+  //
+  // A tap still fires (at MIN_DRAW_POWER) rather than doing nothing — the
+  // previous input was a tap and silently swallowing it would read as a bug.
+  // -------------------------------------------------------------------------
+  /** Seconds of holding for a full-power shot. */
+  const BOW_DRAW_S = 0.55;
+  /** Fraction of full power an instant tap delivers. */
+  const MIN_DRAW_POWER = 0.35;
+  /** Arrow muzzle speed at zero draw and at full draw (m/s). */
+  const ARROW_SPEED_MIN = 19;
+  const ARROW_SPEED_MAX = 36;
+  /** Minimum seconds between loosed arrows (unchanged from the old limiter). */
+  const BOW_REFIRE_S = 0.6;
+  /** Seconds the loose/follow-through pose plays after release. */
+  const BOW_LOOSE_S = 0.20;
+
+  /** True while the string is being drawn. */
+  let bowDrawing = false;
+  /** Seconds the string has been held. */
+  let bowDrawT = 0;
+  /** Counts down through the follow-through after a loose. */
+  let bowLooseT = 0;
+  /** Draw power captured at the moment of release (drives the snap-back). */
+  let bowLoosePower = 0;
+
+  /** Is a bow the currently equipped item? */
+  function bowEquipped(): boolean {
+    const id = equipped(inventory);
+    return id === 'hunter_bow' || id === 'composite_bow';
+  }
+
   /**
-   * Fire an arrow from the held bow (hunter_bow or composite_bow).
-   * Requires ≥1 arrow in inventory; consumes 1. Enforces 0.6 s fire-rate.
-   * Arrow: ~28 m/s, slight gravity arc, max range ~40 m or terrain hit.
-   * Damage: hunter_bow 6, composite_bow 9.
+   * Debug pin for the draw pose. Headless harnesses cannot acquire pointer
+   * lock, so they cannot hold the mouse button — and a 0.55 s draw is not
+   * something a screenshot can be timed against anyway. Mirrors
+   * `attackTOverride`, which exists for exactly the same reason.
    */
-  function tryFireBow(): boolean {
-    const heldId2 = equipped(inventory);
-    if (heldId2 !== 'hunter_bow' && heldId2 !== 'composite_bow') return false;
+  let bowAimOverride: number | null = null;
 
-    // Fire-rate limit: 0.6 s between shots.
-    if (simTime - lastBowShotS < 0.6) return false;
+  /** 0..1 archer pose weight — draw, then a fast snap back on release. */
+  function bowAimAmount(): number {
+    if (bowAimOverride !== null) return bowAimOverride;
+    if (bowDrawing) return Math.min(1, bowDrawT / BOW_DRAW_S);
+    if (bowLooseT > 0) return bowLoosePower * (bowLooseT / BOW_LOOSE_S) * 0.35;
+    return 0;
+  }
 
-    // Require and consume 1 arrow.
+  /** Abort a draw without spending an arrow (panel opened, lock lost, death). */
+  function cancelBowDraw(): void {
+    bowDrawing = false;
+    bowDrawT = 0;
+  }
+
+  /**
+   * Begin drawing. Returns false when the bow cannot shoot at all, so the
+   * left-click priority chain falls through to the next step.
+   */
+  function tryStartBowDraw(): boolean {
+    if (!bowEquipped()) return false;
+    if (bowDrawing) return true;
+    if (simTime - lastBowShotS < BOW_REFIRE_S) return true; // consumed; still cooling
     if (countItem(inventory, 'arrow') < 1) {
       setGatherNotice('No arrows');
       return true; // consumed the action (show notice, no shot)
     }
-    removeItem(inventory, 'arrow', 1);
-    invChanged();
-
-    const damage = heldId2 === 'composite_bow' ? 9 : 6;
-    const yaw = -orbitCam.yaw;
-    // Flat trajectory: fire at camera pitch (near-flat), slight gravity handles arc.
-    const pitch = orbitCam.pitch;
-    const speed = 28;
-    const vx = Math.sin(yaw) * Math.cos(pitch) * speed;
-    const vy = Math.sin(pitch) * speed;
-    const vz = -Math.cos(yaw) * Math.cos(pitch) * speed;
-    projectiles.push({
-      x: controller.pos[0],
-      y: controller.pos[1] + 1.2, // launch from chest height
-      z: controller.pos[2],
-      vx, vy, vz,
-      born: simTime,
-      kind: 'arrow',
-      damage,
-    });
-    lastBowShotS = simTime;
-    attackT = 0; // draw/release animation feedback
+    bowDrawing = true;
+    bowDrawT = 0;
     return true;
   }
 
-  // Update projectiles in the sim loop (called each tick).
-  function tickProjectiles(dt: number): void {
-    const GRAVITY = 9.8;
-    for (let i = projectiles.length - 1; i >= 0; i--) {
-      const p = projectiles[i];
-      p.vy -= GRAVITY * dt;
-      p.x += p.vx * dt;
-      p.y += p.vy * dt;
-      p.z += p.vz * dt;
+  /**
+   * Loose the arrow. Consumes 1 arrow. Damage and speed scale with draw.
+   * Launch is from the player's chest — which, while mounted, is the saddle,
+   * so a rider shoots from over the mount's shoulders rather than out of its
+   * ribcage.
+   */
+  function releaseBowDraw(): void {
+    if (!bowDrawing) return;
+    const power = Math.max(MIN_DRAW_POWER, Math.min(1, bowDrawT / BOW_DRAW_S));
+    bowDrawing = false;
+    bowDrawT = 0;
 
-      // Hit-radius and max-lifetime per kind.
+    const heldId2 = equipped(inventory);
+    if (heldId2 !== 'hunter_bow' && heldId2 !== 'composite_bow') return;
+    if (countItem(inventory, 'arrow') < 1) { setGatherNotice('No arrows'); return; }
+    removeItem(inventory, 'arrow', 1);
+    invChanged();
+
+    const baseDamage = heldId2 === 'composite_bow' ? 9 : 6;
+    const damage = Math.max(1, Math.round(baseDamage * (0.45 + 0.55 * power)));
+    const speed = ARROW_SPEED_MIN + (ARROW_SPEED_MAX - ARROW_SPEED_MIN) * power;
+    const yaw = -orbitCam.yaw;
+    const pitch = orbitCam.pitch;
+    const cp = Math.cos(pitch);
+    // Nudge the launch point forward out of the archer's own body so the
+    // shaft is clear of the chest on frame one.
+    const ox = Math.sin(yaw) * cp * 0.55;
+    const oz = -Math.cos(yaw) * cp * 0.55;
+    spawnProjectile(projectilePool, {
+      kind: 'arrow',
+      x: controller.pos[0] + ox,
+      y: controller.pos[1] + 1.2 + Math.sin(pitch) * 0.55,
+      z: controller.pos[2] + oz,
+      vx: Math.sin(yaw) * cp * speed,
+      vy: Math.sin(pitch) * speed,
+      vz: -Math.cos(yaw) * cp * speed,
+      damage,
+      nowS: simTime,
+    });
+    lastBowShotS = simTime;
+    bowLooseT = BOW_LOOSE_S;
+    bowLoosePower = power;
+    audio.play('swing');
+  }
+
+  /**
+   * Eased 0..1 riding-seat weight for the player mesh. Mounting and
+   * dismounting cross it in ~0.2 s so the rider folds into the saddle rather
+   * than snapping between two frozen poses.
+   */
+  let seatBlend = 0;
+
+  /** Advance the draw / follow-through / seat clocks. Called once per sim step. */
+  function tickBow(dtS: number): void {
+    const seatTarget = mountedEntityId !== null ? 1 : 0;
+    seatBlend += (seatTarget - seatBlend) * Math.min(1, dtS * 6);
+    if (Math.abs(seatBlend - seatTarget) < 0.002) seatBlend = seatTarget;
+    if (bowDrawing) {
+      // Anything that takes the player's hands off the bow cancels the draw.
+      if (!bowEquipped() || panels.isOpen || !vitals.alive
+          || document.pointerLockElement !== canvas) {
+        cancelBowDraw();
+      } else {
+        bowDrawT = Math.min(BOW_DRAW_S * 1.5, bowDrawT + dtS);
+      }
+    }
+    if (bowLooseT > 0) bowLooseT = Math.max(0, bowLooseT - dtS);
+  }
+
+  // -------------------------------------------------------------------------
+  // Projectile hit resolution (the world-aware half; storage is projectiles.ts)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Test an ENEMY projectile against the player, and route the damage.
+   *
+   * This is the one place a ranged attack can reach a mounted rider, which is
+   * the whole point of ranged attackers existing: see attack-routing.ts.
+   */
+  function resolveEnemyProjectileHit(p: Projectile): import('./projectiles').ProjectileHit | null {
+    if (!vitals.alive) return null;
+    const px = controller.pos[0];
+    const pz = controller.pos[2];
+    // Player capsule: feet at pos[1], ~1.7 m tall, ~0.55 m hit radius.
+    const dx = px - p.x;
+    const dz = pz - p.z;
+    if (dx * dx + dz * dz > 0.55 * 0.55) return null;
+    const footY = controller.pos[1];
+    if (p.y < footY - 0.2 || p.y > footY + PLAYER_HEIGHT + 0.2) return null;
+
+    const routing = routePlayerDamage('ranged', { size: 1.7, y: p.y }, riderState());
+    if (routing.target === 'player') {
+      damagePlayer(vitals, p.damage, 'combat', totalDefense(inventory));
+      triggerDamageFlash();
+      audio.play('hurt');
+      saveVitals(vitals);
+    } else if (routing.target === 'mount') {
+      damageMount(p.damage);
+    }
+    return { anchorId: null, anchorX: p.x, anchorY: p.y, anchorZ: p.z };
+  }
+
+  /** Update projectiles in the sim loop (called each tick). */
+  function tickProjectiles(dt: number): void {
+    stepProjectiles(projectilePool, dt, simTime, {
+      heightAt: (x, z) => (dungeonManager.isInside ? -1e9 : heightField.heightAt(x, z)),
+      resolveHit: (p) => resolveProjectileHit(p),
+    });
+    // Arrows stuck in a creature ride it; arrows in a corpse that has been
+    // looted away go with it rather than hanging in the air.
+    followAnchors(projectilePool, (id) => {
+      const e = dungeonManager.isInside
+        ? dungeonManager.dungeonEnemies().find(en => en.id === id)
+        : entityManager.entities.get(id);
+      if (e !== undefined) return { x: e.x, y: e.y, z: e.z };
+      const rt = npcRuntimes.find(r => r.npc.id === id);
+      if (rt !== undefined && rt.hp > 0) return { x: rt.wx, y: rt.wy, z: rt.wz };
+      return null;
+    });
+  }
+
+  /** One projectile's hit test + consequences. Returns the anchor it lodged in. */
+  function resolveProjectileHit(p: Projectile): import('./projectiles').ProjectileHit | null {
+    if (p.team === 'enemy') return resolveEnemyProjectileHit(p);
+    {
+      // Hit-radius per kind.
       const hitRadius = p.kind === 'arrow' ? 0.8 : 1.2;
-      // Arrows: max range ~40 m (at 28 m/s → ~1.43 s); stones: 3 s max.
-      const maxAge = p.kind === 'arrow' ? 1.5 : 3;
 
       // Entity hit-test: check all live entities (dungeon or overworld) within hit radius.
-      let hit = false;
+      let hit: import('./projectiles').ProjectileHit | null = null;
       const projTargets: Iterable<import('./entities/entity-manager').EntityState> =
         dungeonManager.isInside
           ? dungeonManager.dungeonEnemies()
           : entityManager.entities.values();
       for (const e of projTargets) {
         if (e.mode === 'dead') continue;
+        // Never shoot the animal you are sitting on. Without this, a mounted
+        // archer's own arrow spawns inside the mount's hit sphere and kills it.
+        if (e.id === mountedEntityId) continue;
         const specSize = SPECIES_DEFS[e.species].size;
         // Scale hit radius by entity size (larger targets easier to hit).
         const effectiveRadius = hitRadius * Math.max(1, specSize);
@@ -4701,6 +5871,8 @@ async function boot() {
         const dy = e.y + specSize * 0.5 - p.y; // aim for body centre
         const dist3 = Math.sqrt(dx * dx + dy * dy + dz * dz);
         if (dist3 > effectiveRadius) continue;
+
+        hit = { anchorId: e.id, anchorX: e.x, anchorY: e.y, anchorZ: e.z };
 
         // Apply damage via the same path as melee.
         e.hp = Math.max(0, e.hp - p.damage);
@@ -4739,12 +5911,11 @@ async function boot() {
             }
           }
         }
-        hit = true;
         break; // one hit per projectile
       }
 
       // Feature 4: Projectiles also hit NPC runtimes (overworld only).
-      if (!hit && !dungeonManager.isInside) {
+      if (hit === null && !dungeonManager.isInside) {
         const npcHitRadius = p.kind === 'arrow' ? 0.7 : 1.0;
         for (const rt of npcRuntimes) {
           if (rt.hp <= 0) continue;
@@ -4753,6 +5924,7 @@ async function boot() {
           const dy4 = rt.wy + 0.9 - p.y; // aim for body centre
           const dist4 = Math.sqrt(dx4 * dx4 + dy4 * dy4 + dz4 * dz4);
           if (dist4 > npcHitRadius) continue;
+          hit = { anchorId: rt.npc.id, anchorX: rt.wx, anchorY: rt.wy, anchorZ: rt.wz };
           // Apply damage.
           rt.hp = Math.max(0, rt.hp - p.damage);
           audio.play('hit');
@@ -4781,16 +5953,11 @@ async function boot() {
             saveCrimeState(crimeState);
             setGatherNotice(`${killedByProj ? 'Murder' : 'Assault'}! Bounty +${BOUNTY_AMOUNTS[crimeKindProj]}`);
           }
-          hit = true;
           break;
         }
       }
 
-      // Despawn on entity hit, terrain hit, or max age.
-      const groundY = heightField.heightAt(p.x, p.z);
-      if (hit || p.y <= groundY || simTime - p.born > maxAge) {
-        projectiles.splice(i, 1);
-      }
+      return hit;
     }
   }
 
@@ -4798,14 +5965,24 @@ async function boot() {
   // Left-click: 8-step priority resolver (Phase H + ranged combat)
   // -------------------------------------------------------------------------
   // Left-click while locked in — priority chain (first match wins):
-  //  1. Gather node in range
+  //  1. Gather node in range              } skipped in the saddle
   //  2. Placeable selected (campfire_kit, tent items)
   //  3. Fill container at fresh water
   //  4. Consume edible/drinkable
   //  5. Ignite fire (fire_starter or torch aimed at unlit campfire)
-  //  6. Bow shot (hunter_bow / composite_bow) — shoots arrow, consumes 1 arrow
+  //  6. Bow draw (hunter_bow / composite_bow) — hold to draw, release to loose
   //  7. Throw stone (or other throwable)
   //  8. Attack swing (fallback)
+  //
+  // MOUNTED INPUT SCHEME. Left-click is the RIDER's attack, mounted or not —
+  // the same button, the same weapons, the same feel; nothing to relearn when
+  // you climb into a saddle. The MOUNT's own weapons stay where they were, on
+  // F (breath / stomp) and G (bite), so the two can never contend for an
+  // input: one button belongs to the person, two keys belong to the animal,
+  // and you can loose an arrow mid-fire-breath because they are separate
+  // hands. Steps 1–5 are world interactions that make no sense at saddle
+  // height (you cannot chop a tree or fill a waterskin from a flying dragon)
+  // and are skipped while mounted so they can never swallow the attack.
   // Right click: toggle stay/sit on a nearby owned animal (mounts, pets).
   // A staying animal sits where it was left and stops following the player.
   window.addEventListener('mousedown', (e) => {
@@ -4830,62 +6007,73 @@ async function boot() {
     if (document.pointerLockElement === canvas) e.preventDefault();
   });
 
-  window.addEventListener('mousedown', (e) => {
-    if (e.button !== 0 || flyMode || panels.isOpen) return;
-    if (document.pointerLockElement !== canvas) return;
+  //
+  // Extracted from the listener so it can be exercised without a mouse.
+  // Pointer lock is unobtainable in headless Chrome, so the listener body was
+  // unreachable to every automated check — a mounted melee swing could have
+  // been broken and nothing would have caught it.
+  function resolveLeftClick(): void {
     if (attackT < 1) return; // swing still in progress
 
-    // Phase K: attacking is disabled while mounted.
-    if (mountedEntityId !== null) return;
+    const heldId2 = equipped(inventory);
+    const isMounted = mountedEntityId !== null;
+
+    // The bow is checked BEFORE the swing bookkeeping: drawing a string is not
+    // a swing, and stamping attackT here would start a chop under the aim pose.
+    if (bowEquipped()) {
+      if (tryStartBowDraw()) return;
+    }
 
     attackT = 0;
-    controller.yaw = -orbitCam.yaw;
+    // Mounted, the mount's facing is the body's facing (tickMount owns yaw) —
+    // snapping the rider to the camera would spin them in the saddle.
+    if (!isMounted) controller.yaw = -orbitCam.yaw;
     audio.play('swing'); // Feature 10: melee swing SFX
 
-    const heldId2 = equipped(inventory);
-
-    // 1. Gather node in range
-    const node = resourceManager.nearestNode(controller.pos, GATHER_REACH, Date.now());
-    if (node !== null) {
-      tryGather();
-      return;
-    }
-
-    // Phase K: 1b. Feed animal if held item matches favorite food
-    if (tryFeedAnimal()) return;
-
-    // 2. Placeables
-    if (heldId2 === 'campfire_kit') {
-      tryPlaceCampfire();
-      return;
-    }
-    if (heldId2 === 'fiber_tent' || heldId2 === 'wool_tent' || heldId2 === 'hide_tent') {
-      tryPlaceTent(heldId2 as 'fiber_tent' | 'wool_tent' | 'hide_tent');
-      return;
-    }
-    // Phase K: 2b. Place egg
-    if (heldId2 !== null && eggSpeciesFor(heldId2) !== null) {
-      tryPlaceEgg();
-      return;
-    }
-
-    // 3. Fill container at fresh water
-    if (tryFillContainer()) return;
-
-    // 4. Consume edible/drinkable
-    if (heldId2 !== null) {
-      const def2 = itemDef(heldId2);
-      if (def2.edible || def2.drinkable) {
-        tryConsumeHeldItemLeftClick();
+    // Steps 1-5 are ground interactions. From the saddle they are either
+    // impossible or actively harmful (placing a campfire under a flying
+    // dragon), and every one of them would eat the click before the attack.
+    if (!isMounted) {
+      // 1. Gather node in range
+      const node = resourceManager.nearestNode(controller.pos, GATHER_REACH, Date.now());
+      if (node !== null) {
+        tryGather();
         return;
       }
+
+      // Phase K: 1b. Feed animal if held item matches favorite food
+      if (tryFeedAnimal()) return;
+
+      // 2. Placeables
+      if (heldId2 === 'campfire_kit') {
+        tryPlaceCampfire();
+        return;
+      }
+      if (heldId2 === 'fiber_tent' || heldId2 === 'wool_tent' || heldId2 === 'hide_tent') {
+        tryPlaceTent(heldId2 as 'fiber_tent' | 'wool_tent' | 'hide_tent');
+        return;
+      }
+      // Phase K: 2b. Place egg
+      if (heldId2 !== null && eggSpeciesFor(heldId2) !== null) {
+        tryPlaceEgg();
+        return;
+      }
+
+      // 3. Fill container at fresh water
+      if (tryFillContainer()) return;
+
+      // 4. Consume edible/drinkable
+      if (heldId2 !== null) {
+        const def2 = itemDef(heldId2);
+        if (def2.edible || def2.drinkable) {
+          tryConsumeHeldItemLeftClick();
+          return;
+        }
+      }
+
+      // 5. Ignite fire (fire_starter or torch + unlit campfire in range)
+      if (tryIgniteFire()) return;
     }
-
-    // 5. Ignite fire (fire_starter or torch + unlit campfire in range)
-    if (tryIgniteFire()) return;
-
-    // 6. Bow shot (hunter_bow / composite_bow): shoots arrow, trumps throw and swing.
-    if (tryFireBow()) return;
 
     // 7. Throw stone or throwable
     if (tryThrow()) return;
@@ -4895,7 +6083,26 @@ async function boot() {
     {
       // Every melee swing costs stamina (one-shot drain: 3 × 1 s).
       drainStamina(vitals, 3, 1);
-      const ENTITY_HIT_DIST = 3.2;
+      // From a saddle the rider swings from higher up and further out, so the
+      // reach grows with the mount. A rider on a dragon (size 3.5) has to be
+      // able to hit what is standing beside its shoulder, not just what is
+      // pressed against its ribs.
+      const mountedOn = isMounted && mountedEntityId !== null
+        ? entityManager.entities.get(mountedEntityId) : undefined;
+      const ENTITY_HIT_DIST = 3.2
+        + (mountedOn !== undefined ? SPECIES_DEFS[mountedOn.species].size : 0);
+      // Vertical gate: a rider 30 m up cannot swing a sword at the ground.
+      //
+      // Measured from the MOUNT'S BASE, not from the saddle — the same
+      // reference attack-routing.ts uses for blows coming the other way. The
+      // first version measured from the rider's seat, which put a dragon's
+      // saddle 3.5 m above a deer's chest and 2.9 m of that against a 3.7 m
+      // budget: it worked on flat ground and silently missed on any slope.
+      // If the mount is standing next to something, its rider can hit it.
+      const MELEE_VERTICAL_REACH = 2.5;
+      const meleeOriginY = mountedOn !== undefined
+        ? controller.pos[1] - SPECIES_DEFS[mountedOn.species].size
+        : controller.pos[1];
       const px7 = controller.pos[0];
       const pz7 = controller.pos[2];
       const facingX = Math.sin(controller.yaw);
@@ -4917,10 +6124,16 @@ async function boot() {
           : entityManager.entities.values();
       for (const e of meleeTargets) {
         if (e.mode === 'dead') continue;
+        // Never swing at the animal you are riding.
+        if (e.id === mountedEntityId) continue;
         const ex = e.x - px7;
         const ez = e.z - pz7;
         const dist7 = Math.hypot(ex, ez);
         if (dist7 > ENTITY_HIT_DIST) continue;
+        // Height gate — symmetric with the rule that stops a bear reaching a
+        // rider: a sword swung from 30 m up reaches nothing on the ground.
+        if (Math.abs((e.y + SPECIES_DEFS[e.species].size * 0.5) - meleeOriginY)
+            > MELEE_VERTICAL_REACH + SPECIES_DEFS[e.species].size) continue;
         // Facing check: dot product of facing vector and direction to entity.
         const dot7 = (dist7 > 0.001)
           ? (facingX * ex / dist7 + facingZ * ez / dist7)
@@ -4985,6 +6198,7 @@ async function boot() {
         const nz = rt.wz - pz7;
         const ndist = Math.hypot(nx, nz);
         if (ndist > ENTITY_HIT_DIST) continue;
+        if (Math.abs(rt.wy + 0.9 - meleeOriginY) > MELEE_VERTICAL_REACH + 1.5) continue;
         const ndot = ndist > 0.001 ? (facingX * nx / ndist + facingZ * nz / ndist) : 1;
         if (ndot < 0.3) continue;
 
@@ -5010,6 +6224,23 @@ async function boot() {
       }
     }
     // (attackT was already set to 0 above)
+  }
+
+  window.addEventListener('mousedown', (e) => {
+    if (e.button !== 0 || flyMode || panels.isOpen) return;
+    if (document.pointerLockElement !== canvas) return;
+    resolveLeftClick();
+  });
+
+  // Releasing the left button looses a drawn arrow. Bound on `window` rather
+  // than the canvas so letting go outside the canvas still fires instead of
+  // leaving the string drawn forever; `pointerlockchange` covers the case
+  // where focus is lost while held (tickBow cancels it).
+  window.addEventListener('mouseup', (e) => {
+    if (e.button !== 0) return;
+    if (!bowDrawing) return;
+    if (panels.isOpen || !vitals.alive) { cancelBowDraw(); return; }
+    releaseBowDraw();
   });
 
   // Live debug capture (F8 snapshot / F9 auto) — see debug-capture.ts.
@@ -5136,7 +6367,8 @@ async function boot() {
           const onDragonInFlight = mountedEntityId !== null
             && (() => {
               const me = entityManager.entities.get(mountedEntityId ?? '');
-              return me !== undefined && me.species === 'dragon' && dragonFlightY > 0.5;
+              return me !== undefined && SPECIES_DEFS[me.species].canFly === true
+                && dragonFlightY > 0.5;
             })();
           if (!inWater && !onDragonInFlight && impactSpeed > FALL_SAFE_THRESHOLD) {
             const excess = impactSpeed - FALL_SAFE_THRESHOLD;
@@ -5252,6 +6484,7 @@ async function boot() {
         }
       }
 
+      tickBow(SIM_DT);
       tickProjectiles(SIM_DT);
       tickEntities(SIM_DT);
       tickMount(SIM_DT);
@@ -5280,6 +6513,9 @@ async function boot() {
     buildingManager.update(controller.pos, settlementManager.nearby(), dungeonManager.isInside);
     const inDungeon = dungeonPreview || dungeonManager.isInside || buildingManager.isInside;
     controller.swimEnabled = !inDungeon; // interiors sit at y=-300, no sea there
+    // Keep the orbit camera above the waterline while surface-swimming, so a
+    // swim looks like a swim instead of a drowning (see OrbitCamera.minEyeY).
+    orbitCam.minEyeY = controller.swimming ? SEA_LEVEL + 0.35 : null;
 
     // Feature 9: reset overworld entity aggro on dungeon/building exit.
     if (prevInDungeon && !inDungeon) {
@@ -5295,8 +6531,15 @@ async function boot() {
     // Feature 6: Compass HUD update.
     updateCompass();
 
-    // Camera + streaming follow the active viewpoint.
-    const target = add(controller.pos, [0, PLAYER_HEIGHT * 0.85, 0]);
+    // Camera + streaming follow the active viewpoint. In portrait mode the
+    // orbit centre is the subject creature, framed at half its standing height.
+    const portraitEnt = portraitEntityId === null
+      ? undefined : entityManager.entities.get(portraitEntityId);
+    const target = portraitEnt !== undefined
+      ? [portraitEnt.x,
+         portraitEnt.y + (SPECIES_DEFS[portraitEnt.species]?.size ?? 1) * 0.5,
+         portraitEnt.z] as [number, number, number]
+      : add(controller.pos, [0, PLAYER_HEIGHT * 0.85, 0]);
     const { view, eye } = flyMode
       ? { view: flyCam.viewMatrix(), eye: flyCam.pos }
       : orbitCam.viewMatrix(target);
@@ -5330,11 +6573,32 @@ async function boot() {
         legs: armorTierOf(inventory.armor.legs?.id),
       },
     };
+    // An archer looks where the arrow is going. Unmounted the controller yaw
+    // already tracks the camera; MOUNTED it tracks the animal's body, so a
+    // rider shooting off to the side would be firing over their own shoulder
+    // with their chest square to the front. Blend the mesh yaw toward the aim
+    // by the draw amount — the turn then happens over the draw, not as a snap.
+    const aimNow = bowAimAmount();
+    let meshYaw = controller.yaw;
+    // Only a LIVE draw turns the body. `freezeBowAim` pins the pose for
+    // capture and must not also hijack the facing, or every camera angle a
+    // harness picks ends up behind the archer's head — which is exactly how a
+    // previous harness in this repo photographed the back of the player's
+    // head for an entire session.
+    if (aimNow > 0.01 && (bowDrawing || bowLooseT > 0)) {
+      let d = (-orbitCam.yaw) - controller.yaw;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      meshYaw = controller.yaw + d * Math.min(1, aimNow * 1.6);
+    }
     const charVerts = buildCharacterMesh(custom, {
-      yaw: controller.yaw, walkPhase, walkAmp: effectiveWalkAmp, attackT,
-    }, held, charOptions);
-    renderer.device.queue.writeBuffer(player.vertexBuffer, 0, charVerts);
-    player.draw.count = charVerts.length / 6;
+      yaw: meshYaw, walkPhase, walkAmp: effectiveWalkAmp, attackT,
+      aim: aimNow, seat: seatBlend,
+    }, held, charOptions, playerMeshScratch);
+    const playerVerts = fitCharacterMesh(charVerts);
+    renderer.device.queue.writeBuffer(player.vertexBuffer, 0, playerVerts);
+    player.draw.count = portraitEntityId !== null
+      ? 0 : playerVerts.length / (STRIDE_CREATURE / 4);
     renderer.device.queue.writeBuffer(
       player.objectBuffer, 0, new Float32Array([p[0], p[1], p[2], 1]));
 
@@ -5375,7 +6639,32 @@ async function boot() {
       env.sunColor[1] * wx.sunDim,
       env.sunColor[2] * wx.sunDim,
     ];
-    const proj = perspectiveZO(Math.PI / 3, renderer.aspect, 0.1, 1200);
+    const FOV_Y = Math.PI / 3;
+    const NEAR = 0.1;
+    const proj = perspectiveZO(FOV_Y, renderer.aspect, NEAR, 1200);
+    // Camera forward from the view matrix's third rotation row (lookAt puts
+    // the camera's -Z along the look direction). Shadow cascades fit to it.
+    const cameraForward: Vec3 = [-view[2], -view[6], -view[10]];
+
+    // Moon: roughly opposite the sun but on a slightly inclined orbit, so it
+    // drifts across the sky over successive nights instead of sitting fixed.
+    const moonT = simTime / DAY_LENGTH_S;
+    const moonSwing = moonT * 0.21;
+    const moonDir = normalize([
+      -env.sunDir[0] * Math.cos(moonSwing) - env.sunDir[2] * Math.sin(moonSwing),
+      Math.abs(env.sunDir[1]) * 0.94 + 0.16,
+      -env.sunDir[2] * Math.cos(moonSwing) + env.sunDir[0] * Math.sin(moonSwing),
+    ]);
+    // Illuminated fraction over an 8-day cycle.
+    const moonPhase = 0.5 - 0.5 * Math.cos(moonT * (Math.PI * 2 / 8));
+
+    // Overcast skies scatter the sun into a soft dome — shadows weaken with
+    // cloud cover and rain rather than staying knife-sharp in a downpour.
+    let shadowStrength = inDungeon
+      ? 0
+      : Math.max(0, 1 - wx.cloudCover * 0.55 - wx.rainLevel * 0.25);
+    if (shadowOverride !== null) shadowStrength = shadowOverride ? 1 : 0;
+
     const frame: FrameUniforms = {
       viewProj: multiply(proj, proj, view),
       cameraPos: eye,
@@ -5389,7 +6678,66 @@ async function boot() {
       starVis: inDungeon ? 0 : env.starVis,
       cloudCover: inDungeon ? 0 : wx.cloudCover,
       rainLevel: inDungeon ? 0 : wx.rainLevel,
+      cameraForward,
+      fovY: FOV_Y,
+      near: NEAR,
+      shadowStrength,
+      moonDir,
+      moonPhase,
+      windTime: simTime,
     };
+
+    // Queue every flame billboard for this frame and collect the point lights
+    // they cast. Doing both in one pass is deliberate: they used to be
+    // computed in unrelated places, which is how burning trees ended up
+    // blazing away while lighting absolutely nothing.
+    const fireLights = emitFireVfx(eye, inDungeon);
+
+    let worldLightCount = 0;
+    // Outdoor point lights: lit fires near the camera, brightest-first, so a
+    // campfire actually lights the ground, the grass and whoever stands round
+    // it. Interiors keep their own group-2 torch set, so skip this inside.
+    if (inDungeon) {
+      // Indoors the sun and sky contribute nothing, and the interior's torch
+      // set lives in a group-2 uniform only the dungeon pipeline can read —
+      // so feed the same lights into the world set, or characters and animals
+      // render as unlit black silhouettes underground.
+      const interiorLights = dungeonManager.isInside
+        ? dungeonManager.activeLights()
+        : buildingManager.activeLights();
+      worldLightCount = interiorLights.length;
+      const nearest = [...interiorLights]
+        .sort((a, b) =>
+          (a.pos[0] - eye[0]) ** 2 + (a.pos[1] - eye[1]) ** 2 + (a.pos[2] - eye[2]) ** 2
+          - ((b.pos[0] - eye[0]) ** 2 + (b.pos[1] - eye[1]) ** 2 + (b.pos[2] - eye[2]) ** 2))
+        .slice(0, MAX_WORLD_LIGHTS);
+      renderer.setWorldLights(nearest);
+    } else {
+      worldLightCount = Math.min(fireLights.length, MAX_WORLD_LIGHTS);
+      renderer.setWorldLights(fireLights.slice(0, MAX_WORLD_LIGHTS));
+    }
+
+    // Post-process state that follows gameplay rather than the environment.
+    {
+      const post = renderer.postSettings;
+      // Submerged: driven by the camera eye, not the player's feet, and
+      // capped short of 1 — full absorption reads as an opaque blue screen.
+      post.underwater = inDungeon
+        ? 0
+        : Math.max(0, Math.min(0.85, (SEA_LEVEL - eye[1]) * 1.1));
+      // Red pulse as health runs out.
+      const hpFrac = vitals.hp / MAX_HP;
+      post.hurt = Math.max(0, 1 - hpFrac / 0.34) * 0.55;
+      // Night lifts exposure a little so the world stays readable without
+      // washing the daylight out.
+      post.exposure = DEFAULT_POST.exposure
+        * (inDungeon ? 1.30 : 1 + (env.starVis) * 0.22);
+      post.godrayStrength = inDungeon ? 0 : 1 - wx.cloudCover * 0.5;
+      post.bloomIntensity = DEFAULT_POST.bloomIntensity
+        * (inDungeon ? 1.8 : 1 + wx.rainLevel * 0.5);
+      // Damp air scatters more: haze up the vignette in the rain.
+      post.vignette = DEFAULT_POST.vignette + wx.rainLevel * 0.10;
+    }
 
     if (!inDungeon) {
       const prevNpcCount = settlementManager.nearbyNpcs().length;
@@ -5399,37 +6747,28 @@ async function boot() {
       updateNestStream();
     }
     const draws = inDungeon ? [] : chunkManager.draws();
-    const dDraws = dungeonPreview ? dungeonDraws : dungeonManager.draws();
+    // Copy, do not extend in place. `DungeonManager.draws()` returns its own
+    // `resident.draws` array by reference while the player is inside a
+    // dungeon, so every `push` here appends to the manager's permanent list
+    // and it grows without bound frame after frame. The existing pushes below
+    // have the same hazard; taking a copy fixes all of them at once.
+    const dDraws = [...(dungeonPreview ? dungeonDraws : dungeonManager.draws())];
     dDraws.push(...buildingManager.draws());
     if (!inDungeon) {
       dDraws.push(...settlementManager.draws());
       dDraws.push(...resourceManager.draws());
+      // Fire pits only (stone, logs, chimney). Flames, embers, smoke and coals
+      // are billboards already queued by emitFireVfx above.
       dDraws.push(...fireDraws);
-      updateBreathVfx();
-      if (breathVertCount > 0 && breathVb !== null && breathBindGroup !== null) {
-        dDraws.push({
-          draw: {
-            vertexBuffer: breathVb, indexBuffer: null,
-            count: breathVertCount, bindGroup: breathBindGroup,
-          },
-          lightsBindGroup: getFireLightsBindGroup(),
-        });
-      }
-      updateBurningVegVfx();
-      if (burnVegVertCount > 0 && burnVegVb !== null && burnVegBindGroup !== null) {
-        dDraws.push({
-          draw: {
-            vertexBuffer: burnVegVb, indexBuffer: null,
-            count: burnVegVertCount, bindGroup: burnVegBindGroup,
-          },
-          lightsBindGroup: getFireLightsBindGroup(),
-        });
-      }
       dDraws.push(...tentDraws);
       dDraws.push(...eggDraws);
       dDraws.push(...nestDraws);
     }
+    // Arrows in flight and arrows stuck where they landed. One draw for the
+    // whole pool; skipped entirely when nothing is in the air.
+    if (updateProjectileDraw(eye[0], eye[2]) > 0) dDraws.push(projectileDraw);
     const treeDraws = inDungeon ? [] : chunkManager.treeDraws();
+    const grassDraws = inDungeon ? [] : chunkManager.grassDraws();
     // Build entity draws (animals): overworld OR dungeon enemies.
     const entityDraws = inDungeon
       ? entityRenderer.buildDraws(dungeonManager.dungeonEnemies(), eye[0], eye[2], simTime)
@@ -5440,10 +6779,14 @@ async function boot() {
     const npcDraws = inDungeon ? [] : buildNpcDraws(eye[0], eye[2]);
 
     if (renderer.renderFrame(
-      frame, draws, dDraws, !inDungeon, treeDraws, [player.draw, ...entityDraws, ...npcDraws])) {
+      frame, draws, dDraws, !inDungeon, treeDraws,
+      [player.draw, ...entityDraws, ...npcDraws], grassDraws)) {
       frameCount++;
       fpsFrames++;
-      if (!window.__gameReady) window.__gameReady = true;
+      if (!window.__gameReady) {
+        window.__gameReady = true;
+        debugSpawnFromUrl();
+      }
       // Same-task canvas read-back for the live debug channel (F8/F9).
       capture.maybeCapture(canvas, now, () => ({
         stats: window.__gameStats,
@@ -5524,6 +6867,8 @@ async function boot() {
         frameCount,
         fps,
         chunkCount: chunkManager.count,
+        grassInstances: grassDraws.reduce((n, g) => n + g.instanceCount, 0),
+        worldLightCount,
         playerPos: [p[0], p[1], p[2]],
         grounded: controller.grounded,
         swimming: controller.swimming,
@@ -5538,6 +6883,7 @@ async function boot() {
         attackT,
         gathered: gatheredCount,
         burningTreeCount: getBurningTrees().length,
+        fireBillboards: lastFireBillboards,
         entityCount: entityManager.entities.size,
         entityDrawn: entityDrawnCount,
         mountedEntityId,
@@ -5545,6 +6891,14 @@ async function boot() {
           ? dragonFlightY
           : null,
         npcCount: npcRuntimes.length,
+        projectilesInFlight: inFlightCount(projectilePool),
+        projectilesStuck: activeCount(projectilePool) - inFlightCount(projectilePool),
+        bowAim: bowAimAmount(),
+        mountHp: (() => {
+          const m = mountedEntityId !== null
+            ? entityManager.entities.get(mountedEntityId) : undefined;
+          return m !== undefined ? m.hp : null;
+        })(),
         // Phase M
         bounty: bountyIn(crimeState, nearestRegionId()),
         jailed: jailRecord !== null && Date.now() < jailRecord.jailedUntilMs,

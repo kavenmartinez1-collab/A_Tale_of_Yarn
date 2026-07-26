@@ -24,10 +24,9 @@ import type { Vec3 } from '../math';
 import type { HeightField } from '../noise';
 import type { OrbitCamera } from '../camera';
 import type { PlayerController } from '../controller';
-import { LIGHTS_BUFFER_SIZE, type DungeonDraw, type Renderer } from '../renderer';
-import type { DungeonSpec, ItemId } from './dungeon-spec';
+import { LIGHTS_BUFFER_SIZE, STRIDE_PROP, type DungeonDraw, type Renderer } from '../renderer';
 import { DUNGEON_FIXTURES } from './dungeon-fixtures';
-import { layoutDungeon, mix32, type DungeonLayout, type PlacedRoom } from './dungeon-layout';
+import { layoutDungeon, mix32, type DungeonLayout } from './dungeon-layout';
 import { buildInteriorMesh } from './dungeon-mesh';
 import {
   buildChestMesh, buildEntranceGlowMesh, buildEntranceStoneMesh,
@@ -37,19 +36,27 @@ import { DungeonCollider } from './dungeon-collider';
 import { DCELL, entranceSiteAt } from './entrance-site';
 import { SPECIES_DEFS } from '../entities/entity-types';
 import type { EntityState } from '../entities/entity-manager';
-import { stepAnimal, onEntityDamaged } from '../entities/animal-ai';
+import {
+  CombatIndex, stepAnimal, onEntityDamaged,
+  type DamageSource, type RangedShot,
+} from '../entities/animal-ai';
+import { rollDrops } from '../entities/animal-drops';
+import type { GameItemId } from '../items';
+import type { DungeonSpec, ItemId } from './dungeon-spec';
+import {
+  spawnDungeonEnemies, type DungeonEnemy,
+} from './dungeon-enemies';
+
+// Re-exported so `main.ts` (and anything else holding a manager) can keep
+// importing the type from here. The spawner itself moved to `dungeon-enemies`
+// because that module is pure and can therefore be unit-tested; this file
+// imports the renderer and cannot.
+export type { DungeonEnemy };
 import { mulberry32 } from '../mesh-utils';
 
 const INTERACT_DIST = 3;    // E-key reach (m, XZ)
 const EXIT_OFFSET = 1.5;    // how far outside the entrance you reappear (m)
 
-// --- dungeon enemy constants -----------------------------------------------
-const DUNGEON_ENEMY_SPECIES = 'wolf' as const;
-/** Min/max enemies spawned per dungeon (2–5). */
-const DUNGEON_ENEMY_MIN = 2;
-const DUNGEON_ENEMY_MAX = 5;
-/** Room types that receive enemies. */
-const DUNGEON_COMBAT_ROOM_TYPES = new Set(['combat', 'boss']);
 // Surface arches render within this range (m). MUST stay inside the terrain
 // stream radius (LOAD_RADIUS 6 × 64 = 384 m guaranteed) or arches float in
 // the sky over unloaded ground; 360 leaves margin for async chunk gen.
@@ -93,73 +100,6 @@ interface ResidentChest {
   opened: boolean;
 }
 
-/**
- * A dungeon enemy: an EntityState placed in a combat/boss room.
- * Uses the same fields and AI path as overworld entities, but lives
- * inside the dungeon origin-space.
- */
-export type DungeonEnemy = EntityState & {
-  /** Room rect (in layout cell coords) used to clamp movement. */
-  roomX: number;
-  roomZ: number;
-  roomW: number;
-  roomD: number;
-};
-
-/** Spawn 2–5 wolf enemies in combat/boss rooms deterministically. */
-function spawnDungeonEnemies(
-  layout: DungeonLayout,
-  origin: Vec3,
-  seed: number,
-  dcx: number,
-  dcz: number,
-): DungeonEnemy[] {
-  const rng = mulberry32(mix32(seed ^ 0xd00f, dcx, dcz));
-  const enemies: DungeonEnemy[] = [];
-
-  // Collect eligible rooms (combat + boss), shuffle order.
-  const combatRooms: PlacedRoom[] = layout.rooms.filter(
-    (r) => DUNGEON_COMBAT_ROOM_TYPES.has(r.type));
-  if (combatRooms.length === 0) return enemies;
-
-  const total = DUNGEON_ENEMY_MIN + Math.floor(rng() * (DUNGEON_ENEMY_MAX - DUNGEON_ENEMY_MIN + 1));
-  const def = SPECIES_DEFS[DUNGEON_ENEMY_SPECIES];
-
-  for (let i = 0; i < total; i++) {
-    const room = combatRooms[Math.floor(rng() * combatRooms.length)];
-    // Place within the inner 80% of the room, away from walls.
-    const margin = 1;
-    const fx = room.x + margin + rng() * Math.max(0, room.w - 2 * margin);
-    const fz = room.z + margin + rng() * Math.max(0, room.d - 2 * margin);
-    const wx = origin[0] + fx;
-    const wy = origin[1]; // dungeon floor
-    const wz = origin[2] + fz;
-    const id = `dungeon:${dcx},${dcz}:e${i}`;
-
-    const enemy: DungeonEnemy = {
-      id,
-      species: DUNGEON_ENEMY_SPECIES,
-      x: wx, y: wy, z: wz,
-      yaw: rng() * Math.PI * 2,
-      hp: def.hp,
-      mode: 'idle',
-      walkPhase: 0,
-      colorVariant: (rng() * 4) | 0,
-      homeX: wx,
-      homeZ: wz,
-      stateTimer: rng() * 3,
-      fleeTimer: 0,
-      // Room bounds in world coords (for moveXZ clamping).
-      roomX: origin[0] + room.x,
-      roomZ: origin[2] + room.z,
-      roomW: room.w,
-      roomD: room.d,
-    };
-    enemies.push(enemy);
-  }
-  return enemies;
-}
-
 interface Resident {
   entrance: Entrance;
   layout: DungeonLayout;
@@ -170,6 +110,28 @@ interface Resident {
   buffers: GPUBuffer[];
   /** Enemies active in this dungeon; emptied when all are killed. */
   enemies: DungeonEnemy[];
+  /**
+   * World-space torch lights, in CPU form. The same data goes into the
+   * group-2 uniform the dungeon pipeline reads, but characters and animals
+   * render on their own pipelines and cannot see that buffer — without a
+   * CPU-side copy to feed the renderer's world-light set, anything standing
+   * in a dungeon renders as a pure black silhouette.
+   */
+  torchLights: WorldLight[];
+}
+
+/** A point light in world space, shared with the renderer's world-light set. */
+export interface WorldLight {
+  pos: Vec3;
+  color: Vec3;
+  radius: number;
+  /**
+   * Size of the billboard flame render/fire-fx.ts should draw here: 1 is a
+   * wall-torch head, ~0.4 a candle, ~1.7 a hearth. Omitted means "no visible
+   * flame" (a lit window, say). Deriving it from `radius` instead was wrong —
+   * a dungeon torch and a cottage hearth share a radius of 7.
+   */
+  flameScale?: number;
 }
 
 interface EntranceProps {
@@ -192,8 +154,27 @@ export class DungeonManager {
   private notice: { text: string; until: number } | null = null;
   private lastProviderGeneration = 0;
   chestsOpened = 0;
-  /** Chest-loot sink (main.ts deposits into the player inventory). */
-  onLoot: ((items: ItemId[]) => void) | null = null;
+  /**
+   * Loot sink — chests AND enemy drops (main.ts deposits into the pack).
+   *
+   * Widened from `ItemId[]` to `GameItemId[]` so enemy drops can use the same
+   * sink: `ItemId` is the small hand-curated set a Director may name in a
+   * spec, while a drop table reaches the whole item catalogue. `ItemId[]` is
+   * assignable to `GameItemId[]`, so the existing chest call site and the
+   * existing `main.ts` handler are both unchanged.
+   */
+  onLoot: ((items: GameItemId[]) => void) | null = null;
+  /**
+   * A dungeon enemy is loosing a ranged attack. Optional: when unset, ranged
+   * attackers still hit for their damage, they just have no visible arrow.
+   * See the exact `main.ts` wiring in the handover notes.
+   */
+  onEnemyShot: ((e: EntityState, shot: RangedShot) => void) | null = null;
+
+  /** Shared per-tick combat index for the resident dungeon's enemies. */
+  private readonly combat = new CombatIndex();
+  /** Last sim time seen, so mob-vs-mob kills can stamp a corpse timer. */
+  private lastSimTime = 0;
 
   constructor(
     private readonly renderer: Renderer,
@@ -207,6 +188,12 @@ export class DungeonManager {
 
   get isInside(): boolean {
     return this.resident !== null;
+  }
+
+  /** Torch lights of the resident interior, for the renderer's world-light
+   *  set — this is what lights characters and animals underground. */
+  activeLights(): readonly WorldLight[] {
+    return this.resident?.torchLights ?? [];
   }
 
   get interactPrompt(): string | null {
@@ -232,11 +219,25 @@ export class DungeonManager {
     const res = this.resident;
     if (res === null) return;
     const enemies = res.enemies;
-    const def = SPECIES_DEFS[DUNGEON_ENEMY_SPECIES];
-    const rngBase = mulberry32(0xdead1234);
+
+    // Combat index for mob-vs-mob. Rebuilt once for the whole room, not once
+    // per enemy — see `combat-targeting.ts` for why that distinction is the
+    // difference between O(n) and O(n²) here.
+    //
+    // In practice a dungeon warband is all one faction and will not fight
+    // itself, so this mostly matters for what it enables: a wild animal that
+    // followed you in, and (once the caller supplies it) anything else that
+    // ends up down here. It costs one pass over at most 18 entities.
+    this.combat.rebuild(enemies, null, playerX, playerZ);
 
     for (const e of enemies) {
       if (e.mode === 'dead') continue;
+      // Per-enemy, NOT hoisted. It used to be `SPECIES_DEFS['wolf']` fetched
+      // once outside the loop and handed to every enemy, so the instant this
+      // dungeon held two different species they would all have moved at the
+      // wolf's speed, taken the wolf's damage and used the wolf's size for
+      // collision. That was invisible while there was only ever one species.
+      const def = SPECIES_DEFS[e.species];
       const playerDist = Math.hypot(e.x - playerX, e.z - playerZ);
       const rng = mulberry32(((e.walkPhase * 1000) | 0) ^ e.id.charCodeAt(8));
 
@@ -264,13 +265,49 @@ export class DungeonManager {
         moveXZ,
         speciesDef: def,
         onAttackPlayer,
+        combat: this.combat,
+        onAttackEntity: (targetId, damage) => {
+          const t = res.enemies.find((en) => en.id === targetId);
+          if (t === undefined || t.mode === 'dead') return;
+          this._hurtEnemy(t, damage, { id: e.id, kind: 'entity', x: e.x, z: e.z });
+        },
+        // Ranged attackers (the goblin archer) route through here. When the
+        // caller has not wired a projectile renderer, `onRangedAttack` is
+        // absent and `animal-ai` falls back to `onAttackPlayer` — so the
+        // archer is a working enemy before a single arrow is drawn.
+        onRangedAttack: this.onEnemyShot === null ? undefined : (src, shot) => {
+          this.onEnemyShot?.(src, shot);
+          if (shot.kind === 'player') onAttackPlayer(shot.damage);
+          else if (shot.kind === 'entity' && shot.id !== undefined) {
+            const t = res.enemies.find((en) => en.id === shot.id);
+            if (t !== undefined && t.mode !== 'dead') {
+              this._hurtEnemy(t, shot.damage,
+                { id: src.id, kind: 'entity', x: src.x, z: src.z });
+            }
+          }
+        },
       });
 
       // Clamp y to floor (stepAnimal may set it via heightAt, but belt+suspenders).
       e.y = floorY;
     }
+  }
 
-    void rngBase; // suppress unused-var lint
+  /** Apply damage to a dungeon enemy from another creature (never the player). */
+  private _hurtEnemy(
+    e: DungeonEnemy, damage: number, from: DamageSource,
+  ): void {
+    e.hp = Math.max(0, e.hp - damage);
+    if (e.hp <= 0) {
+      e.mode = 'dead';
+      // No `deadAtS` and no drops: a mob-vs-mob kill is not the player's, so
+      // it must not pay them. The corpse still renders through the normal
+      // dead path once `deadAtS` is set by a player kill; here it simply
+      // stops.
+      e.deadAtS = this.lastSimTime;
+      return;
+    }
+    onEntityDamaged(e, from);
   }
 
   /**
@@ -280,16 +317,81 @@ export class DungeonManager {
   attackDungeonEnemy(id: string, damage: number, simTime: number): boolean {
     const res = this.resident;
     if (res === null) return false;
+    this.lastSimTime = simTime;
     const e = res.enemies.find((en) => en.id === id);
     if (!e || e.mode === 'dead') return false;
     e.hp = Math.max(0, e.hp - damage);
     if (e.hp <= 0) {
       e.mode = 'dead';
       e.deadAtS = simTime;
+      this._onEnemyKilled(e);
     } else {
+      // No `from` — this is the player's blow, so the reaction is the original
+      // one: it turns on the player rather than starting a mob-vs-mob hunt.
       onEntityDamaged(e);
     }
     return true;
+  }
+
+  /**
+   * Pay out a player kill and check whether the dungeon is finished.
+   *
+   * Dungeon enemies used to drop nothing at all: `tryLootDeadAnimal` in
+   * `main.ts` is gated behind `!dungeonManager.isInside`, so clearing a room
+   * paid exactly zero and the only reason to fight anything was that it was in
+   * the way. Drops are rolled here instead, through the same `rollDrops`
+   * table the overworld uses and straight into the existing chest-loot sink,
+   * so no new plumbing crosses into `main.ts`.
+   */
+  private _onEnemyKilled(e: DungeonEnemy): void {
+    const res = this.resident;
+    if (res === null) return;
+    // Seeded off the entity id so a given goblin always drops the same thing —
+    // consistent with every other deterministic roll in the dungeon.
+    let h = 0x811c9dc5 >>> 0;
+    for (let i = 0; i < e.id.length; i++) {
+      h ^= e.id.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    const drops = rollDrops(e.species, mulberry32(h));
+    const items: GameItemId[] = [];
+    for (const d of drops) {
+      for (let i = 0; i < d.count; i++) items.push(d.id);
+    }
+    if (items.length > 0) this.onLoot?.(items);
+
+    const name = SPECIES_DEFS[e.species].name;
+    if (e.boss === true) {
+      this.notice = {
+        text: `${name} slain — ${res.entrance.name} is broken`,
+        until: performance.now() + NOTICE_MS * 2,
+      };
+      return;
+    }
+    // "Cleared" is a real state worth telling the player about: it is the
+    // difference between a dungeon being a corridor with loot in it and being
+    // somewhere you finished.
+    const alive = res.enemies.filter((en) => en.mode !== 'dead').length;
+    if (alive === 0) {
+      this.notice = {
+        text: `${res.entrance.name} cleared`,
+        until: performance.now() + NOTICE_MS,
+      };
+    }
+  }
+
+  /** Live enemies remaining, and the total spawned. For the HUD and tests. */
+  enemyCounts(): { alive: number; total: number; bossAlive: boolean } {
+    const res = this.resident;
+    if (res === null) return { alive: 0, total: 0, bossAlive: false };
+    let alive = 0;
+    let bossAlive = false;
+    for (const e of res.enemies) {
+      if (e.mode === 'dead') continue;
+      alive++;
+      if (e.boss === true) bossAlive = true;
+    }
+    return { alive, total: res.enemies.length, bossAlive };
   }
 
   /** Number of discovered (cached, present) entrances so far. */
@@ -393,9 +495,9 @@ export class DungeonManager {
       });
       this.entranceProps = {
         stoneBuffer: make('entrance-stone', stone),
-        stoneCount: stone.length / 3,
+        stoneCount: stone.length / (STRIDE_PROP / 4),
         glowBuffer: make('entrance-glow', glow),
-        glowCount: glow.length / 3,
+        glowCount: glow.length / (STRIDE_PROP / 4),
         lightsBindGroup: this.renderer.createLightsBindGroup(zeroLights),
         draws: new Map(),
       };
@@ -403,17 +505,23 @@ export class DungeonManager {
     const key = `${e.dcx},${e.dcz}`;
     const p = this.entranceProps;
     if (p.draws.has(key)) return;
-    const stoneBg = this.renderer.createObjectBindGroup(e.x, e.y, e.z, 100).bindGroup;
-    const glowBg = this.renderer.createObjectBindGroup(e.x, e.y, e.z, 103).bindGroup;
+    const stone = this.renderer.createObjectBindGroup(e.x, e.y, e.z, 100);
+    const glow = this.renderer.createObjectBindGroup(e.x, e.y, e.z, 103);
     p.draws.set(key, {
       entrance: e,
       draws: [
         {
-          draw: { vertexBuffer: p.stoneBuffer, indexBuffer: null, count: p.stoneCount, bindGroup: stoneBg },
+          draw: {
+            vertexBuffer: p.stoneBuffer, indexBuffer: null, count: p.stoneCount,
+            bindGroup: stone.bindGroup, shadowBindGroup: stone.shadowBindGroup,
+          },
           lightsBindGroup: p.lightsBindGroup,
         },
         {
-          draw: { vertexBuffer: p.glowBuffer, indexBuffer: null, count: p.glowCount, bindGroup: glowBg },
+          draw: {
+            vertexBuffer: p.glowBuffer, indexBuffer: null, count: p.glowCount,
+            bindGroup: glow.bindGroup, shadowBindGroup: glow.shadowBindGroup,
+          },
           lightsBindGroup: p.lightsBindGroup,
         },
       ],
@@ -522,22 +630,32 @@ export class DungeonManager {
       return buffer;
     };
     const makeObject = (w: number, x = origin[0], y = origin[1], z = origin[2]) => {
-      const { bindGroup, buffer } = this.renderer.createObjectBindGroup(x, y, z, w);
+      const { bindGroup, buffer, shadowBindGroup } = this.renderer.createObjectBindGroup(x, y, z, w);
       buffers.push(buffer);
-      return { bindGroup, buffer };
+      return { bindGroup, buffer, shadowBindGroup };
     };
 
     // Torch point lights: count + pos/colorRadius per torch (shader group 2).
     const torches = buildTorchProps(layout);
     const lightsData = new Float32Array(LIGHTS_BUFFER_SIZE / 4);
     lightsData[0] = torches.lights.length;
+    const torchLights: WorldLight[] = [];
     torches.lights.forEach(([lx, ly, lz], i) => {
       const base = 4 + i * 8;
-      lightsData[base + 0] = origin[0] + lx;
-      lightsData[base + 1] = origin[1] + ly;
-      lightsData[base + 2] = origin[2] + lz;
+      const wx = origin[0] + lx, wy = origin[1] + ly, wz = origin[2] + lz;
+      lightsData[base + 0] = wx;
+      lightsData[base + 1] = wy;
+      lightsData[base + 2] = wz;
       lightsData.set(TORCH_COLOR, base + 4);
       lightsData[base + 7] = TORCH_RADIUS;
+      torchLights.push({
+        pos: [wx, wy, wz],
+        // The world-light path has no ambient floor behind it, so torches
+        // need more punch here than the dungeon shader's own copy.
+        color: [TORCH_COLOR[0] * 2.4, TORCH_COLOR[1] * 2.4, TORCH_COLOR[2] * 2.4],
+        radius: TORCH_RADIUS,
+        flameScale: 1,   // every dungeon light is a wall torch
+      });
     });
     const lightsBuffer = this.renderer.device.createBuffer({
       label: 'dungeon-lights',
@@ -550,23 +668,26 @@ export class DungeonManager {
 
     // Interior shell + per-palette prop batches, all sharing the lights BG.
     const draws: DungeonDraw[] = [];
-    const addDraw = (data: Float32Array<ArrayBuffer>, label: string, bindGroup: GPUBindGroup) => {
+    const addDraw = (
+      data: Float32Array<ArrayBuffer>, label: string,
+      obj: { bindGroup: GPUBindGroup; shadowBindGroup: GPUBindGroup },
+    ) => {
       if (data.length === 0) return;
       draws.push({
         draw: {
           vertexBuffer: makeVerts(label, data),
           indexBuffer: null,
-          count: data.length / 3,
-          bindGroup,
+          count: data.length / (STRIDE_PROP / 4),
+          bindGroup: obj.bindGroup,
+          shadowBindGroup: obj.shadowBindGroup,
         },
         lightsBindGroup,
       });
     };
-    addDraw(buildInteriorMesh(layout), `dungeon-mesh(${e.dcx},${e.dcz})`,
-      makeObject(0).bindGroup);
-    addDraw(torches.wood, 'dungeon-torch-wood', makeObject(1).bindGroup);
-    addDraw(torches.flame, 'dungeon-torch-flame', makeObject(2).bindGroup);
-    addDraw(buildPortalMesh(layout), 'dungeon-exit-portal', makeObject(3).bindGroup);
+    addDraw(buildInteriorMesh(layout), `dungeon-mesh(${e.dcx},${e.dcz})`, makeObject(0));
+    addDraw(torches.wood, 'dungeon-torch-wood', makeObject(1));
+    addDraw(torches.flame, 'dungeon-torch-flame', makeObject(2));
+    addDraw(buildPortalMesh(layout), 'dungeon-exit-portal', makeObject(3));
 
     // Chests: shared mesh, per-chest object uniform (position + palette).
     const dkey = `${e.dcx},${e.dcz}`;
@@ -575,15 +696,16 @@ export class DungeonManager {
       ? makeVerts('dungeon-chest', chestVerts) : null;
     const chests: ResidentChest[] = layout.chests.map((c, i) => {
       const opened = this.openedChests.get(dkey)?.has(i) ?? false;
-      const { bindGroup, buffer } = makeObject(
+      const { bindGroup, buffer, shadowBindGroup } = makeObject(
         opened ? 0 : 1,
         origin[0] + c.cell[0] + 0.5, origin[1], origin[2] + c.cell[1] + 0.5);
       draws.push({
         draw: {
           vertexBuffer: chestBuffer!,
           indexBuffer: null,
-          count: chestVerts.length / 3,
+          count: chestVerts.length / (STRIDE_PROP / 4),
           bindGroup,
+          shadowBindGroup,
         },
         lightsBindGroup,
       });
@@ -591,8 +713,11 @@ export class DungeonManager {
     });
 
     const collider = new DungeonCollider(layout, origin);
-    const enemies = spawnDungeonEnemies(layout, origin, this.seed, e.dcx, e.dcz);
-    this.resident = { entrance: e, layout, collider, origin, draws, chests, buffers, enemies };
+    const enemies = spawnDungeonEnemies(layout, spec, origin, this.seed, e.dcx, e.dcz);
+    this.resident = {
+      entrance: e, layout, collider, origin, draws, chests, buffers, enemies,
+      torchLights,
+    };
 
     this.controller.world = collider;
     this.controller.pos = [

@@ -6,10 +6,11 @@
  * `onChange`.
  */
 
-import { ITEM_DEFS } from '../items';
+import { ITEM_DEFS, itemDef } from '../items';
 import { itemIcon } from './item-icons';
 import {
-  moveSlot, equipArmor, unequipArmor, totalDefense, type Inventory, type Slot, type SlotRef,
+  moveSlot, dropSlot, equipArmor, unequipArmor, totalDefense,
+  type Inventory, type Slot, type SlotRef,
 } from '../inventory';
 
 const UI_CSS = `
@@ -98,6 +99,27 @@ const UI_CSS = `
   margin-top: 4px;
   color: rgba(205, 214, 228, 0.8);
   font: 600 11px system-ui, sans-serif;
+}
+.drop-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+.drop-btn {
+  padding: 5px 14px;
+  border-radius: 7px;
+  border: 1px solid #a8443a;
+  background: #3a1f1c;
+  color: #f0cfc9;
+  font: inherit;
+  cursor: pointer;
+}
+.drop-btn:hover { background: #522a25; }
+.drop-msg {
+  font-size: 12px;
+  color: #e8b9a5;
+  min-height: 14px;
 }
 `;
 
@@ -219,6 +241,18 @@ export function buildInventoryPanel(
       }
       refresh();
     });
+    // Right-click discards straight from the slot: one item, or the whole
+    // stack with Shift. The Drop button below is the discoverable route; this
+    // is the fast one for clearing several slots in a row.
+    b.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      const dropped = dropSlot(inv, ref, ev.shiftKey);
+      if (dropped === null) return;
+      src = null;
+      announce(`Dropped ${dropped.count}× ${itemDef(dropped.id).name}`);
+      onChange();
+      refresh();
+    });
     buttons.set(refKey(ref), b);
     return b;
   };
@@ -312,9 +346,51 @@ export function buildInventoryPanel(
   el.appendChild(armorSection);
   el.appendChild(defenseReadout);
 
+  // --- Drop target -----------------------------------------------------
+  // Works like the armor slots: with a slot picked up, clicking here discards
+  // it. A full pack is otherwise a dead end — crafting has nowhere to put its
+  // output, so the player can neither craft nor make room.
+  const dropRow = document.createElement('div');
+  dropRow.className = 'drop-row';
+
+  const dropBtn = document.createElement('button');
+  dropBtn.className = 'drop-btn';
+  dropBtn.textContent = 'Drop';
+  dropBtn.title = 'Pick up a slot, then click here to discard the stack. '
+    + 'Right-click any slot to drop one (Shift for all).';
+  dropBtn.addEventListener('click', () => {
+    if (src === null) {
+      announce('Pick up a slot first, then click Drop');
+      return;
+    }
+    const dropped = dropSlot(inv, src, true);
+    src = null;
+    if (dropped !== null) {
+      announce(`Dropped ${dropped.count}× ${itemDef(dropped.id).name}`);
+      onChange();
+    }
+    refresh();
+  });
+  dropRow.appendChild(dropBtn);
+
+  const dropMsg = document.createElement('span');
+  dropMsg.className = 'drop-msg';
+  dropRow.appendChild(dropMsg);
+  el.appendChild(dropRow);
+
+  /** Transient feedback line. Discarding is irreversible, so it must be
+   *  visibly acknowledged rather than silently swallowing the items. */
+  let msgTimer = 0;
+  function announce(text: string): void {
+    dropMsg.textContent = text;
+    window.clearTimeout(msgTimer);
+    msgTimer = window.setTimeout(() => { dropMsg.textContent = ''; }, 2200);
+  }
+
   const hint = document.createElement('div');
   hint.className = 'hint';
-  hint.textContent = 'Click to pick up, click again to place — Tab to close';
+  hint.textContent = 'Click to pick up, click again to place · '
+    + 'right-click a slot to drop one (Shift = whole stack) · Q drops held · Tab to close';
   el.appendChild(hint);
 
   refresh();

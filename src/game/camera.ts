@@ -14,6 +14,17 @@ export class OrbitCamera {
   /** Interior camera collision (set while inside a dungeon, else terrain). */
   interior: { clampCameraEye(target: Vec3, desired: Vec3): Vec3 } | null = null;
 
+  /**
+   * Hard floor for the camera eye in world Y, or null for none. main.ts raises
+   * this to just above the waterline while the player swims at the surface:
+   * the eye position is what drives the underwater post effect, and a
+   * third-person camera orbiting a floating swimmer otherwise dips below the
+   * surface and fills the screen with blue — which reads as drowning rather
+   * than as swimming. The terrain clamp below cannot cover this, because
+   * under water the terrain is the sea bed.
+   */
+  minEyeY: number | null = null;
+
   constructor(private readonly heightField: HeightField) {}
 
   onMouseMove(dx: number, dy: number) {
@@ -43,6 +54,7 @@ export class OrbitCamera {
     // Terrain: keep the camera above the ground (cheap camera collision).
     const minY = this.heightField.heightAt(eye[0], eye[2]) + 0.5;
     if (eye[1] < minY) eye[1] = minY;
+    if (this.minEyeY !== null && eye[1] < this.minEyeY) eye[1] = this.minEyeY;
     return eye;
   }
 

@@ -62,6 +62,13 @@ export const DROP_TABLE: Record<Species, DropRow[]> = {
     { id: 'bone',         min: 1, max: 2, chance: 1.0  },
     { id: 'egg_dragon',   min: 1, max: 1, chance: 0.15 },
   ],
+  wyvern: [
+    // Fewer scales than a dragon and no egg: a wyvern is the renewable
+    // source, not the trophy.
+    { id: 'dragon_scale', min: 1, max: 3, chance: 1.0  },
+    { id: 'hide',         min: 1, max: 2, chance: 1.0  },
+    { id: 'bone',         min: 1, max: 2, chance: 0.75 },
+  ],
   griffin: [
     { id: 'griffin_feather', min: 2, max: 3, chance: 1.0  },
     { id: 'feather',         min: 2, max: 4, chance: 1.0  },
@@ -70,6 +77,36 @@ export const DROP_TABLE: Record<Species, DropRow[]> = {
   sea_serpent: [
     { id: 'bone',     min: 2, max: 4, chance: 1.0 },
     { id: 'meat_raw', min: 3, max: 5, chance: 1.0 },
+  ],
+
+  // --- dungeon enemies -----------------------------------------------------
+  //
+  // Deliberately coin-and-materials rather than hide and meat: these are the
+  // reason to clear a room, and a dungeon that pays in venison is a dungeon
+  // nobody delves. The boss is the only guaranteed relic source in the game
+  // outside a treasure chest.
+  goblin: [
+    { id: 'gold_small', min: 1, max: 3, chance: 0.75 },
+    { id: 'hide',       min: 1, max: 1, chance: 0.40 },
+    { id: 'bone',       min: 1, max: 1, chance: 0.20 },
+  ],
+  goblin_archer: [
+    { id: 'gold_small', min: 1, max: 3, chance: 0.70 },
+    // Its quiver. The one enemy in the game that pays out ammunition, which
+    // is a real reason to prefer shooting the archers first.
+    { id: 'arrow',      min: 2, max: 5, chance: 0.90 },
+    { id: 'feather',    min: 1, max: 3, chance: 0.60 },
+  ],
+  skeleton: [
+    { id: 'bone',       min: 1, max: 3, chance: 1.0  },
+    { id: 'gold_small', min: 1, max: 4, chance: 0.55 },
+    { id: 'iron_ingot', min: 1, max: 1, chance: 0.18 },
+  ],
+  dread_king: [
+    { id: 'gold_large',     min: 2, max: 4, chance: 1.0  },
+    { id: 'ancient_relic',  min: 1, max: 1, chance: 1.0  },
+    { id: 'iron_ingot',     min: 2, max: 4, chance: 1.0  },
+    { id: 'healing_potion', min: 1, max: 2, chance: 0.60 },
   ],
 };
 

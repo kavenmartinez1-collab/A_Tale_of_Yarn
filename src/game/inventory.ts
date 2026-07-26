@@ -163,6 +163,41 @@ export function removeItem(inv: Inventory, id: GameItemId, count = 1): number {
   return count - need;
 }
 
+/**
+ * Discard items from one pack/hotbar slot. Returns what was dropped, or null
+ * if the slot was already empty.
+ *
+ * `whole` drops the entire stack; otherwise a single item goes. Items are
+ * destroyed rather than left on the ground — there is no world-item entity in
+ * this game, and adding one to solve "my pack is full" would be a much larger
+ * feature than the problem calls for.
+ *
+ * This exists because a full pack is a dead end: crafting needs somewhere to
+ * put its output, so once all 28 pack slots and 5 hotbar slots are occupied
+ * the player cannot craft, and without a discard there is no way back out.
+ */
+export function dropSlot(
+  inv: Inventory,
+  ref: SlotRef,
+  whole = false,
+): { id: GameItemId; count: number } | null {
+  const arr = slots(inv, ref.area);
+  if (ref.index < 0 || ref.index >= arr.length) return null;
+  const s = arr[ref.index];
+  if (s === null) return null;
+
+  const n = whole ? s.count : 1;
+  const id = s.id;
+  s.count -= n;
+  if (s.count <= 0) arr[ref.index] = null;
+  return { id, count: n };
+}
+
+/** True when there is nowhere left to put a new item — the crafting dead end. */
+export function isFull(inv: Inventory): boolean {
+  return inv.pack.every(s => s !== null) && inv.hotbar.every(s => s !== null);
+}
+
 /** Total count of an item across pack + hotbar. */
 export function countItem(inv: Inventory, id: GameItemId): number {
   let n = 0;

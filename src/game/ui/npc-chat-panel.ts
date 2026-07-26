@@ -15,9 +15,13 @@
 
 import type { NpcPersona } from '../npc/npc-prompt';
 import { buildNpcMessages, buildNpcSystemPrompt, npcGenderFor } from '../npc/npc-prompt';
+import {
+  screenPlayerInput, screenNpcReply, safetyDeflection,
+} from '../npc/content-safety';
 import type { ForkedChatContext } from '../../engine/inference';
 import {
   TRADE_CATALOG, SELL_PRICES, extractTradeOffer, extractNpcAction, stripNpcJson,
+  threatActionFor, memoryFactForAction,
   validateTradeAgainstCatalog, validateSellOffer, applyStock,
   type TradeOffer, type CatalogEntry, type NpcRole, type NpcActionKind,
 } from '../npc/npc-trade';
@@ -678,37 +682,133 @@ export type NpcChatFn = (
 /**
  * Selectable NPC dialogue models. Pick with `?npcllm=<key>`.
  *
- * `fast` (the shipped default): huihui-ai's abliterated Qwen3-1.7B
- * (refusal-direction removed — conversations can go anywhere) at Q4_K_M,
- * ~1.11 GB weights. Roughly 2-2.5x faster decode and prefill than the 4B —
- * chat speed is what makes NPC talk feel alive, and 1.7B holds up for
- * roleplay dialogue.
+ * `fast` (the shipped default) and `default` are the SAME stock Qwen3-1.7B
+ * Q4_K_M, ~1.11 GB, Apache-2.0 — which is also what the Dungeon Director runs
+ * (director.ts). One model serves both, the session dedups on `repo::file`, so
+ * the pair costs one download and one set of resident weights.
  *
- * `abliterated`: mlabonne's abliterated Qwen3-4B Q4_K_M, ~2.44 GB weights —
- * smarter, slower; for players who prefer depth over speed.
+ * `large`: stock Qwen3-4B-Instruct-2507 Q4_K_M, ~2.50 GB, same licence, same
+ * ChatML template — a size/quality dial on an identical integration. Measured
+ * far better at the control-JSON contract; see scripts/test-npc-live.mts.
  *
- * `default`: the Director's own Qwen3-4B Q4_K_M, already resident for
- * dungeons — zero extra download, but stock safety training.
+ * `abliterated`: mlabonne's abliterated Qwen3-4B — comparison only, never a
+ * default. See the note on that key.
  *
  * All dense qwen3 arch — supported by the GGUF session (no hybrid layers).
  * Local hf-cache first, HF CDN fallback.
  */
 export const NPC_MODELS = {
-  default: {
-    repo: 'local/flux2-te-qwen3-4b-q4_k_m',
-    file: 'flux2-te-qwen3-4b-q4_k_m.gguf',
+  /**
+   * Shipping default: STOCK Qwen3-1.7B, Apache-2.0, ~1.11 GB.
+   *
+   * Replaced `mradermacher/Qwen3-1.7B-abliterated-GGUF` for two independent
+   * reasons that happen to point the same way (docs/AI_MODEL_LICENSING.md):
+   *
+   * - **Licence.** Apache-2.0 with no cap, no MAU threshold, no acceptable-use
+   *   policy and no gating, declared on the checkpoint itself rather than
+   *   inherited through a chain of community re-uploads. Note that the licence
+   *   that matters is the one on the artefact actually shipped: several
+   *   derivative GGUF repos in this space ship no licence file at all.
+   * - **Safety.** An abliterated model has had its refusal direction removed
+   *   from the weights, which made the content filter in npc/content-safety.ts
+   *   the *only* thing between a crafted prompt and its output. A stock
+   *   instruction-tuned model restores a layer of trained refusal underneath
+   *   it. See docs/AI_GUARDRAILS.md.
+   *
+   * The game's mature tone does NOT depend on abliteration — it comes from the
+   * system prompt, which tells the model adult subjects are open and that it
+   * must not moralise. Stock Qwen3 follows that instruction perfectly well.
+   */
+  fast: {
+    repo: 'unsloth/Qwen3-1.7B-GGUF',
+    file: 'Qwen3-1.7B-Q4_K_M.gguf',
+    emptyThink: true,
   },
+  /**
+   * Smarter/slower stock 4B, same licence and ChatML template. `?npcllm=large`.
+   *
+   * `emptyThink: false` is load-bearing, not a preference. Qwen3-4B-Instruct-2507
+   * is a NON-thinking checkpoint: its template has no `enable_thinking` branch
+   * and it was never trained to see `<think>\n\n</think>\n\n` after the
+   * assistant header. Feeding it one makes it emit `<|im_end|>` immediately —
+   * measured, an empty string with stopReason 'eos' on a prompt the same model
+   * answers correctly with the block removed (scripts/test-npc-live.mts).
+   */
+  large: {
+    repo: 'unsloth/Qwen3-4B-Instruct-2507-GGUF',
+    file: 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf',
+    emptyThink: false,
+  },
+  /**
+   * Alias of `fast` — the model the Director already has resident, so talking
+   * to an NPC costs no second download and no second cold start.
+   *
+   * This key is also the code-level fallback (`npcModel ?? 'default'`, and
+   * preloadNpcChat's parameter default), which is exactly why it must not point
+   * anywhere else: it used to resolve to `local/flux2-te-qwen3-4b-q4_k_m`, an
+   * unlabelled checkpoint with no licence field, meaning any call site that
+   * forgot to pass a model key silently loaded an unlicensed artefact. Keep
+   * this pointed at the same GGUF as `fast`.
+   */
+  default: {
+    repo: 'unsloth/Qwen3-1.7B-GGUF',
+    file: 'Qwen3-1.7B-Q4_K_M.gguf',
+    emptyThink: true,
+  },
+  /**
+   * Abliterated 4B, kept behind `?npcllm=abliterated` for comparison only.
+   * NOT shippable as a default: the upstream GGUF declares no licence, and
+   * removing refusal behaviour is the opposite of what the Steam Content
+   * Survey asks about. Do not make this the default without reading
+   * docs/AI_GUARDRAILS.md.
+   */
   abliterated: {
     repo: 'bartowski/mlabonne_Qwen3-4B-abliterated-GGUF',
     file: 'mlabonne_Qwen3-4B-abliterated-Q4_K_M.gguf',
-  },
-  fast: {
-    repo: 'mradermacher/Qwen3-1.7B-abliterated-GGUF',
-    file: 'Qwen3-1.7B-abliterated.Q4_K_M.gguf',
+    emptyThink: true,
   },
 } as const;
 
 export type NpcModelKey = keyof typeof NPC_MODELS;
+
+// ---------------------------------------------------------------------------
+// AI disclosure (EU AI Act Art. 50)
+// ---------------------------------------------------------------------------
+
+/** Storage key for "the player has seen the first-run AI notice". */
+export const AI_DISCLOSURE_KEY = 'artifex-ai-disclosure:v1';
+
+/**
+ * The first-run notice. Written to be read by a player rather than a lawyer —
+ * a policy paragraph in a speech-bubble UI gets dismissed unread, which would
+ * defeat the point of showing it.
+ *
+ * It states the three things that actually matter: the dialogue is generated,
+ * it is generated on this machine (so the player knows nothing is being sent
+ * anywhere), and it can be wrong or offensive because nothing is scripted.
+ */
+export const AI_DISCLOSURE_TEXT =
+  'These villagers are not scripted. Everything they say is written on the fly '
+  + 'by an AI model running on your own machine — nothing you type is sent '
+  + 'anywhere. It can be strange, wrong, or say things no one wrote or intended. '
+  + 'You are talking to software, not a person.';
+
+/** True once the first-run notice has been shown on this browser profile. */
+export function aiDisclosureSeen(): boolean {
+  try {
+    return localStorage.getItem(AI_DISCLOSURE_KEY) !== null;
+  } catch {
+    // Private mode / storage disabled: show it every session rather than never.
+    return false;
+  }
+}
+
+/** Record that the notice has been shown. Failure is non-fatal by design. */
+export function markAiDisclosureSeen(): void {
+  try {
+    localStorage.setItem(AI_DISCLOSURE_KEY, String(Date.now()));
+  } catch { /* storage unavailable — the notice simply shows again */ }
+}
 
 export function isNpcModelKey(x: string): x is NpcModelKey {
   return Object.prototype.hasOwnProperty.call(NPC_MODELS, x);
@@ -741,17 +841,34 @@ async function buildLiveChatFn(
   // turns prefill only the new tokens.
   const ctx: ForkedChatContext = session.forkKV !== undefined ? session.forkKV() : session;
   _chatCtx = ctx;
+  _chatEmptyThink = model.emptyThink;
 
   return async (messages: ChatMessage[], onToken?: (chunk: string) => void) => {
     // Marathon-conversation guard: the attention kernel rejects prompts at or
     // above 2048 tokens (generate.ts throws → this chat would silently fall
-    // back to stub forever). Estimate ~3.5 chars/token and drop the oldest
-    // user+assistant pair (keeping the system prompt) until we fit.
+    // back to stub forever). Estimate ~3.5 chars/token and drop whole
+    // user+assistant pairs, keeping the system prompt.
+    //
+    // Trimming to exactly the budget is the obvious implementation and it is a
+    // performance trap. Any dropped pair shifts every token after the system
+    // prompt, so the KV cache stops being a prefix of the new prompt and the
+    // turn pays a FULL re-prefill. Trim-to-the-line means the conversation sits
+    // permanently at the budget and re-prefills on every single turn from then
+    // on. Measured: turns 1-6 took 240-714 ms TTFT, and from turn 7 — the first
+    // trimmed turn — every turn cost 16.5-19.3 s, against a 20 s watchdog that
+    // then serves the player a canned line for the rest of the conversation.
+    //
+    // So trim down to a LOW-WATER mark instead. The next few turns fit under
+    // the budget without trimming and extend the cache normally, which turns a
+    // per-turn stall into one stall every few turns.
     const PROMPT_CHAR_BUDGET = 1600 * 3.5;
+    const PROMPT_CHAR_LOW_WATER = PROMPT_CHAR_BUDGET * 0.6;
     let msgs = messages;
     const chars = (m: ChatMessage[]) => m.reduce((n, x) => n + x.content.length, 0);
-    while (msgs.length > 3 && chars(msgs) > PROMPT_CHAR_BUDGET) {
-      msgs = [msgs[0], ...msgs.slice(3)];
+    if (chars(msgs) > PROMPT_CHAR_BUDGET) {
+      while (msgs.length > 3 && chars(msgs) > PROMPT_CHAR_LOW_WATER) {
+        msgs = [msgs[0], ...msgs.slice(3)];
+      }
     }
     // Serialize against any in-flight warm prefill on the same fork.
     const prior = _genChain;
@@ -772,7 +889,7 @@ async function buildLiveChatFn(
           sawToken = true;
           onToken?.(chunk);
         },
-        { enableThinking: false, emptyThink: true },
+        { enableThinking: false, emptyThink: model.emptyThink },
       );
       // TTFT watchdog: if no token arrives within the deadline (GPU
       // contention, pathological prefill), abort and throw — the caller's
@@ -780,8 +897,18 @@ async function buildLiveChatFn(
       const timer = setTimeout(() => { if (!sawToken) handle.abort(); }, NPC_TTFT_DEADLINE_MS);
       try {
         const r = await handle.result;
-        if (r.stopReason === 'aborted' && r.text === '') {
-          throw new Error('NPC chat: aborted before first token (TTFT watchdog)');
+        // An aborted turn is never a usable reply, even when it is not empty.
+        // abort() is not instantaneous: the decode step already on the GPU
+        // still lands, so a watchdog firing at the exact moment the first
+        // token arrives returns ONE token. Testing against the real game
+        // produced NPCs whose entire answer was `*` — the opening character of
+        // a `*wipes hands on apron*` gesture — shown to the player as dialogue,
+        // because the old check only rejected the empty string.
+        //
+        // Anything this short is a fragment, not an answer; throwing hands the
+        // turn to the canned reply, which is at least a whole sentence.
+        if (r.stopReason === 'aborted' && stripNpcJson(r.text).trim().length < 20) {
+          throw new Error('NPC chat: aborted with no usable text (TTFT watchdog)');
         }
         return r.text;
       } finally {
@@ -804,6 +931,14 @@ let _liveChatFn: NpcChatFn | null = null;
 let _chatFnBuilding = false;
 /** NPC chat's private KV fork (set by buildLiveChatFn; null until loaded). */
 let _chatCtx: ForkedChatContext | null = null;
+/**
+ * Whether the loaded model needs the empty `<think></think>` preamble. Mirrors
+ * NPC_MODELS[key].emptyThink and is set by buildLiveChatFn, because
+ * warmNpcChat() is module-level and has no model key of its own — and the warm
+ * prefill MUST render the same preamble as the real turns or the cached tokens
+ * stop being a strict prefix and every turn pays a full re-prefill.
+ */
+let _chatEmptyThink = true;
 /** Serializes generate() calls on the fork (warm prefill vs. chat turns). */
 let _genChain: Promise<unknown> = Promise.resolve();
 
@@ -831,7 +966,7 @@ export function warmNpcChat(persona: NpcPersona): void {
         // prompt, keeping the strict-prefix invariant.
         { temperature: 0, topP: 1, repetitionPenalty: 1.0, maxNewTokens: 1 },
         undefined,
-        { enableThinking: false, emptyThink: true, addGenerationPrompt: false },
+        { enableThinking: false, emptyThink: _chatEmptyThink, addGenerationPrompt: false },
       );
       await handle.result;
     } catch { /* warm is best-effort */ } finally {
@@ -933,6 +1068,11 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
   const currentRecord = stockMap[sk];
   const currentStock: CatalogEntry[] = currentRecord.catalog;
 
+  /** Disposition a single conversation can add, however long it runs. */
+  const WARMTH_PER_CONVERSATION = 6;
+  /** How much this conversation has already granted. */
+  let sessionWarmth = 0;
+
   // Persist the (potentially freshly-initialised or regen'd) record immediately.
   saveStockMap(stockMap);
 
@@ -952,6 +1092,32 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
   // Romance (Phase N6): gender is name-derived; romance/spouse persist.
   persona.gender = npcGenderFor(persona.name);
   persona.romance = memRec.romance;
+
+  // Live trade context. All three of these existed in the game and none of
+  // them reached the model, which is why NPC conversation felt thin: every
+  // merchant recited the same static role catalogue, none of them knew what
+  // they had actually sold, and none could see that the traveller was carrying
+  // forty pelts and a sack of ore.
+  persona.stock = currentStock
+    .map((e) => ({ id: e.id, price: e.price, count: e.stock }));
+  persona.gold = currentRecord.gold;
+  // What this NPC would buy, priced from SELL_PRICES, capped at what they can
+  // actually pay. Sorted by value so a short list leads with the good stuff.
+  {
+    const seen = new Map<string, number>();
+    for (const slot of [...inventory.pack, ...inventory.hotbar]) {
+      if (slot === null) continue;
+      if (slot.id === 'gold_small') continue; // nobody buys your money
+      const price = SELL_PRICES[slot.id];
+      if (price === undefined) continue;
+      seen.set(slot.id, (seen.get(slot.id) ?? 0) + slot.count);
+    }
+    persona.playerWares = [...seen.entries()]
+      .map(([id, count]) => ({ id, price: SELL_PRICES[id as GameItemId] ?? 0, count }))
+      .filter((w) => w.price > 0)
+      .sort((a, b) => b.price * b.count - a.price * a.count)
+      .slice(0, 8); // keep the prompt short; the model only needs the highlights
+  }
   persona.spouse = memRec.spouse;
 
   /** Persist a remembered fact (with optional disposition shift). */
@@ -1018,7 +1184,12 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
 
   const hint = document.createElement('div');
   hint.className = 'hint';
-  hint.textContent = 'Enter to send  ·  Esc to close';
+  // AI disclosure. EU AI Act Article 50(1) (applicable 2 August 2026) requires
+  // people be informed they are interacting with an AI system unless it is
+  // obvious from context. A talking villager in a fantasy game is arguably
+  // obvious, but "arguably" is not a compliance position, and the line costs
+  // nothing. See docs/AI_MODEL_LICENSING.md.
+  hint.textContent = 'Enter to send  ·  Esc to close  ·  replies are AI-generated';
   chatCol.appendChild(hint);
 
   const tradeCol = document.createElement('div');
@@ -1336,6 +1507,32 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
       adjustRomance(memRec, FLIRT_ROMANCE_GAIN);
       adjustDisposition(memRec, 3);
       persona.romance = memRec.romance;
+
+  // Live trade context. All three of these existed in the game and none of
+  // them reached the model, which is why NPC conversation felt thin: every
+  // merchant recited the same static role catalogue, none of them knew what
+  // they had actually sold, and none could see that the traveller was carrying
+  // forty pelts and a sack of ore.
+  persona.stock = currentStock
+    .map((e) => ({ id: e.id, price: e.price, count: e.stock }));
+  persona.gold = currentRecord.gold;
+  // What this NPC would buy, priced from SELL_PRICES, capped at what they can
+  // actually pay. Sorted by value so a short list leads with the good stuff.
+  {
+    const seen = new Map<string, number>();
+    for (const slot of [...inventory.pack, ...inventory.hotbar]) {
+      if (slot === null) continue;
+      if (slot.id === 'gold_small') continue; // nobody buys your money
+      const price = SELL_PRICES[slot.id];
+      if (price === undefined) continue;
+      seen.set(slot.id, (seen.get(slot.id) ?? 0) + slot.count);
+    }
+    persona.playerWares = [...seen.entries()]
+      .map(([id, count]) => ({ id, price: SELL_PRICES[id as GameItemId] ?? 0, count }))
+      .filter((w) => w.price > 0)
+      .sort((a, b) => b.price * b.count - a.price * a.count)
+      .slice(0, 8); // keep the prompt short; the model only needs the highlights
+  }
       persona.disposition = memRec.disposition;
       saveMemoryMap(memoryMap);
       const t = romanceTone(memRec.romance);
@@ -1351,6 +1548,32 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
       marry(memoryMap, sk);
       persona.spouse = true;
       persona.romance = memRec.romance;
+
+  // Live trade context. All three of these existed in the game and none of
+  // them reached the model, which is why NPC conversation felt thin: every
+  // merchant recited the same static role catalogue, none of them knew what
+  // they had actually sold, and none could see that the traveller was carrying
+  // forty pelts and a sack of ore.
+  persona.stock = currentStock
+    .map((e) => ({ id: e.id, price: e.price, count: e.stock }));
+  persona.gold = currentRecord.gold;
+  // What this NPC would buy, priced from SELL_PRICES, capped at what they can
+  // actually pay. Sorted by value so a short list leads with the good stuff.
+  {
+    const seen = new Map<string, number>();
+    for (const slot of [...inventory.pack, ...inventory.hotbar]) {
+      if (slot === null) continue;
+      if (slot.id === 'gold_small') continue; // nobody buys your money
+      const price = SELL_PRICES[slot.id];
+      if (price === undefined) continue;
+      seen.set(slot.id, (seen.get(slot.id) ?? 0) + slot.count);
+    }
+    persona.playerWares = [...seen.entries()]
+      .map(([id, count]) => ({ id, price: SELL_PRICES[id as GameItemId] ?? 0, count }))
+      .filter((w) => w.price > 0)
+      .sort((a, b) => b.price * b.count - a.price * a.count)
+      .slice(0, 8); // keep the prompt short; the model only needs the highlights
+  }
       persona.disposition = memRec.disposition;
       addFact(memRec, 'we are married');
       saveMemoryMap(memoryMap);
@@ -1394,16 +1617,18 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
       return;
     }
     conversationOver = true;
-    const reason = action.reason ?? 'player was hostile to me';
+    // NOTE: `action.reason` is the model's own free text. It is NOT persisted —
+    // memoryFactForAction() supplies a first-party line instead. See that
+    // function for why (it is a transparency-law condition, not just taste).
     if (action.action === 'hostile') {
       appendMsg('system', `${persona.name} turns hostile!`);
-      remember(reason, -45);
+      remember(memoryFactForAction('hostile'), -45);
     } else if (action.action === 'afraid') {
       appendMsg('system', `${persona.name} flees in fear!`);
-      remember(reason, -25);
+      remember(memoryFactForAction('afraid'), -25);
     } else {
       appendMsg('system', `${persona.name} ends the conversation.`);
-      if (action.reason !== undefined) remember(reason, -5);
+      if (action.reason !== undefined) remember(memoryFactForAction('end'), -5);
     }
     input.disabled = true;
     sendBtn.disabled = true;
@@ -1420,16 +1645,48 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
     }
   }
 
-  /** Process a completed NPC reply: update history, check for trade offer. */
-  function onReplyComplete(replyText: string): void {
+  /**
+   * Process a completed NPC reply: update history, check for trade offer.
+   *
+   * `playerSaid` is the message that produced this reply, used only for the
+   * deterministic threat floor below. Omitted for the canned opening line.
+   */
+  function onReplyComplete(replyText: string, playerSaid?: string): void {
     _state.lastReply = replyText;
     history.push({ role: 'assistant', content: replyText });
 
     // Conversation consequences take precedence over trade offers.
-    const npcAction = extractNpcAction(replyText);
+    let npcAction = extractNpcAction(replyText);
+    // Deterministic floor: a 1.7B reliably fails to emit the action verb when
+    // threatened (0/4 measured, both the current and previous default — see
+    // threatActionFor). Without this, threatening an NPC has consequences in
+    // stub mode and none with the live model loaded. The model's own verb
+    // still wins; this only fills the gap when it emitted nothing at all.
+    if (npcAction === null && playerSaid !== undefined) {
+      const kind = detectThreat(playerSaid);
+      if (kind !== null) npcAction = threatActionFor(persona.role, kind);
+    }
     if (npcAction !== null) {
       handleNpcAction(npcAction);
       return;
+    }
+
+    // Conversation itself warms the relationship.
+    //
+    // Nothing did, before. Disposition moved only on trades (+2), gifts (+4)
+    // and flirts (+3), against a 'friendly' threshold of 25 — so reaching it
+    // took roughly a dozen transactions, and a twenty-turn heart-to-heart left
+    // you exactly as much a stranger as when you walked up. In a game whose
+    // headline feature is talking to people, talking was the one thing that
+    // did not count.
+    //
+    // Capped per conversation so it cannot be farmed by spamming "hello", and
+    // small enough that four or five real conversations is what carries a
+    // stranger to friendly — which is about right for a villager.
+    if (sessionWarmth < WARMTH_PER_CONVERSATION) {
+      sessionWarmth++;
+      adjustDisposition(memRec, 1);
+      saveMemoryMap(memoryMap);
     }
 
     // Try to extract a trade offer.
@@ -1463,6 +1720,24 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
     input.disabled = true;
 
     appendMsg('user', text);
+
+    // --- guardrail, input side ------------------------------------------
+    // Screened BEFORE the model sees it, so prohibited content is never
+    // generated in the first place rather than caught afterwards. The turn is
+    // kept out of `history` entirely: leaving it in would feed it back as
+    // context on every subsequent turn and steer the whole conversation.
+    const inVerdict = screenPlayerInput(text);
+    if (inVerdict.blocked) {
+      const deflection = safetyDeflection(persona.name + text.length);
+      appendReply(deflection);
+      // eslint-disable-next-line no-console
+      console.warn(`[safety] blocked player input (${inVerdict.category}/${inVerdict.detail})`);
+      sendBtn.disabled = false;
+      input.disabled = false;
+      input.focus();
+      return;
+    }
+
     history.push({ role: 'user', content: text });
 
     const messages = buildNpcMessages(persona, history.slice(0, -1), text);
@@ -1472,13 +1747,13 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
       if (typeof window.__NPC_CHAT_MOCK__ === 'function') {
         const reply = String(await window.__NPC_CHAT_MOCK__(messages));
         appendReply(reply);
-        onReplyComplete(reply);
+        onReplyComplete(reply, text);
       } else {
         // Simulate a tiny async delay so the UI renders before the reply.
         await new Promise<void>((r) => setTimeout(r, 40));
         const reply = stubReply(persona, text, currentStock, currentRecord.gold);
         appendReply(reply);
-        onReplyComplete(reply);
+        onReplyComplete(reply, text);
       }
     } else {
       // Live mode: attempt LLM call, fall back to stub on any error.
@@ -1512,8 +1787,18 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
         replyEl.className = 'msg assistant';
         historyEl.appendChild(replyEl);
 
+        // Streaming means partial text is on screen before the reply is
+        // finished, so the guardrail has to run on the buffer as it grows —
+        // screening only the completed reply would let a prohibited sentence
+        // be visible for the second or two it takes to finish generating.
+        let streamBlocked = false;
         const fullReply = await chatFn(messages, (chunk: string) => {
           buffer += chunk;
+          if (!streamBlocked && screenNpcReply(buffer).blocked) {
+            streamBlocked = true;
+            replyEl.textContent = '';
+          }
+          if (streamBlocked) return;
           // Strip control JSON live so the player never sees it mid-stream.
           replyEl.textContent = stripNpcJson(buffer);
           scrollBottom();
@@ -1548,17 +1833,32 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
           }
         }
 
+        // --- guardrail, output side ---------------------------------------
+        // Final screen on the assembled reply. Discarded rather than edited:
+        // a partially-redacted line reads as broken, and the redacted text
+        // would still enter `history` as context for the next turn.
+        const outVerdict = screenNpcReply(finalReply);
+        if (streamBlocked || outVerdict.blocked) {
+          replyEl.textContent = safetyDeflection(persona.name + finalReply.length);
+          scrollBottom();
+          // eslint-disable-next-line no-console
+          console.warn(`[safety] blocked model output (${outVerdict.category ?? 'stream'}/${outVerdict.detail ?? 'partial'})`);
+          // Deliberately NOT passed to onReplyComplete: that is what commits
+          // the turn to history, memory and disposition.
+          return;
+        }
+
         const shown = stripNpcJson(finalReply);
         if (shown === '') replyEl.remove();
         else replyEl.textContent = shown;
         scrollBottom();
-        onReplyComplete(finalReply);
+        onReplyComplete(finalReply, text);
       } catch {
         thinkingEl.remove();
         // Fall back to stub on any LLM error.
         const reply = stubReply(persona, text, currentStock, currentRecord.gold);
         appendReply(reply);
-        onReplyComplete(reply);
+        onReplyComplete(reply, text);
         // Repair the KV fork in the background: a watchdog-aborted turn
         // leaves the cache ending in generation-preamble tokens the next
         // turn can't extend (full re-prefill → another abort). Re-warming
@@ -1618,6 +1918,29 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
   if (openingLine !== undefined && !bountyGuard) {
     greetingText = openingLine;
   }
+  // First-run AI disclosure, shown once per browser profile, ahead of the very
+  // first line any NPC speaks. The persistent hint under the input box covers
+  // the steady state; this covers the moment the player first meets the
+  // feature, which is what "in-context disclosure" actually means.
+  //
+  // Two separate obligations land on this, and one line satisfies both:
+  //   - EU AI Act Art. 50(1) — inform people they are interacting with an AI.
+  //     Single-player game NPCs are a listed example of the "obvious from
+  //     context" carve-out, but the Commission's guidelines (C(2026) 5054
+  //     final, 20 July 2026, ¶38) say out-of-band disclosure "may complement,
+  //     though not replace, in-context disclosure". Cheaper to show it than to
+  //     argue obviousness.
+  //   - The same guidelines' ¶88, the route by which real-time game dialogue
+  //     may be exempted from Art. 50(2) machine-readable marking, requires as
+  //     one of its conjunctive conditions that "the persons exposed to the
+  //     content are made aware that the content is AI-generated". This IS that
+  //     condition. Do not remove it without reading
+  //     docs/AI_TRANSPARENCY_GAP_ANALYSIS.md.
+  if (!aiDisclosureSeen()) {
+    appendMsg('system', AI_DISCLOSURE_TEXT);
+    markAiDisclosureSeen();
+  }
+
   appendMsg('assistant', greetingText);
   history.push({ role: 'assistant', content: greetingText });
   _state.lastReply = greetingText;

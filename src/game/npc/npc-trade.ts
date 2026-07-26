@@ -6,7 +6,7 @@
 import { ITEM_DEFS, type GameItemId } from '../items';
 
 /** Bump when the NPC prompt/trade logic changes materially. */
-export const NPC_PROMPT_VERSION = 9; // v9: open-topic conversation rules (no blocks)
+export const NPC_PROMPT_VERSION = 13; // v13: + shared village facts and concerns
 
 export type NpcRole = 'farmer' | 'villager' | 'merchant' | 'guard';
 
@@ -172,6 +172,76 @@ export interface NpcAction {
   action: NpcActionKind;
   /** Short in-fiction reason, e.g. "player threatened my wife". */
   reason?: string;
+}
+
+/**
+ * The memory line stored when an NPC acts on `kind`.
+ *
+ * Deliberately a closed, first-party set rather than the model's own
+ * `reason` string, which used to be written straight to localStorage via
+ * remember() → addFact() → saveMemoryMap() and then fed back into every later
+ * system prompt as `persona.memoryFacts`.
+ *
+ * Two reasons, and the second is the one that forced the change:
+ *
+ * 1. Quality — an arbitrary generated fragment becomes permanent, cross-session
+ *    context for that NPC. A bad one is a bad prompt forever.
+ * 2. Transparency law — the Commission's Art. 50 guidelines (C(2026) 5054
+ *    final, 20 July 2026) offer real-time game dialogue an exemption from the
+ *    machine-readable marking duty at ¶88, but the conditions are CONJUNCTIVE
+ *    and one of them is that the content is "not recorded, stored or
+ *    disseminated further". Persisting generated prose to disk is exactly
+ *    that. See docs/AI_TRANSPARENCY_GAP_ANALYSIS.md.
+ *
+ * The model still emits `reason` — it is in the prompt contract and it makes
+ * the model justify its own verb — it is used for the on-screen line and then
+ * dropped. Nothing generated reaches disk.
+ */
+export function memoryFactForAction(kind: NpcActionKind): string {
+  switch (kind) {
+    case 'hostile': return 'they threatened me and I turned on them';
+    case 'afraid': return 'they frightened me badly';
+    case 'end': return 'they said something that ended our talk';
+    case 'charmed': return 'they charmed me';
+    case 'accept_proposal': return 'I accepted their proposal';
+    case 'reject_proposal': return 'I turned down their proposal';
+    case 'follow': return 'I agreed to travel with them';
+    case 'stay': return 'they asked me to stay behind';
+    case 'invite_home': return 'I welcomed them into my home';
+  }
+}
+
+/**
+ * The action an NPC of `role` takes when threatened or insulted.
+ *
+ * This exists because the model cannot be relied on to emit the verb. Measured
+ * with scripts/test-npc-live.mts: BOTH the current stock Qwen3-1.7B and the
+ * abliterated 1.7B that shipped before it emit an action JSON on 0 of 4
+ * explicit threats — a drawn sword, a death threat, a robbery demand and an
+ * insult to the NPC's husband all produced an in-character alarmed reply with
+ * no `{"action":...}` anywhere in it. A 1.7B simply does not hold the negative
+ * constraint ("never during civil conversation") and the positive one at the
+ * same time; the 4B does much better but is not the default.
+ *
+ * The consequence was that `?director=off` stub mode punished threats and the
+ * LIVE path did not — threatening a merchant with the real model loaded was
+ * strictly safer than with it off. This restores the floor: the deterministic
+ * scan decides, and the model's own verb still wins when it emits one.
+ *
+ * Mirrors the mapping in stubReply (npc-chat-panel.ts): merchants panic,
+ * everyone else stands their ground.
+ */
+export function threatActionFor(
+  role: NpcRole,
+  kind: 'threat' | 'insult',
+): NpcAction {
+  if (role === 'merchant' && kind === 'threat') {
+    return { action: 'afraid', reason: 'player threatened me' };
+  }
+  return {
+    action: 'hostile',
+    reason: kind === 'threat' ? 'player threatened me' : 'player insulted me',
+  };
 }
 
 function parseRawAction(parsed: unknown): NpcAction | null {

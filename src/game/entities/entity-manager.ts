@@ -22,8 +22,37 @@ import type { EcologyDirector } from './ecology-director';
 /** Dead entities don't respawn for this many real seconds (10 min). */
 export const RESPAWN_S = 600;
 
-/** Max live entities across all loaded cells. */
+/** Max live entities across all loaded cells. Safety net, not the main limiter. */
 export const LIVE_CAP = 40;
+
+/**
+ * Entities are materialised within this radius of the player and released
+ * beyond it.
+ *
+ * This used to be whole-cell: loading a cell instantiated every spawn in its
+ * 512 m square, and the live cap then culled back to 40 farthest-first. Two
+ * things went wrong with that. The 3x3 neighbourhood is 2.36 km2, so the
+ * entire 40-entity budget was spread over a ~690 m radius while the renderer
+ * only draws to 120 m — measured, 90% of land positions had no animal within
+ * 60 m and the median nearest was 146 m. And because a cell was only ever
+ * populated once, on load, anything the cap culled while it was distant never
+ * came back as the player walked toward it.
+ *
+ * Materialising by distance instead spends the budget where it can be seen,
+ * and makes the population continuously correct as the player moves. Sits
+ * comfortably outside the renderer's 120 m RENDER_DIST so nothing pops into
+ * existence inside the visible window.
+ */
+export const LIVE_RADIUS = 170;
+
+/** Hysteresis on release, so pacing back and forth over the edge doesn't thrash. */
+export const RELEASE_RADIUS = LIVE_RADIUS * 1.3;
+
+/**
+ * Matches a streamed scatter id ("cx,cz:e{i}"). Only these can be released by
+ * distance — a debug-spawned entity has no spawn record to rebuild it from.
+ */
+const STREAMED_ID = /^-?\d+,-?\d+:e\d+$/;
 
 /** Persistence keys. */
 export const ENTITY_KILLED_KEY = 'artifex-entities:v1';
@@ -32,7 +61,22 @@ export const ENTITY_KILLED_KEY = 'artifex-entities:v1';
 // Types
 // ---------------------------------------------------------------------------
 
-export type EntityMode = 'idle' | 'graze' | 'wander' | 'flee' | 'aggro' | 'dead' | 'follow';
+/**
+ * 'defend' is the owned-animal counterpart of 'aggro': a tamed mount or pet
+ * intercepting something that is coming after its owner. It is deliberately
+ * separate from 'aggro' so nothing that reads "is this creature hostile to the
+ * player" (crime, taming, loot) ever mistakes a bodyguard for a threat.
+ */
+/**
+ * 'hunt' is mob-vs-mob combat: this creature is fighting another creature or
+ * an NPC, not the player. Kept separate from 'aggro' for exactly the reason
+ * 'defend' is — everything that asks "is this thing hostile to the PLAYER"
+ * (crime, taming, loot, the mount-defence scan) must not mistake a wolf eating
+ * a deer for a threat to anyone. See `animal-ai.ts`.
+ */
+export type EntityMode =
+  'idle' | 'graze' | 'wander' | 'flee' | 'aggro' | 'dead' | 'follow' | 'defend'
+  | 'hunt';
 
 export interface EntityState {
   id: string;
@@ -193,8 +237,13 @@ export class EntityManager {
   /** All currently live entities, keyed by id. */
   readonly entities = new Map<string, EntityState>();
 
-  /** Set of cell keys ("cx,cz") currently loaded. */
-  private loadedCells = new Set<string>();
+  /**
+   * Spawn points for each loaded cell, keyed "cx,cz". Holding the spawn list
+   * separately from the live entities is what lets an animal be released when
+   * it is far away and rebuilt when the player comes back — the old code threw
+   * the spawn list away after materialising it once.
+   */
+  private cellSpawns = new Map<string, EntitySpawn[]>();
 
   /** Killed registry: id → { killedAtS (wall-clock ms) }. */
   readonly killedRegistry: Map<string, KilledRecord>;
@@ -221,8 +270,9 @@ export class EntityManager {
   // -------------------------------------------------------------------------
 
   /**
-   * Call each frame (or whenever the player moves).  Streams in/out the 3×3
-   * cell neighbourhood, enforces the live cap, and prunes the killed registry.
+   * Call each frame (or whenever the player moves). Keeps spawn lists for the
+   * 3×3 cell neighbourhood, materialises every spawn within LIVE_RADIUS,
+   * releases live entities past RELEASE_RADIUS, and prunes the killed registry.
    */
   update(playerX: number, playerZ: number): void {
     const nowMs = Date.now();
@@ -230,7 +280,8 @@ export class EntityManager {
 
     const [pcx, pcz] = cellOf(playerX, playerZ);
 
-    // Collect the 3×3 neighbourhood keys.
+    // Collect the 3×3 neighbourhood keys. At 512 m per cell this always
+    // contains everything within LIVE_RADIUS of the player.
     const needed = new Set<string>();
     for (let dx = -1; dx <= 1; dx++) {
       for (let dz = -1; dz <= 1; dz++) {
@@ -239,21 +290,24 @@ export class EntityManager {
     }
 
     // Unload cells no longer in range.
-    for (const key of this.loadedCells) {
+    for (const key of [...this.cellSpawns.keys()]) {
       if (!needed.has(key)) {
         this._unloadCell(key);
       }
     }
 
-    // Load cells newly in range.
+    // Compute spawn lists for cells newly in range. This is position maths
+    // only — no entity objects are built here.
     for (const key of needed) {
-      if (!this.loadedCells.has(key)) {
+      if (!this.cellSpawns.has(key)) {
         const [cx, cz] = key.split(',').map(Number) as [number, number];
-        this._loadCell(cx, cz);
+        this.cellSpawns.set(key, this._spawnsForCell(cx, cz));
       }
     }
 
-    // Enforce live cap: remove entities from farthest cells first.
+    this._materialiseNear(playerX, playerZ, nowMs);
+    this._releaseFar(playerX, playerZ);
+    // Backstop only — distance selection normally keeps the count well under.
     this._enforceCap(playerX, playerZ);
   }
 
@@ -315,11 +369,9 @@ export class EntityManager {
   // Private helpers
   // -------------------------------------------------------------------------
 
-  private _loadCell(cx: number, cz: number): void {
-    const key = `${cx},${cz}`;
-    if (this.loadedCells.has(key)) return;
-    this.loadedCells.add(key);
-
+  /** Spawn points for a cell — EcologySpec herds when a director is attached,
+   *  else the deterministic scatter. No entity objects are created. */
+  private _spawnsForCell(cx: number, cz: number): EntitySpawn[] {
     // Determine spawns: use EcologySpec herds when available, else deterministic scatter.
     let spawns: EntitySpawn[];
     if (this.ecologyDirector !== null) {
@@ -343,34 +395,53 @@ export class EntityManager {
     } else {
       spawns = entitiesForCell(this.seed, cx, cz, this.heightAt, this.biomeAt);
     }
+    return spawns;
+  }
 
-    const nowMs = Date.now();
-    for (const spawn of spawns) {
-      // Skip if in killed registry and not yet expired.
-      const killed = this.killedRegistry.get(spawn.id);
-      if (killed !== undefined && nowMs - killed.killedAtS < RESPAWN_S * 1000) continue;
+  /** Bring every not-yet-live spawn inside LIVE_RADIUS into existence. */
+  private _materialiseNear(playerX: number, playerZ: number, nowMs: number): void {
+    const r2 = LIVE_RADIUS * LIVE_RADIUS;
+    for (const spawns of this.cellSpawns.values()) {
+      for (const spawn of spawns) {
+        const dx = spawn.x - playerX, dz = spawn.z - playerZ;
+        if (dx * dx + dz * dz > r2) continue;
+        if (this.entities.has(spawn.id)) continue;
+        // Skip if in killed registry and not yet expired.
+        const killed = this.killedRegistry.get(spawn.id);
+        if (killed !== undefined && nowMs - killed.killedAtS < RESPAWN_S * 1000) continue;
 
-      if (this.entities.has(spawn.id)) continue;
+        const rng = entityRng(spawn.id);
+        const y = this._yFor(spawn.species, spawn.x, spawn.z);
+        this.entities.set(spawn.id, {
+          id: spawn.id,
+          species: spawn.species,
+          x: spawn.x,
+          y,
+          z: spawn.z,
+          yaw: rng() * Math.PI * 2,
+          hp: SPECIES_DEFS[spawn.species].hp,
+          mode: 'idle',
+          walkPhase: 0,
+          colorVariant: variantFromId(spawn.id),
+          homeX: spawn.x,
+          homeZ: spawn.z,
+          stateTimer: rng() * 3, // stagger timers so they don't all act at once
+          fleeTimer: 0,
+        });
+      }
+    }
+  }
 
-      const rng = entityRng(spawn.id);
-      const y = this._yFor(spawn.species, spawn.x, spawn.z);
-      const e: EntityState = {
-        id: spawn.id,
-        species: spawn.species,
-        x: spawn.x,
-        y,
-        z: spawn.z,
-        yaw: rng() * Math.PI * 2,
-        hp: SPECIES_DEFS[spawn.species].hp,
-        mode: 'idle',
-        walkPhase: 0,
-        colorVariant: variantFromId(spawn.id),
-        homeX: spawn.x,
-        homeZ: spawn.z,
-        stateTimer: rng() * 3, // stagger timers so they don't all act at once
-        fleeTimer: 0,
-      };
-      this.entities.set(spawn.id, e);
+  /** Release streamed entities that have fallen well outside the live window. */
+  private _releaseFar(playerX: number, playerZ: number): void {
+    const r2 = RELEASE_RADIUS * RELEASE_RADIUS;
+    for (const [id, e] of this.entities) {
+      // Owned (babies / tamed) and npcOwned (stable horses) entities are never
+      // streamed out; debug spawns have no spawn record to rebuild them from.
+      if (e.owned || e.npcOwned) continue;
+      if (!STREAMED_ID.test(id)) continue;
+      const dx = e.x - playerX, dz = e.z - playerZ;
+      if (dx * dx + dz * dz > r2) this.entities.delete(id);
     }
   }
 
@@ -387,20 +458,39 @@ export class EntityManager {
     for (const herd of spec.herds) {
       const species = herd.species as Species;
       const def = SPECIES_DEFS[species];
-      // Anchor point for the herd within the cell.
-      const ax = cx * ECELL + rng() * ECELL;
-      const az = cz * ECELL + rng() * ECELL;
 
-      for (let k = 0; k < herd.count; k++) {
-        const jx = ax + (rng() * 2 - 1) * 12;
-        const jz = az + (rng() * 2 - 1) * 12;
-        const h = this.heightAt(jx, jz);
-        if (def.water) {
-          if (h >= -8) continue;
-        } else {
-          if (h < 1) continue;
+      // A herd is a population of the cell, not a single huddle. Giving each
+      // herd one anchor made every 512 m cell 2–3 tight ±12 m blobs with
+      // hundreds of empty metres between them — coverage, not headcount, is
+      // what made the map read as dead. Break the herd into subgroups that
+      // graze apart from one another.
+      let remaining = herd.count;
+      while (remaining > 0) {
+        const n = Math.min(remaining, 1 + Math.floor(rng() * 3)); // 1–3
+        remaining -= n;
+        // Give the subgroup a few tries at ground it can actually stand on.
+        // A single uniform draw meant coastal cells lost most of their
+        // wildlife to the habitat test below — see entity-scatter.ts.
+        let ax = 0, az = 0, sited = false;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          ax = cx * ECELL + rng() * ECELL;
+          az = cz * ECELL + rng() * ECELL;
+          const h = this.heightAt(ax, az);
+          if (def.water ? h < -8 : h >= 1) { sited = true; break; }
         }
-        spawns.push({ id: `${prefix}${spawns.length}`, species, x: jx, z: jz });
+        if (!sited) continue;
+
+        for (let k = 0; k < n; k++) {
+          const jx = ax + (rng() * 2 - 1) * 12;
+          const jz = az + (rng() * 2 - 1) * 12;
+          const h = this.heightAt(jx, jz);
+          if (def.water) {
+            if (h >= -8) continue;
+          } else {
+            if (h < 1) continue;
+          }
+          spawns.push({ id: `${prefix}${spawns.length}`, species, x: jx, z: jz });
+        }
       }
     }
     return spawns;
@@ -417,7 +507,7 @@ export class EntityManager {
         this.entities.delete(id);
       }
     }
-    this.loadedCells.delete(key);
+    this.cellSpawns.delete(key);
   }
 
   private _enforceCap(playerX: number, playerZ: number): void {

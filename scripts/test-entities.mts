@@ -72,23 +72,29 @@ const ALL_ITEM_IDS = new Set(Object.keys(ITEM_DEFS));
 // ---------------------------------------------------------------------------
 
 {
-  const expected11: Species[] = [
+  // Twelve overworld creatures plus the four dungeon enemies. The enemies
+  // carry `biomes: []` so they can never leak into the overworld — asserted
+  // separately below rather than assumed from this list.
+  const expectedAll: Species[] = [
     'rabbit', 'deer', 'bird', 'horse', 'cow',
-    'donkey', 'wolf', 'bear', 'dragon', 'griffin', 'sea_serpent',
+    'donkey', 'wolf', 'bear', 'dragon', 'wyvern', 'griffin', 'sea_serpent',
+    'goblin', 'goblin_archer', 'skeleton', 'dread_king',
   ];
   check(
-    'SPECIES_DEFS has exactly 11 species',
-    ALL_SPECIES.length === 11 &&
-      expected11.every((s) => s in SPECIES_DEFS),
+    'SPECIES_DEFS has exactly 16 species',
+    ALL_SPECIES.length === expectedAll.length &&
+      expectedAll.every((s) => s in SPECIES_DEFS),
+    `got ${ALL_SPECIES.length}: ${ALL_SPECIES.join(', ')}`,
   );
 }
 
 {
   const rares = ALL_SPECIES.filter((s) => SPECIES_DEFS[s].rare);
   check(
-    'Rare species are exactly dragon, griffin, sea_serpent',
-    rares.length === 3 &&
+    'Rare species are exactly dragon, wyvern, griffin, sea_serpent',
+    rares.length === 4 &&
       rares.includes('dragon') &&
+      rares.includes('wyvern') &&
       rares.includes('griffin') &&
       rares.includes('sea_serpent'),
     `got: ${rares.join(', ')}`,
@@ -97,10 +103,10 @@ const ALL_ITEM_IDS = new Set(Object.keys(ITEM_DEFS));
 
 {
   const mountables = ALL_SPECIES.filter((s) => SPECIES_DEFS[s].mountable);
-  const expected = ['horse', 'cow', 'donkey', 'dragon', 'griffin'] as Species[];
+  const expected = ['horse', 'cow', 'donkey', 'dragon', 'wyvern', 'griffin'] as Species[];
   check(
-    'Mountable species are exactly horse, cow, donkey, dragon, griffin',
-    mountables.length === 5 && expected.every((s) => mountables.includes(s)),
+    'Mountable species are exactly horse, cow, donkey, dragon, wyvern, griffin',
+    mountables.length === 6 && expected.every((s) => mountables.includes(s)),
     `got: ${mountables.join(', ')}`,
   );
 }
@@ -368,7 +374,12 @@ check('ECELL is 512', ECELL === 512);
   const goldenHash = fnv32a(goldenJson);
 
   // Baked hash (computed on first run, then hardcoded):
-  const GOLDEN_HASH = 0x7d751885; // rebaselined: wolf/bear biome expansion (desert/beach/jungle pressure)
+  // Rebaselined for the spawn-density pass: 7–11 groups of 2–5 (was 2–5 of
+  // 1–3), plus anchors now retry up to 5 times to find land instead of being
+  // dropped when they fall in water. Measured effect on a player standing on
+  // land: animals within 100 m 0.93 -> 3.30, median nearest 146 m -> 64 m.
+  // Previous: 0x7d751885 (wolf/bear biome expansion).
+  const GOLDEN_HASH = 0x7931ab44;
 
   check(
     `FNV-32 golden hash == 0x${GOLDEN_HASH.toString(16).padStart(8, '0')}`,

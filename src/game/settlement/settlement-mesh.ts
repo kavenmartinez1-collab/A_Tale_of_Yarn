@@ -1,149 +1,164 @@
 /**
  * Settlement meshes — world-space triangle soups batched by dungeon-pipeline
- * palette (stone 0, wood 1, torch 2, thatch 4, plaster 5, berry 7), so a whole
- * settlement draws in ≤ 6 calls with the surface material mode (100 + palette)
- * and zeroed lights, exactly like dungeon entrance arches.
+ * palette, so a whole settlement draws in one call per palette it uses with
+ * the surface material mode (100 + palette) and zeroed lights, exactly like
+ * dungeon entrance arches.
  *
  * Buildings sit on the resolved pad height (highest footprint corner) with a
  * stone platform skirt extending below to hide slope gaps — heightAt stays
  * pure, no terrain flattening.
+ *
+ * The big builders live next door: settlement-buildings.ts (church, tavern,
+ * longhouse, smithy, mill, town house, granary, cottage, barn) and
+ * settlement-props.ts (carts, crops, hedges, graves, washing, braziers…).
+ * This file owns the castle/utility vocabulary and the dispatch + batching.
  */
 
-import { box, quad, type P3 } from '../mesh-utils';
+import { appendYaw, cone, cylinder } from '../mesh-utils';
 import type { ResolvedPad, ResolvedSettlement } from './settlement-layout';
+import {
+  ALL_PALETTES, emptyBuckets, PAL_BERRY, PAL_LEAF, PAL_PLASTER, PAL_STONE,
+  PAL_THATCH, PAL_TIMBER, PAL_TORCH, PAL_WOOD, PAL_WOOL, SKIRT_DEPTH,
+  type Buckets, type SettlementFlame,
+} from './settlement-palette';
+import {
+  buildBarn, buildChurch, buildGranary, buildHouse, buildLonghouse, buildMill,
+  buildSmithy, buildTavern, buildTownhouse,
+} from './settlement-buildings';
+import {
+  buildBanner, buildBarrels, buildBrazier, buildCart, buildCrops, buildGraves,
+  buildHaystack, buildHedge, buildPillory, buildShrine, buildTrough,
+  buildWashline, buildWoodpile,
+} from './settlement-props';
+import { beam, bevelBoxN, boxN, roof } from './settlement-shapes';
 
-/** Palette indices (dungeon.wgsl): keep in sync with the shader table. */
-export const PAL_STONE = 0;
-export const PAL_WOOD = 1;
-export const PAL_TORCH = 2;   // emissive — lamps/braziers glow at night
-export const PAL_THATCH = 4;
-export const PAL_PLASTER = 5;
-export const PAL_BERRY = 7;   // dark crimson — banners/market goods
+export {
+  ALL_PALETTES, PAL_BERRY, PAL_LEAF, PAL_PLASTER, PAL_STONE, PAL_THATCH,
+  PAL_TIMBER, PAL_TORCH, PAL_WOOD, PAL_WOOL,
+} from './settlement-palette';
+export type { SettlementFlame } from './settlement-palette';
 
-const ALL_PALETTES = [
-  PAL_STONE, PAL_WOOD, PAL_TORCH, PAL_THATCH, PAL_PLASTER, PAL_BERRY,
-] as const;
-
-const SKIRT_DEPTH = 2.5; // platform skirt below the pad (m)
-
-type Buckets = Record<(typeof ALL_PALETTES)[number], number[]>;
-
-function emptyBuckets(): Buckets {
-  return {
-    [PAL_STONE]: [], [PAL_WOOD]: [], [PAL_TORCH]: [],
-    [PAL_THATCH]: [], [PAL_PLASTER]: [], [PAL_BERRY]: [],
-  };
-}
-
-function tri(verts: number[], a: P3, b: P3, c: P3): void {
-  verts.push(...a, ...b, ...c);
-}
-
-/** Gabled prism roof: ridge along local x at y0+rise, overhang o. */
-function roof(
-  thatch: number[], gable: number[],
-  w: number, d: number, y0: number, rise: number, o: number,
+/**
+ * Append one pad's local-space geometry into the palette buckets.
+ * `flames` (optional) collects PAL_TORCH fixture anchors in the same local
+ * space, so they stay pinned to the geometry that emits them.
+ */
+function buildPad(
+  pad: ResolvedPad, b: Buckets, flames?: SettlementFlame[],
 ): void {
-  const W = w / 2 + o;
-  const D = d / 2 + o;
-  const y2 = y0 + rise;
-  // Slopes (outward normals verified against mesh-utils winding).
-  quad(thatch, [-W, y2, 0], [W, y2, 0], [W, y0, -D], [-W, y0, -D]); // front -z
-  quad(thatch, [W, y2, 0], [-W, y2, 0], [-W, y0, D], [W, y0, D]);   // back +z
-  // Gable end triangles.
-  tri(gable, [-W, y0, -D], [-W, y0, D], [-W, y2, 0]); // -x
-  tri(gable, [W, y0, D], [W, y0, -D], [W, y2, 0]);    // +x
-}
-
-/** Append one pad's local-space geometry into the palette buckets. */
-function buildPad(pad: ResolvedPad, b: Buckets): void {
   const hw = pad.w / 2;
   const hd = pad.d / 2;
   const h = pad.h;
+  const v = pad.v ?? 0;
   switch (pad.type) {
-    case 'house': {
-      box(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3);
-      box(b[PAL_PLASTER], -hw, 0.08, -hd, hw, h, hd);
-      // Timber frame: corner posts proud of the plaster.
-      for (const sx of [-1, 1]) {
-        for (const sz of [-1, 1]) {
-          box(b[PAL_WOOD],
-            sx * hw - 0.12, 0.08, sz * hd - 0.12,
-            sx * hw + 0.12, h, sz * hd + 0.12);
-        }
-      }
-      // Horizontal beams across the front and back faces (top + waist).
-      for (const sz of [-1, 1]) {
-        const z0 = sz * hd - (sz < 0 ? 0.06 : -0.02);
-        const z1 = sz * hd + (sz < 0 ? 0.02 : 0.06);
-        box(b[PAL_WOOD], -hw - 0.04, h - 0.26, z0, hw + 0.04, h - 0.06, z1);
-        box(b[PAL_WOOD], -hw - 0.04, h * 0.45, z0, hw + 0.04, h * 0.45 + 0.16, z1);
-      }
-      box(b[PAL_WOOD], -0.45, 0.08, -hd - 0.06, 0.45, 1.7, -hd + 0.02); // door
-      // Shuttered windows flanking the door.
-      for (const sx of [-1, 1]) {
-        box(b[PAL_WOOD],
-          sx * hw * 0.55 - 0.3, 1.05, -hd - 0.04,
-          sx * hw * 0.55 + 0.3, 1.65, -hd + 0.02);
-      }
-      // Stone chimney rising past the roof ridge on the back-right corner.
-      const rise = pad.d * 0.45;
-      box(b[PAL_STONE], hw - 0.75, h - 0.2, hd - 0.95, hw - 0.15, h + rise + 0.35, hd - 0.35);
-      roof(b[PAL_THATCH], b[PAL_PLASTER], pad.w, pad.d, h, rise, 0.3);
-      break;
-    }
-    case 'barn': {
-      box(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3);
-      box(b[PAL_WOOD], -hw, 0.08, -hd, hw, h, hd);
-      box(b[PAL_STONE], -0.9, 0.08, -hd - 0.06, 0.9, 2.2, -hd + 0.02); // door
-      roof(b[PAL_THATCH], b[PAL_WOOD], pad.w, pad.d, h, pad.d * 0.4, 0.35);
-      break;
-    }
+    // --- delegated builders ------------------------------------------------
+    case 'house': buildHouse(b, pad.w, pad.d, h, v); break;
+    case 'townhouse': buildTownhouse(b, pad.w, pad.d, h, v); break;
+    case 'barn': buildBarn(b, pad.w, pad.d, h, v); break;
+    case 'church': buildChurch(b, pad.w, pad.d, h); break;
+    case 'tavern': buildTavern(b, pad.w, pad.d, h, flames); break;
+    case 'longhouse': buildLonghouse(b, pad.w, pad.d, h); break;
+    case 'smithy': buildSmithy(b, pad.w, pad.d, h, flames); break;
+    case 'mill': buildMill(b, pad.w, pad.d, h); break;
+    case 'granary': buildGranary(b, pad.w, pad.d, h); break;
+    case 'cart': buildCart(b, pad.w, pad.d, h, v); break;
+    case 'woodpile': buildWoodpile(b, pad.w, pad.d, h, v); break;
+    case 'haystack': buildHaystack(b, pad.w, pad.d, h, v); break;
+    case 'crops': buildCrops(b, pad.w, pad.d, h, v); break;
+    case 'graves': buildGraves(b, pad.w, pad.d, h, v); break;
+    case 'washline': buildWashline(b, pad.w, pad.d, h, v); break;
+    case 'trough': buildTrough(b, pad.w, pad.d, h, v); break;
+    case 'brazier': buildBrazier(b, pad.w, pad.d, h, v, flames); break;
+    case 'banner': buildBanner(b, pad.w, pad.d, h, v); break;
+    case 'pillory': buildPillory(b, pad.w, pad.d, h, v); break;
+    case 'shrine': buildShrine(b, pad.w, pad.d, h, v); break;
+    case 'hedge': buildHedge(b, pad.w, pad.d, h, v); break;
+    case 'barrels': buildBarrels(b, pad.w, pad.d, h, v); break;
+
+    // --- utility + castle vocabulary --------------------------------------
     case 'well': {
-      box(b[PAL_STONE], -0.9, -1.5, -0.9, 0.9, 0.05, 0.9); // skirt
-      // Low wall ring.
-      box(b[PAL_STONE], -0.75, 0, -0.75, 0.75, h, -0.45);
-      box(b[PAL_STONE], -0.75, 0, 0.45, 0.75, h, 0.75);
-      box(b[PAL_STONE], -0.75, 0, -0.45, -0.45, h, 0.45);
-      box(b[PAL_STONE], 0.45, 0, -0.45, 0.75, h, 0.45);
+      const dry = v === 1;
+      boxN(b[PAL_STONE], -0.9, -1.5, -0.9, 0.9, 0.05, 0.9); // skirt
+      // Round wall ring (hollow tube — no caps — reads as a stone well shaft).
+      cylinder(b[PAL_STONE], 0, 0, 0, 0.75, 0.72, h, 8, false, false);
+      cylinder(b[PAL_STONE], 0, h - 0.1, 0, 0.8, 0.78, 0.12, 8, false, false);
+      if (dry) {
+        // Abandoned: the roof is gone and the coping has fallen in.
+        boxN(b[PAL_STONE], -0.72, h - 0.05, -0.3, -0.1, h + 0.24, 0.36);
+        boxN(b[PAL_LEAF], -0.86, 0.05, -0.86, 0.86, 0.34, -0.5);
+        boxN(b[PAL_LEAF], 0.42, 0.05, -0.3, 0.9, 0.42, 0.5);
+        break;
+      }
       // Posts + mini thatch roof.
-      box(b[PAL_WOOD], -0.72, h, -0.06, -0.6, 1.9, 0.06);
-      box(b[PAL_WOOD], 0.6, h, -0.06, 0.72, 1.9, 0.06);
-      roof(b[PAL_THATCH], b[PAL_WOOD], 1.5, 1.2, 1.9, 0.5, 0.1);
+      cylinder(b[PAL_WOOD], -0.66, h, 0, 0.07, 0.055, 1.95 - h, 6, false, true);
+      cylinder(b[PAL_WOOD], 0.66, h, 0, 0.07, 0.055, 1.95 - h, 6, false, true);
+      // Winch drum, crank handle, rope and bucket.
+      cylinder(b[PAL_WOOD], -0.6, 1.42, 0, 0.11, 0.11, 1.2, 6, false, false);
+      beam(b[PAL_TIMBER], 0.68, 1.42, 0, 0.68, 1.42, 0.34, 0.045, 0.045);
+      beam(b[PAL_TIMBER], 0.68, 1.42, 0.34, 0.9, 1.16, 0.34, 0.045, 0.045);
+      boxN(b[PAL_WOOD], -0.03, h + 0.15, -0.03, 0.03, 1.42, 0.03);
+      cylinder(b[PAL_TIMBER], 0, h - 0.08, 0, 0.17, 0.2, 0.26, 7, true, false);
+      boxN(b[PAL_LEAF], -0.82, 0.02, 0.34, -0.3, 0.28, 0.86);
+      roof(b[PAL_THATCH], b[PAL_WOOD], 1.6, 1.3, 1.95, 0.55, 0.12);
       break;
     }
     case 'fence': {
       // Rails + posts every ~2 m; sunk 1 m so slopes don't leave gaps.
-      box(b[PAL_WOOD], -hw, 0.42, -0.05, hw, 0.54, 0.05);
-      box(b[PAL_WOOD], -hw, 0.78, -0.05, hw, 0.9, 0.05);
+      bevelBoxN(b[PAL_WOOD], -hw, 0.42, -0.05, hw, 0.54, 0.05);
+      bevelBoxN(b[PAL_WOOD], -hw, 0.78, -0.05, hw, 0.9, 0.05);
       const posts = Math.max(2, Math.round(pad.w / 2) + 1);
       for (let i = 0; i < posts; i++) {
         const x = -hw + (i / (posts - 1)) * pad.w;
-        box(b[PAL_WOOD], x - 0.06, -1, -0.06, x + 0.06, pad.h, 0.06);
+        cylinder(b[PAL_WOOD], x, -1, 0, 0.07, 0.055, pad.h + 1, 6, false, true);
       }
       break;
     }
     case 'ruin': {
       // Broken wall block, sunk into the ground (no skirt needed).
-      box(b[PAL_STONE], -hw, -1.5, -hd, hw, h, hd);
+      bevelBoxN(b[PAL_STONE], -hw, -1.5, -hd, hw, h, hd);
+      if (h > 0.8) {
+        // A broken-off tooth on top, and moss creeping up the shaded face.
+        boxN(b[PAL_STONE], -hw * 0.45, h, -hd, hw * 0.15, h + 0.26 + hw * 0.1, hd);
+        // Weeds at the foot of the wall. This used to be a tall panel of
+        // PAL_LEAF up the wall face, which read as a bright green decal
+        // pasted on the stone rather than as moss.
+        boxN(b[PAL_LEAF], -hw + 0.05, 0.0, hd - 0.04, -hw + 0.6, 0.3, hd + 0.16);
+        boxN(b[PAL_LEAF], hw - 0.66, 0.0, -hd - 0.16, hw - 0.2, 0.24, -hd + 0.02);
+      }
       break;
     }
     case 'signpost': {
-      box(b[PAL_WOOD], -0.07, -1, -0.07, 0.07, h, 0.07);
-      box(b[PAL_WOOD], -0.55, h - 0.65, -0.05, 0.55, h - 0.15, 0.05); // board
+      boxN(b[PAL_STONE], -0.36, -0.4, -0.36, 0.36, 0.16, 0.36);
+      cylinder(b[PAL_WOOD], 0, -1, 0, 0.075, 0.06, h + 1, 6, false, true);
+      cone(b[PAL_WOOD], 0, h, 0, 0.1, 0.22, 6, false);
+      bevelBoxN(b[PAL_TIMBER], -0.58, h - 0.68, -0.05, 0.58, h - 0.16, 0.05);
+      bevelBoxN(b[PAL_TIMBER], -0.42, h - 1.24, -0.05, 0.42, h - 0.82, 0.05);
       break;
     }
     case 'tower': {
       // Solid stone tower with overhanging crenellated cap + torch brazier.
-      box(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3); // skirt
-      box(b[PAL_STONE], -hw, 0.08, -hd, hw, h, hd); // shaft
-      // Arrow slits on two faces at two heights (dark plaster insets).
+      bevelBoxN(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3);
+      bevelBoxN(b[PAL_STONE], -hw, 0.08, -hd, hw, h, hd); // shaft
+      // Battered base: a thicker skirt of masonry, which is both how a real
+      // tower is built and what stops it reading as an extruded rectangle.
+      bevelBoxN(b[PAL_STONE], -hw - 0.3, 0.08, -hd - 0.3, hw + 0.3, 1.3, hd + 0.3);
+      // Arrow slits on two faces at two heights (dark insets).
       for (const sy of [0.35, 0.6]) {
-        box(b[PAL_PLASTER], -0.12, h * sy, -hd - 0.03, 0.12, h * (sy + 0.14), -hd + 0.02);
-        box(b[PAL_PLASTER], hw - 0.02, h * sy, -0.12, hw + 0.03, h * (sy + 0.14), 0.12);
+        boxN(b[PAL_TIMBER], -0.12, h * sy, -hd - 0.03, 0.12, h * (sy + 0.14), -hd + 0.02);
+        boxN(b[PAL_TIMBER], hw - 0.02, h * sy, -0.12, hw + 0.03, h * (sy + 0.14), 0.12);
+      }
+      // Corbels under the overhanging cap.
+      for (let i = 0; i < 4; i++) {
+        const t = -hw + ((i + 0.5) / 4) * pad.w;
+        for (const sz of [-1, 1]) {
+          boxN(b[PAL_STONE], t - 0.14, h - 0.55, sz * hd - 0.02, t + 0.14, h - 0.15, sz * (hd + 0.26));
+        }
+        for (const sx of [-1, 1]) {
+          boxN(b[PAL_STONE], sx * hd - 0.02, h - 0.55, t - 0.14, sx * (hd + 0.26), h - 0.15, t + 0.14);
+        }
       }
       // Overhanging cap slab (machicolation suggestion).
-      box(b[PAL_STONE], -hw - 0.25, h - 0.15, -hd - 0.25, hw + 0.25, h + 0.05, hd + 0.25);
+      bevelBoxN(b[PAL_STONE], -hw - 0.25, h - 0.15, -hd - 0.25, hw + 0.25, h + 0.05, hd + 0.25);
       // Merlons around the cap rim: corners + mid-edges.
       const mHalf = 0.32;
       const cx = hw - 0.1;
@@ -153,195 +168,291 @@ function buildPad(pad: ResolvedPad, b: Buckets): void {
         [0, -cz], [0, cz], [-cx, 0], [cx, 0],        // mid-edges
       ];
       for (const [mx, mz] of merlonPts) {
-        box(b[PAL_STONE],
+        boxN(b[PAL_STONE],
           mx - mHalf, h + 0.05, mz - mHalf,
           mx + mHalf, h + 0.9, mz + mHalf);
       }
-      // Torch brazier at the center of the platform.
-      box(b[PAL_WOOD], -0.09, h + 0.05, -0.09, 0.09, h + 1.0, 0.09);
-      box(b[PAL_TORCH], -0.18, h + 1.0, -0.18, 0.18, h + 1.35, 0.18);
+      // Torch brazier at the centre of the platform, and a pennant.
+      cylinder(b[PAL_TIMBER], 0, h + 0.05, 0, 0.1, 0.08, 0.95, 6, false, true);
+      boxN(b[PAL_TORCH], -0.19, h + 1.0, -0.19, 0.19, h + 1.38, 0.19);
+      flames?.push({ x: 0, y: h + 1.08, z: 0, scale: 1.55 });
+      cylinder(b[PAL_WOOD], cx - 0.1, h + 0.9, cz - 0.1, 0.055, 0.045, 2.1, 5, false, true);
+      boxN(b[PAL_BERRY], cx - 0.12, h + 2.2, cz - 0.1, cx + 0.85, h + 2.72, cz - 0.06);
       break;
     }
     case 'wall': {
       // Curtain-wall segment, stone with walkway.
-      box(b[PAL_STONE], -hw - 0.2, -SKIRT_DEPTH, -hd - 0.2, hw + 0.2, 0.08, hd + 0.2); // skirt
-      box(b[PAL_STONE], -hw, 0.08, -hd, hw, h, hd); // main body
+      bevelBoxN(b[PAL_STONE], -hw - 0.2, -SKIRT_DEPTH, -hd - 0.2, hw + 0.2, 0.08, hd + 0.2);
+      bevelBoxN(b[PAL_STONE], -hw, 0.08, -hd, hw, h, hd); // main body
+      // Battered plinth on the outer (-z) face.
+      boxN(b[PAL_STONE], -hw, 0.08, -hd - 0.28, hw, 1.15, -hd + 0.02);
       // Walkway floor on top.
-      box(b[PAL_STONE], -hw, h, -hd, hw, h + 0.1, hd);
-      // Low parapet on outer face (-z side) topped with crenellated merlons.
-      box(b[PAL_STONE], -hw, h + 0.1, -hd, hw, h + 0.5, -hd + 0.3);
-      const merlons = Math.max(2, Math.round(pad.w / 2.2));
+      bevelBoxN(b[PAL_STONE], -hw, h, -hd, hw, h + 0.1, hd);
+      // Low parapet on outer face topped with crenellated merlons.
+      bevelBoxN(b[PAL_STONE], -hw, h + 0.1, -hd, hw, h + 0.5, -hd + 0.32);
+      const merlons = Math.max(2, Math.round(pad.w / 2.6));
       for (let mi = 0; mi < merlons; mi++) {
         const mx = -hw + ((mi + 0.5) / merlons) * pad.w;
-        box(b[PAL_STONE], mx - 0.35, h + 0.5, -hd, mx + 0.35, h + 1.1, -hd + 0.3);
+        boxN(b[PAL_STONE], mx - 0.35, h + 0.5, -hd, mx + 0.35, h + 1.15, -hd + 0.32);
+        // Corbel every other merlon — at 50 m of curtain wall, one under each
+        // is a thousand vertices for a shadow you cannot resolve.
+        if (mi % 2 === 0) {
+          boxN(b[PAL_STONE], mx - 0.2, h - 0.4, -hd - 0.22, mx + 0.2, h - 0.05, -hd + 0.02);
+        }
+      }
+      // Inner-face buttresses carrying the walkway.
+      const buts = Math.max(2, Math.round(pad.w / 5));
+      for (let i = 0; i < buts; i++) {
+        const bx = -hw + ((i + 0.5) / buts) * pad.w;
+        boxN(b[PAL_STONE], bx - 0.35, 0.08, hd - 0.02, bx + 0.35, h * 0.72, hd + 0.45);
       }
       break;
     }
     case 'stable': {
       // Open-sided horse stable: stone base, wood frame, thatch roof.
-      box(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3); // skirt
-      box(b[PAL_STONE], -hw, 0.08, -hd, hw, 0.3, hd); // low stone base
-      // Wood frame walls (left/right/back — front -z side open).
-      box(b[PAL_WOOD], -hw, 0.3, hd - 0.2, hw, h, hd); // back wall
-      box(b[PAL_WOOD], -hw, 0.3, -hd, -hw + 0.2, h, hd); // left wall
-      box(b[PAL_WOOD],  hw - 0.2, 0.3, -hd,  hw, h, hd); // right wall
-      // Stall dividers.
+      bevelBoxN(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3);
+      bevelBoxN(b[PAL_STONE], -hw, 0.08, -hd, hw, 0.3, hd); // low stone base
+      bevelBoxN(b[PAL_WOOD], -hw, 0.3, hd - 0.2, hw, h, hd);   // back wall
+      bevelBoxN(b[PAL_WOOD], -hw, 0.3, -hd, -hw + 0.2, h, hd); // left wall
+      bevelBoxN(b[PAL_WOOD], hw - 0.2, 0.3, -hd, hw, h, hd);   // right wall
+      // Stall dividers, a half-door on each, and hay on the floor.
       const stalls = Math.max(2, Math.round(pad.w / 2));
       for (let si = 1; si < stalls; si++) {
         const sx2 = -hw + (si / stalls) * pad.w;
-        box(b[PAL_WOOD], sx2 - 0.06, 0.3, -hd + 0.2, sx2 + 0.06, h * 0.7, hd);
+        boxN(b[PAL_WOOD], sx2 - 0.07, 0.3, -hd + 0.2, sx2 + 0.07, h * 0.72, hd);
       }
-      // Thatch roof.
-      roof(b[PAL_THATCH], b[PAL_WOOD], pad.w, pad.d, h, pad.d * 0.4, 0.3);
+      for (let si = 0; si < stalls; si++) {
+        const cx2 = -hw + ((si + 0.5) / stalls) * pad.w;
+        const sw = (pad.w / stalls) * 0.42;
+        boxN(b[PAL_TIMBER], cx2 - sw, 0.3, -hd + 0.16, cx2 + sw, 1.25, -hd + 0.3);
+        boxN(b[PAL_THATCH], cx2 - sw, 0.3, hd - 1.0, cx2 + sw, 0.52, hd - 0.28);
+      }
+      // Head beam and a hanging bridle.
+      boxN(b[PAL_TIMBER], -hw, h - 0.28, -hd + 0.1, hw, h - 0.04, -hd + 0.32);
+      boxN(b[PAL_TIMBER], hw - 0.62, h - 1.35, -hd + 0.28, hw - 0.42, h - 0.3, -hd + 0.4);
+      roof(b[PAL_THATCH], b[PAL_WOOD], pad.w, pad.d, h, pad.d * 0.42, 0.34);
       break;
     }
     case 'gatehouse': {
-      // Heavy stone gatehouse: two flanking piers with arched passthrough.
-      box(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3); // skirt
-      // Left pier.
-      box(b[PAL_STONE], -hw, 0.08, -hd, -2.2, h, hd);
-      // Right pier.
-      box(b[PAL_STONE],  2.2, 0.08, -hd,  hw, h, hd);
-      // Arch lintel (over the passage).
-      box(b[PAL_STONE], -2.2, 2.4, -hd, 2.2, h, hd);
-      // Raised portcullis: vertical wood bars hanging in the arch mouth.
-      for (let pi = 0; pi < 4; pi++) {
-        const px2 = -1.5 + pi;
-        box(b[PAL_WOOD], px2 - 0.09, 1.6, -hd - 0.05, px2 + 0.09, 2.55, -hd + 0.03);
+      // Heavy stone gatehouse: two flanking piers with an arched passage.
+      bevelBoxN(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3);
+      bevelBoxN(b[PAL_STONE], -hw, 0.08, -hd, -2.2, h, hd); // left pier
+      bevelBoxN(b[PAL_STONE], 2.2, 0.08, -hd, hw, h, hd);   // right pier
+      bevelBoxN(b[PAL_STONE], -2.2, 2.6, -hd, 2.2, h, hd);  // lintel over passage
+      // Half-round flanking turrets, which is what makes a gate read as a gate.
+      for (const sxg of [-1, 1]) {
+        cylinder(b[PAL_STONE], sxg * (hw - 0.3), 0.08, -hd - 0.1, 1.15, 1.0, h + 0.5, 8, false, false);
+        cylinder(b[PAL_STONE], sxg * (hw - 0.3), h + 0.5, -hd - 0.1, 1.3, 1.25, 0.32, 8, false, true);
+        for (let m = 0; m < 5; m++) {
+          const a = Math.PI * (0.15 + (m / 4) * 0.7) + Math.PI;
+          boxN(b[PAL_STONE],
+            sxg * (hw - 0.3) + Math.cos(a) * 1.05 - 0.22, h + 0.8, -hd - 0.1 + Math.sin(a) * 1.05 - 0.22,
+            sxg * (hw - 0.3) + Math.cos(a) * 1.05 + 0.22, h + 1.5, -hd - 0.1 + Math.sin(a) * 1.05 + 0.22);
+        }
       }
-      box(b[PAL_WOOD], -2.0, 2.35, -hd - 0.05, 2.0, 2.6, -hd + 0.03); // header bar
+      // Raised portcullis: round iron bars hanging in the arch mouth.
+      for (let pi = 0; pi < 5; pi++) {
+        const px2 = -1.7 + pi * 0.85;
+        cylinder(b[PAL_TIMBER], px2, 1.75, -hd - 0.02, 0.075, 0.07, 0.9, 6, false, true);
+      }
+      boxN(b[PAL_TIMBER], -2.0, 2.52, -hd - 0.06, 2.0, 2.72, -hd + 0.03);
+      // Drawbridge chains running up to the winch housing.
+      for (const sxc of [-1, 1]) {
+        beam(b[PAL_TIMBER], sxc * 1.7, 2.75, -hd - 0.08, sxc * 1.9, h - 0.6, -hd - 0.06, 0.045, 0.045);
+      }
       // Crimson banners hung on the outer face of each pier.
       for (const sxb of [-1, 1]) {
-        box(b[PAL_BERRY],
-          sxb * (hw - 0.9) - 0.45, h - 3.4, -hd - 0.08,
-          sxb * (hw - 0.9) + 0.45, h - 0.6, -hd - 0.02);
+        boxN(b[PAL_BERRY],
+          sxb * (hw - 1.6) - 0.5, h - 3.6, -hd - 0.1,
+          sxb * (hw - 1.6) + 0.5, h - 0.7, -hd - 0.03);
+        boxN(b[PAL_WOOL],
+          sxb * (hw - 1.6) - 0.22, h - 2.6, -hd - 0.13,
+          sxb * (hw - 1.6) + 0.22, h - 1.7, -hd - 0.06);
       }
       // Torches flanking the gate.
       for (const sxt of [-1, 1]) {
-        box(b[PAL_TORCH], sxt * 2.6 - 0.12, 2.6, -hd - 0.16, sxt * 2.6 + 0.12, 2.95, -hd - 0.02);
+        boxN(b[PAL_TORCH], sxt * 2.7 - 0.12, 2.7, -hd - 0.17, sxt * 2.7 + 0.12, 3.05, -hd - 0.02);
+        flames?.push({ x: sxt * 2.7, y: 2.82, z: -hd - 0.1, scale: 1 });
       }
-      // Battlements.
-      const bw2 = 1.0;
-      const bgap2 = 1.4;
-      for (let bi = -1; bi <= 1; bi++) {
-        const bx2 = bi * bgap2 * 2;
-        if (Math.abs(bx2) < hw) {
-          box(b[PAL_STONE], bx2 - bw2 / 2, h, -hd, bx2 + bw2 / 2, h + 1.0, hd);
+      // Battlements over the passage.
+      for (let bi = -2; bi <= 2; bi++) {
+        const bx2 = bi * 1.35;
+        if (Math.abs(bx2) < hw - 1.4) {
+          boxN(b[PAL_STONE], bx2 - 0.5, h, -hd, bx2 + 0.5, h + 1.05, hd);
         }
       }
       break;
     }
     case 'jail': {
-      // Stone jail building with barred window suggestion.
-      box(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3); // skirt
-      box(b[PAL_STONE], -hw, 0.08, -hd, hw, h, hd); // walls
-      // Door opening on -z face.
-      box(b[PAL_WOOD], -0.55, 0.08, -hd - 0.06, 0.55, 2.0, -hd + 0.06);
-      // Barred window suggestion (iron-grey plaster inset).
-      box(b[PAL_PLASTER], hw - 0.15, 0.9, -0.45, hw + 0.02, 1.7, 0.45);
+      // Stone jail: heavy, small openings, real bars.
+      bevelBoxN(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3);
+      bevelBoxN(b[PAL_STONE], -hw, 0.08, -hd, hw, h, hd); // walls
+      boxN(b[PAL_TIMBER], -0.55, 0.08, -hd - 0.07, 0.55, 2.0, -hd + 0.06); // door
+      boxN(b[PAL_STONE], -0.68, 1.96, -hd - 0.12, 0.68, 2.2, -hd + 0.02);
+      // Barred window on the +X face.
+      boxN(b[PAL_TIMBER], hw - 0.14, 0.95, -0.48, hw + 0.02, 1.7, 0.48);
+      for (let i = 0; i < 4; i++) {
+        const bz = -0.44 + i * 0.29;
+        cylinder(b[PAL_TIMBER], hw + 0.01, 0.95, bz, 0.045, 0.04, 0.75, 5, false, false);
+      }
       // Heavy flat roof (no gable — fortified look).
-      box(b[PAL_STONE], -hw - 0.15, h, -hd - 0.15, hw + 0.15, h + 0.3, hd + 0.15);
+      bevelBoxN(b[PAL_STONE], -hw - 0.15, h, -hd - 0.15, hw + 0.15, h + 0.32, hd + 0.15);
+      for (let i = 0; i < 4; i++) {
+        const mx = -hw + ((i + 0.5) / 4) * pad.w;
+        boxN(b[PAL_STONE], mx - 0.28, h + 0.3, -hd - 0.15, mx + 0.28, h + 0.75, -hd + 0.15);
+      }
       break;
     }
     case 'keep': {
       // Fortified great hall: crenellated block with corner turrets + banner.
-      box(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3); // skirt
-      box(b[PAL_STONE], -hw, 0.08, -hd, hw, h, hd); // main block
-      // Overhanging cap slab.
-      box(b[PAL_STONE], -hw - 0.3, h - 0.15, -hd - 0.3, hw + 0.3, h + 0.1, hd + 0.3);
+      bevelBoxN(b[PAL_STONE], -hw - 0.3, -SKIRT_DEPTH, -hd - 0.3, hw + 0.3, 0.08, hd + 0.3);
+      bevelBoxN(b[PAL_STONE], -hw, 0.08, -hd, hw, h, hd); // main block
+      bevelBoxN(b[PAL_STONE], -hw - 0.35, 0.08, -hd - 0.35, hw + 0.35, 1.5, hd + 0.35); // batter
+      bevelBoxN(b[PAL_STONE], -hw - 0.3, h - 0.15, -hd - 0.3, hw + 0.3, h + 0.1, hd + 0.3);
       // Merlons around the roof rim.
       const kx = Math.max(2, Math.round(pad.w / 1.8));
       const kz = Math.max(2, Math.round(pad.d / 1.8));
       for (let i = 0; i < kx; i++) {
         const mx = -hw + ((i + 0.5) / kx) * pad.w;
-        box(b[PAL_STONE], mx - 0.35, h + 0.1, -hd - 0.3, mx + 0.35, h + 0.85, -hd + 0.25);
-        box(b[PAL_STONE], mx - 0.35, h + 0.1, hd - 0.25, mx + 0.35, h + 0.85, hd + 0.3);
+        boxN(b[PAL_STONE], mx - 0.35, h + 0.1, -hd - 0.3, mx + 0.35, h + 0.9, -hd + 0.25);
+        boxN(b[PAL_STONE], mx - 0.35, h + 0.1, hd - 0.25, mx + 0.35, h + 0.9, hd + 0.3);
       }
       for (let i = 0; i < kz; i++) {
         const mz = -hd + ((i + 0.5) / kz) * pad.d;
-        box(b[PAL_STONE], -hw - 0.3, h + 0.1, mz - 0.35, -hw + 0.25, h + 0.85, mz + 0.35);
-        box(b[PAL_STONE], hw - 0.25, h + 0.1, mz - 0.35, hw + 0.3, h + 0.85, mz + 0.35);
+        boxN(b[PAL_STONE], -hw - 0.3, h + 0.1, mz - 0.35, -hw + 0.25, h + 0.9, mz + 0.35);
+        boxN(b[PAL_STONE], hw - 0.25, h + 0.1, mz - 0.35, hw + 0.3, h + 0.9, mz + 0.35);
       }
-      // Corner turrets rising above the roofline.
+      // Corner turrets rising above the roofline, each with a conical cap.
       for (const sx of [-1, 1]) {
         for (const sz of [-1, 1]) {
-          box(b[PAL_STONE],
-            sx * hw - 0.7, 0.08, sz * hd - 0.7,
-            sx * hw + 0.7, h + 1.7, sz * hd + 0.7);
-          box(b[PAL_STONE],
-            sx * hw - 0.85, h + 1.7, sz * hd - 0.85,
-            sx * hw + 0.85, h + 2.0, sz * hd + 0.85); // turret cap
+          cylinder(b[PAL_STONE], sx * hw, 0.08, sz * hd, 0.95, 0.85, h + 1.8, 8, false, false);
+          cylinder(b[PAL_STONE], sx * hw, h + 1.8, sz * hd, 1.05, 1.0, 0.3, 8, false, false);
+          cone(b[PAL_TIMBER], sx * hw, h + 2.1, sz * hd, 1.05, 1.9, 8, true);
         }
       }
-      // Tall double door on the -z face.
-      box(b[PAL_WOOD], -0.9, 0.08, -hd - 0.08, 0.9, 2.6, -hd + 0.02);
+      // Tall double door on the -z face, under a stone hood.
+      boxN(b[PAL_TIMBER], -0.95, 0.08, -hd - 0.09, 0.95, 2.7, -hd + 0.02);
+      boxN(b[PAL_WOOD], -0.05, 0.08, -hd - 0.12, 0.05, 2.7, -hd - 0.06);
+      boxN(b[PAL_STONE], -1.2, 2.62, -hd - 0.2, 1.2, 2.95, -hd + 0.02);
+      boxN(b[PAL_STONE], -1.4, 0.02, -hd - 0.9, 1.4, 0.18, -hd - 0.02);
       // Window insets: two rows on the front face.
-      for (const wy of [h * 0.42, h * 0.68]) {
+      for (const wy of [h * 0.44, h * 0.68]) {
         for (const sx of [-1, 1]) {
-          box(b[PAL_PLASTER],
-            sx * hw * 0.5 - 0.28, wy, -hd - 0.04,
-            sx * hw * 0.5 + 0.28, wy + 0.7, -hd + 0.02);
+          boxN(b[PAL_TIMBER],
+            sx * hw * 0.52 - 0.28, wy, -hd - 0.05,
+            sx * hw * 0.52 + 0.28, wy + 0.8, -hd + 0.02);
+          boxN(b[PAL_STONE],
+            sx * hw * 0.52 - 0.4, wy - 0.1, -hd - 0.09,
+            sx * hw * 0.52 + 0.4, wy + 0.02, -hd + 0.02);
         }
       }
-      // Crimson banner above the door.
-      box(b[PAL_BERRY], -0.6, h - 2.2, -hd - 0.1, 0.6, h - 0.3, -hd - 0.03);
+      // Great crimson banner over the door, and a flagpole on the roof.
+      boxN(b[PAL_BERRY], -0.75, h - 2.6, -hd - 0.12, 0.75, h - 0.3, -hd - 0.04);
+      boxN(b[PAL_WOOL], -0.3, h - 1.9, -hd - 0.15, 0.3, h - 1.1, -hd - 0.09);
+      cylinder(b[PAL_WOOD], 0, h + 0.1, 0, 0.075, 0.06, 3.4, 6, false, true);
+      boxN(b[PAL_BERRY], 0.04, h + 2.5, -0.03, 1.5, h + 3.3, 0.03);
       // Torches flanking the entrance.
       for (const sxt of [-1, 1]) {
-        box(b[PAL_TORCH], sxt * 1.4 - 0.12, 2.2, -hd - 0.16, sxt * 1.4 + 0.12, 2.55, -hd - 0.02);
+        boxN(b[PAL_TORCH], sxt * 1.55 - 0.12, 2.3, -hd - 0.17, sxt * 1.55 + 0.12, 2.66, -hd - 0.02);
+        flames?.push({ x: sxt * 1.55, y: 2.42, z: -hd - 0.1, scale: 1 });
       }
       break;
     }
     case 'stall': {
-      // Market stall: wood posts, thatch canopy, counter, crimson goods.
+      // Market stall: round posts, striped awning, counter, goods by variant.
       for (const sx of [-1, 1]) {
         for (const sz of [-1, 1]) {
-          box(b[PAL_WOOD],
-            sx * (hw - 0.1) - 0.07, -0.5, sz * (hd - 0.1) - 0.07,
-            sx * (hw - 0.1) + 0.07, h, sz * (hd - 0.1) + 0.07);
+          cylinder(b[PAL_WOOD],
+            sx * (hw - 0.1), -0.5, sz * (hd - 0.1),
+            0.075, 0.06, h + 0.5, 6, false, true);
         }
       }
-      // Canopy: main slab + lower front lip for a sloped look.
-      box(b[PAL_THATCH], -hw - 0.25, h, -hd - 0.15, hw + 0.25, h + 0.12, hd + 0.15);
-      box(b[PAL_THATCH], -hw - 0.25, h - 0.25, -hd - 0.55, hw + 0.25, h - 0.13, -hd - 0.1);
-      // Counter across the front.
-      box(b[PAL_WOOD], -hw + 0.1, 0.75, -hd - 0.05, hw - 0.1, 0.95, -hd + 0.45);
-      // Goods crate on the counter.
-      box(b[PAL_BERRY], -0.5, 0.95, -hd + 0.02, 0.1, 1.25, -hd + 0.38);
+      // Awning: alternating cloth panels sloping to the front.
+      const panels = 4;
+      for (let i = 0; i < panels; i++) {
+        const x0 = -hw - 0.25 + (i / panels) * (pad.w + 0.5);
+        const x1 = -hw - 0.25 + ((i + 1) / panels) * (pad.w + 0.5);
+        const pal = i % 2 === 0 ? PAL_WOOL : PAL_BERRY;
+        boxN(b[pal], x0, h, -hd - 0.15, x1, h + 0.11, hd + 0.15);
+        boxN(b[pal], x0, h - 0.26, -hd - 0.62, x1, h + 0.02, -hd - 0.08);
+      }
+      // Counter across the front, with a trestle.
+      bevelBoxN(b[PAL_WOOD], -hw + 0.1, 0.78, -hd - 0.08, hw - 0.1, 0.96, -hd + 0.48);
+      for (const sx of [-1, 1]) {
+        boxN(b[PAL_TIMBER], sx * (hw - 0.35) - 0.06, 0, -hd + 0.05, sx * (hw - 0.35) + 0.06, 0.78, -hd + 0.35);
+      }
+      // Goods: produce, cloth bolts or grain sacks.
+      if (v === 0) {
+        boxN(b[PAL_LEAF], -0.6, 0.96, -hd + 0.02, 0.0, 1.24, -hd + 0.4);
+        boxN(b[PAL_BERRY], 0.08, 0.96, -hd + 0.05, 0.6, 1.18, -hd + 0.38);
+        boxN(b[PAL_LEAF], -hw + 0.2, 0.0, hd - 0.55, -hw + 0.85, 0.42, hd - 0.05);
+      } else if (v === 1) {
+        for (let i = 0; i < 3; i++) {
+          boxN(b[i % 2 === 0 ? PAL_BERRY : PAL_WOOL],
+            -0.7 + i * 0.5, 0.96, -hd + 0.04, -0.32 + i * 0.5, 1.36, -hd + 0.42);
+        }
+      } else {
+        boxN(b[PAL_WOOL], -0.62, 0.96, -hd + 0.04, -0.05, 1.34, -hd + 0.44);
+        boxN(b[PAL_WOOL], 0.02, 0.0, hd - 0.7, 0.62, 0.55, hd - 0.1);
+        boxN(b[PAL_THATCH], -0.02, 0.96, -hd + 0.06, 0.52, 1.2, -hd + 0.4);
+      }
       break;
     }
     case 'lamp': {
-      // Torch lamp post: pole + arm + glowing lantern.
-      box(b[PAL_WOOD], -0.07, -1, -0.07, 0.07, h, 0.07);
-      box(b[PAL_WOOD], -0.05, h - 0.1, -0.38, 0.05, h, 0.05);
-      box(b[PAL_TORCH], -0.1, h - 0.42, -0.44, 0.1, h - 0.1, -0.24);
+      // Torch lamp post: round pole + arm + glowing lantern.
+      boxN(b[PAL_STONE], -0.24, -0.4, -0.24, 0.24, 0.14, 0.24);
+      cylinder(b[PAL_WOOD], 0, -1, 0, 0.075, 0.06, h + 1, 6, false, true);
+      beam(b[PAL_TIMBER], 0, h - 0.05, 0, 0, h - 0.05, -0.4, 0.035, 0.035);
+      beam(b[PAL_TIMBER], 0, h - 0.42, 0, 0, h - 0.08, -0.3, 0.03, 0.03);
+      boxN(b[PAL_TORCH], -0.11, h - 0.44, -0.45, 0.11, h - 0.1, -0.23);
+      boxN(b[PAL_TIMBER], -0.13, h - 0.12, -0.47, 0.13, h - 0.04, -0.21);
+      flames?.push({ x: 0, y: h - 0.4, z: -0.34, scale: 0.7 });
+      break;
+    }
+    default: {
+      // Exhaustiveness guard: a PadType with no builder renders as nothing
+      // at all, which looks like a missing building rather than a bug.
+      const unhandled: never = pad.type;
+      void unhandled;
       break;
     }
   }
 }
 
-/** One settlement → up to 6 world-space soups, keyed by palette index. */
+/**
+ * One settlement → one world-space soup per palette used.
+ * Pass `flamesOut` to also collect world-space brazier/torch/lantern anchors
+ * for the billboard fire system (render/fire-fx.ts).
+ */
 export function buildSettlementMeshes(
   s: ResolvedSettlement,
+  flamesOut?: SettlementFlame[],
 ): { palette: number; verts: Float32Array<ArrayBuffer> }[] {
   const buckets: Buckets = emptyBuckets();
+  const local: Buckets = emptyBuckets();
+  const localFlames: SettlementFlame[] = [];
   for (const pad of s.pads) {
-    const local: Buckets = emptyBuckets();
-    buildPad(pad, local);
-    // Rotate by yaw (quantized 90° steps) then translate to world.
-    const ys = Math.sin(pad.yaw);
-    const yc = Math.cos(pad.yaw);
+    for (const key of ALL_PALETTES) local[key].length = 0;
+    localFlames.length = 0;
+    buildPad(pad, local, flamesOut !== undefined ? localFlames : undefined);
+    // Rotate by yaw (quantized 90° steps) then translate to world; appendYaw
+    // carries the per-vertex normal along with the position.
     for (const key of ALL_PALETTES) {
-      const src = local[key];
-      const dst = buckets[key];
-      for (let i = 0; i < src.length; i += 3) {
-        const x = src[i];
-        const y = src[i + 1];
-        const z = src[i + 2];
-        dst.push(
-          pad.wx + x * yc - z * ys,
-          pad.wy + y,
-          pad.wz + x * ys + z * yc,
-        );
+      if (local[key].length > 0) {
+        appendYaw(buckets[key], local[key], pad.wx, pad.wy, pad.wz, pad.yaw);
+      }
+    }
+    if (flamesOut !== undefined && localFlames.length > 0) {
+      // Same transform appendYaw applies to vertices — kept literal here so
+      // the two cannot drift apart silently.
+      const c = Math.cos(pad.yaw), sn = Math.sin(pad.yaw);
+      for (const f of localFlames) {
+        flamesOut.push({
+          x: f.x * c - f.z * sn + pad.wx,
+          y: f.y + pad.wy,
+          z: f.x * sn + f.z * c + pad.wz,
+          scale: f.scale,
+        });
       }
     }
   }

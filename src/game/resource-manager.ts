@@ -15,7 +15,7 @@
 import type { Vec3 } from './math';
 import type { HeightField } from './noise';
 import type { BiomeField } from './biome';
-import { LIGHTS_BUFFER_SIZE, type DungeonDraw, type Renderer } from './renderer';
+import { LIGHTS_BUFFER_SIZE, STRIDE_PROP, type DungeonDraw, type Renderer } from './renderer';
 import { CHUNK_SIZE } from './terrain/chunk-mesh';
 import { resourcesForChunk, type ResourceInstance } from './resource-scatter';
 import { treesForChunk, type TreeInstance } from './tree-scatter';
@@ -52,7 +52,8 @@ export class ResourceManager {
   private readonly active = new Map<string, ActiveChunk>();
   /** Tree-harvest signature per chunk, to know when to refresh instances. */
   private readonly treeSig = new Map<string, string>();
-  private readonly palBindGroups = new Map<number, GPUBindGroup>();
+  private readonly palBindGroups =
+    new Map<number, { bindGroup: GPUBindGroup; shadowBindGroup: GPUBindGroup }>();
   private lightsBindGroup: GPUBindGroup | null = null;
 
   /** Wired by main.ts to ChunkManager.refreshTrees. */
@@ -155,10 +156,11 @@ export class ResourceManager {
         });
         this.renderer.device.queue.writeBuffer(vertexBuffer, 0, verts);
         buffers.push(vertexBuffer);
+        const { bindGroup, shadowBindGroup } = this.paletteBindGroup(palette);
         return {
           draw: {
-            vertexBuffer, indexBuffer: null, count: verts.length / 3,
-            bindGroup: this.paletteBindGroup(palette),
+            vertexBuffer, indexBuffer: null, count: verts.length / (STRIDE_PROP / 4),
+            bindGroup, shadowBindGroup,
           },
           lightsBindGroup: this.zeroLights(),
         };
@@ -274,11 +276,12 @@ export class ResourceManager {
     return best;
   }
 
-  private paletteBindGroup(palette: number): GPUBindGroup {
+  private paletteBindGroup(palette: number): { bindGroup: GPUBindGroup; shadowBindGroup: GPUBindGroup } {
     let bg = this.palBindGroups.get(palette);
     if (bg === undefined) {
       // World-space verts: zero offset, sun-lit surface material.
-      bg = this.renderer.createObjectBindGroup(0, 0, 0, 100 + palette).bindGroup;
+      const { bindGroup, shadowBindGroup } = this.renderer.createObjectBindGroup(0, 0, 0, 100 + palette);
+      bg = { bindGroup, shadowBindGroup };
       this.palBindGroups.set(palette, bg);
     }
     return bg;

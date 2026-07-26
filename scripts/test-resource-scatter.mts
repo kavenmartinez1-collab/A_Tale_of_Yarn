@@ -17,7 +17,12 @@ import { CHUNK_SIZE } from '../src/game/terrain/chunk-mesh';
 
 /** Update ONLY on deliberate scatter/heightfield changes. */
 // Rebaked for forced castle near spawn (settlement clearing moved).
-const GOLDEN_HASH: number | null = 0xa99c17d2;
+// Rebaked by the settlement community pass: SETTLEMENT_RADIUS.castle went
+// 50 -> 68 (a castle town needs room outside its gate) and the castle
+// flatness budget 7 -> 9, which moves every castle candidate in the world.
+// (resource scatter clears settlement.radius + 3, same as trees.)
+// Previous: 0xa99c17d2
+const GOLDEN_HASH: number | null = 0xe7d39c42;
 
 const WORLD_SEED = 1337;
 

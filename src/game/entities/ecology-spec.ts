@@ -17,7 +17,7 @@ import { mix32 } from '../dungeon/dungeon-layout';
 
 export interface HerdSpec {
   species: Species;
-  /** Number of individuals in this herd. 1–6. */
+  /** Number of individuals in this herd. 1–12. */
   count: number;
 }
 
@@ -26,7 +26,7 @@ export interface EcologySpec {
   /** Short flavor string describing the cell's wildlife mood. 1–40 chars. */
   mood: string;
   /**
-   * List of herds present in this cell. 0–5 entries.
+   * List of herds present in this cell. 0–7 entries.
    * Empty (barren cell) is valid.
    */
   herds: HerdSpec[];
@@ -69,8 +69,8 @@ export function validateEcologySpec(
   }
 
   // herds
-  if (!Array.isArray(o.herds) || o.herds.length > 5) {
-    errors.push('herds must be an array of 0–5 entries');
+  if (!Array.isArray(o.herds) || o.herds.length > 7) {
+    errors.push('herds must be an array of 0–7 entries');
   } else {
     const seenSpecies = new Set<string>();
     let rareHerdCount = 0;
@@ -120,9 +120,9 @@ export function validateEcologySpec(
           typeof herd.count !== 'number' ||
           !Number.isInteger(herd.count) ||
           herd.count < 1 ||
-          herd.count > 6
+          herd.count > 12
         ) {
-          errors.push(`herds[${i}].count must be an integer 1–6`);
+          errors.push(`herds[${i}].count must be an integer 1–12`);
         } else {
           totalIndividuals += herd.count;
           if (def.rare && herd.count !== 1) {
@@ -139,17 +139,21 @@ export function validateEcologySpec(
           typeof herd.count !== 'number' ||
           !Number.isInteger(herd.count) ||
           herd.count < 1 ||
-          herd.count > 6
+          herd.count > 12
         ) {
-          errors.push(`herds[${i}].count must be an integer 1–6`);
+          errors.push(`herds[${i}].count must be an integer 1–12`);
         }
       }
     });
 
-    // total individuals cap
-    if (totalIndividuals > 14) {
+    // Total individuals cap. Was 14 per 512 m cell, which worked out to one
+    // animal per ~19,000 m2 and left the world reading as empty; raised with
+    // the generator below. These bounds date from when this spec was authored
+    // by an LLM and needed defending against; the director is deterministic
+    // now, so they are a sanity range rather than a trust boundary.
+    if (totalIndividuals > 34) {
       errors.push(
-        `total individuals across all herds must be ≤ 14 (got ${totalIndividuals})`,
+        `total individuals across all herds must be ≤ 34 (got ${totalIndividuals})`,
       );
     }
   }
@@ -238,25 +242,40 @@ export function proceduralEcologySpec(
   // ~7% of cells are barren — silence is part of the variety.
   const barren = rnd() < 0.07;
   if (!barren) {
-    // 1–3 distinct grazer herds of 2–5 individuals (capped by the 14 total).
-    const nGrazers = Math.min(grazers.length, 1 + Math.floor(rnd() * 3));
+    // 2–4 distinct grazer herds of 5–10 individuals (capped by the 34 total).
+    // Was 1–3 herds of 2–5. See the total-individuals note above: at the old
+    // numbers a player standing on land had a 90% chance of no animal within
+    // 60 m, so the wilds read as scenery rather than as habitat.
+    const nGrazers = Math.min(grazers.length, 2 + Math.floor(rnd() * 3));
     const pool = grazers.slice();
     for (let i = 0; i < nGrazers; i++) {
       const sp = pool.splice(Math.floor(rnd() * pool.length), 1)[0];
-      const count = Math.min(2 + Math.floor(rnd() * 4), 14 - total);
+      const count = Math.min(5 + Math.floor(rnd() * 6), 34 - total);
       if (count < 1) break;
       herds.push({ species: sp, count });
       total += count;
     }
-    // 45% chance of one predator pack (1–3) — keeps the wilds dangerous.
-    if (predators.length > 0 && rnd() < 0.45 && total < 14) {
-      const count = Math.min(1 + Math.floor(rnd() * 3), 14 - total);
+    // 55% chance of a predator pack (2–4) — keeps the wilds dangerous.
+    if (predators.length > 0 && rnd() < 0.55 && total < 34) {
+      const count = Math.min(2 + Math.floor(rnd() * 3), 34 - total);
       herds.push({ species: pick(predators), count });
       total += count;
     }
     // 10% chance of a rare beast — count exactly 1 per the validator.
-    if (rares.length > 0 && rnd() < 0.1 && total < 14 && herds.length < 5) {
-      herds.push({ species: pick(rares), count: 1 });
+    // Weighted by `rareWeight` rather than uniform, so the wyvern shows up far
+    // more often than the dragon in the cells where both are admissible. The
+    // scatter path (entity-scatter.ts) applies the same weighting; the two
+    // spawn paths must always be changed together.
+    if (rares.length > 0 && rnd() < 0.1 && total < 34 && herds.length < 7) {
+      let wTotal = 0;
+      for (const sp of rares) wTotal += SPECIES_DEFS[sp].rareWeight ?? 1;
+      let roll = rnd() * wTotal;
+      let chosen = rares[rares.length - 1];
+      for (const sp of rares) {
+        roll -= SPECIES_DEFS[sp].rareWeight ?? 1;
+        if (roll < 0) { chosen = sp; break; }
+      }
+      herds.push({ species: chosen, count: 1 });
       total += 1;
     }
   }

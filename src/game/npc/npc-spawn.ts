@@ -139,6 +139,16 @@ function idleWaypoints(pad: BuildingPad, rng: () => number): NpcWaypoint[] {
 // Pad assignment per role
 // ---------------------------------------------------------------------------
 
+/**
+ * Pads an NPC can never be stationed at — scenery, ground cover and props with
+ * no doorway or standing room.
+ */
+const UNINHABITABLE_PADS: ReadonlySet<string> = new Set([
+  'signpost', 'fence', 'lamp', 'hedge', 'crops', 'haystack', 'woodpile',
+  'cart', 'washline', 'barrels', 'graves', 'shrine', 'trough', 'brazier',
+  'banner', 'pillory', 'well', 'ruin',
+]);
+
 function assignPad(role: NpcRole, pads: BuildingPad[], rng: () => number): BuildingPad | null {
   let preferred: BuildingPad[];
   switch (role) {
@@ -163,8 +173,16 @@ function assignPad(role: NpcRole, pads: BuildingPad[], rng: () => number): Build
       break;
   }
   if (preferred.length === 0) {
-    preferred = pads.filter((p) =>
-      p.type !== 'signpost' && p.type !== 'fence' && p.type !== 'lamp');
+    // Deny-list of things nobody can stand at, rather than a three-name
+    // special case.
+    //
+    // This excluded only signpost/fence/lamp, which was complete when those
+    // were the only decorative pads. The settlement vocabulary has since grown
+    // to twenty-odd types, so the fallback would happily station a villager
+    // inside a hedge, on a haystack, or in the middle of a crop field. Listed
+    // explicitly rather than inferred, so a new decorative pad is a deliberate
+    // decision here and not a silent regression.
+    preferred = pads.filter((p) => !UNINHABITABLE_PADS.has(p.type));
   }
   if (preferred.length === 0) return null;
   return preferred[Math.floor(rng() * preferred.length)];

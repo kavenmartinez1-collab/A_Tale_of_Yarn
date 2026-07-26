@@ -68,6 +68,15 @@ export const FIRE_SPREAD_CHANCE = 0.35;
 export const MAX_BURNING = 40;
 
 /**
+ * Dragon fire-breath cone. These live here rather than in a mesh module
+ * because both the damage cone (main.ts) and the VFX jet (render/fire-fx.ts)
+ * must agree on them — the fire you can see and the fire that burns you are
+ * required to be the same shape.
+ */
+export const BREATH_RANGE = 20;        // m
+export const BREATH_HALF_ANGLE = 0.32; // rad (~18 degrees)
+
+/**
  * Burning vegetation record (trees and bushes). Originally Phase I lightning;
  * now also fed by dragon breath, campfire/torch proximity, and spread.
  */

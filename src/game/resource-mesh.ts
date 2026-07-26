@@ -17,7 +17,7 @@
  *   9  gourd body
  */
 
-import { box } from './mesh-utils';
+import { box, cylinder, sphere } from './mesh-utils';
 import type { ResourceInstance } from './resource-scatter';
 
 export const PAL_ROCK   = 0;
@@ -30,6 +30,17 @@ export const PAL_LEAF   = 6;
 export const PAL_BERRY  = 7;
 export const PAL_ORE    = 8;
 export const PAL_GOURD  = 9;
+
+/**
+ * Lumpy boulder: 3 overlapping low-poly spheres with non-uniform Y/Z scale
+ * so the cluster reads as a craggy rock rather than a smooth ball. Shared by
+ * 'rock' and 'ore_rock' (which adds fleck accents on top).
+ */
+function addBoulder(rock: number[], x: number, y: number, z: number, s: number): void {
+  sphere(rock, x, y + 0.42 * s, z, 0.50 * s, 6, 4, 0.85, 0.95);
+  sphere(rock, x + 0.23 * s, y + 0.56 * s, z - 0.16 * s, 0.40 * s, 6, 4, 0.9, 0.8);
+  sphere(rock, x - 0.20 * s, y + 0.30 * s, z + 0.22 * s, 0.34 * s, 6, 4, 0.75, 0.9);
+}
 
 /** Batch visible (unharvested) nodes into palette draw calls. */
 export function buildResourceMeshes(
@@ -50,26 +61,14 @@ export function buildResourceMeshes(
 
     switch (n.type) {
       case 'rock': {
-        const rock = get(PAL_ROCK);
-        // Two offset boxes read as a craggy boulder under flat shading.
-        box(rock,
-          n.x - 0.55 * s, n.y, n.z - 0.45 * s,
-          n.x + 0.55 * s, n.y + 0.75 * s, n.z + 0.45 * s);
-        box(rock,
-          n.x - 0.30 * s, n.y, n.z - 0.60 * s,
-          n.x + 0.45 * s, n.y + 1.05 * s, n.z + 0.30 * s);
+        addBoulder(get(PAL_ROCK), n.x, n.y, n.z, s);
         break;
       }
       case 'ore_rock': {
         // Rock body (same shape as plain rock).
-        const rock = get(PAL_ROCK);
-        box(rock,
-          n.x - 0.55 * s, n.y, n.z - 0.45 * s,
-          n.x + 0.55 * s, n.y + 0.75 * s, n.z + 0.45 * s);
-        box(rock,
-          n.x - 0.30 * s, n.y, n.z - 0.60 * s,
-          n.x + 0.45 * s, n.y + 1.05 * s, n.z + 0.30 * s);
-        // Ore fleck accent boxes embedded in the face.
+        addBoulder(get(PAL_ROCK), n.x, n.y, n.z, s);
+        // Ore fleck accent boxes embedded in the face — tiny and numerous
+        // enough per-chunk that boxes stay cheaper than spheres here.
         const ore = get(PAL_ORE);
         const r = 0.10 * s;
         for (const [ox, oy, oz] of [[0.20, 0.45, 0.46], [-0.25, 0.65, 0.31], [0.10, 0.30, -0.61]]) {
@@ -81,116 +80,81 @@ export function buildResourceMeshes(
       }
       case 'bush': {
         const leaf = get(PAL_LEAF);
-        box(leaf,
-          n.x - 0.45 * s, n.y, n.z - 0.45 * s,
-          n.x + 0.45 * s, n.y + 0.65 * s, n.z + 0.45 * s);
+        sphere(leaf, n.x, n.y + 0.34 * s, n.z, 0.46 * s, 6, 4, 0.9, 1.0);
         // Three berry clusters straddling the canopy faces so they bulge out.
         const berry = get(PAL_BERRY);
         const spots: [number, number, number][] = [
           [0.28, 0.42, 0.44], [-0.44, 0.30, 0.14], [0.08, 0.55, -0.42],
         ];
         for (const [ox, oy, oz] of spots) {
-          const r = 0.13 * s;
-          box(berry,
-            n.x + ox * s - r, n.y + oy * s - r, n.z + oz * s - r,
-            n.x + ox * s + r, n.y + oy * s + r, n.z + oz * s + r);
+          sphere(berry, n.x + ox * s, n.y + oy * s, n.z + oz * s, 0.11 * s, 6, 4);
         }
         break;
       }
       case 'flax': {
-        // Slender tuft — a few thin vertical boxes with a small flower top.
+        // Slender tuft — a few thin stem cylinders with a small flower top.
         const stem = get(PAL_GREEN);
         for (const [ox, oz] of [[-0.06, 0], [0, 0.07], [0.07, -0.04]]) {
-          box(stem,
-            n.x + ox * s - 0.04 * s, n.y, n.z + oz * s - 0.04 * s,
-            n.x + ox * s + 0.04 * s, n.y + 0.8 * s, n.z + oz * s + 0.04 * s);
+          cylinder(stem, n.x + ox * s, n.y, n.z + oz * s, 0.045 * s, 0.03 * s, 0.8 * s, 6, false, false);
         }
         // Flower tops (cool blue tint reusing PAL_COOL)
         const fl = get(PAL_COOL);
-        const fr = 0.07 * s;
         for (const [ox, oz] of [[-0.06, 0], [0, 0.07], [0.07, -0.04]]) {
-          box(fl,
-            n.x + ox * s - fr, n.y + 0.78 * s, n.z + oz * s - fr,
-            n.x + ox * s + fr, n.y + 0.98 * s, n.z + oz * s + fr);
+          sphere(fl, n.x + ox * s, n.y + 0.86 * s, n.z + oz * s, 0.08 * s, 6, 4);
         }
         break;
       }
       case 'mushroom': {
-        // Stubby stem + domed cap.
+        // Stubby stem cylinder + domed, squashed cap.
         const stem = get(PAL_ROCK); // pale / stone palette for stem
-        box(stem,
-          n.x - 0.12 * s, n.y, n.z - 0.12 * s,
-          n.x + 0.12 * s, n.y + 0.35 * s, n.z + 0.12 * s);
+        cylinder(stem, n.x, n.y, n.z, 0.11 * s, 0.09 * s, 0.32 * s, 6, false, false);
         const cap = get(PAL_MUSH);
-        box(cap,
-          n.x - 0.40 * s, n.y + 0.30 * s, n.z - 0.40 * s,
-          n.x + 0.40 * s, n.y + 0.60 * s, n.z + 0.40 * s);
+        sphere(cap, n.x, n.y + 0.38 * s, n.z, 0.40 * s, 6, 4, 0.55, 1.0);
         break;
       }
       case 'cooling_herb': {
-        // Low tufts with cool-tinted flower blobs.
+        // Low tuft with a cool-tinted flower blob.
         const stem = get(PAL_GREEN);
-        box(stem,
-          n.x - 0.18 * s, n.y, n.z - 0.18 * s,
-          n.x + 0.18 * s, n.y + 0.45 * s, n.z + 0.18 * s);
+        cylinder(stem, n.x, n.y, n.z, 0.17 * s, 0.14 * s, 0.45 * s, 6, false, false);
         const fl = get(PAL_COOL);
-        box(fl,
-          n.x - 0.22 * s, n.y + 0.38 * s, n.z - 0.22 * s,
-          n.x + 0.22 * s, n.y + 0.62 * s, n.z + 0.22 * s);
+        sphere(fl, n.x, n.y + 0.48 * s, n.z, 0.20 * s, 6, 4);
         break;
       }
       case 'warming_herb': {
-        // Low tufts with warm-tinted flower blobs.
+        // Low tuft with a warm-tinted flower blob.
         const stem = get(PAL_GREEN);
-        box(stem,
-          n.x - 0.18 * s, n.y, n.z - 0.18 * s,
-          n.x + 0.18 * s, n.y + 0.45 * s, n.z + 0.18 * s);
+        cylinder(stem, n.x, n.y, n.z, 0.17 * s, 0.14 * s, 0.45 * s, 6, false, false);
         const fl = get(PAL_WARM);
-        box(fl,
-          n.x - 0.22 * s, n.y + 0.38 * s, n.z - 0.22 * s,
-          n.x + 0.22 * s, n.y + 0.62 * s, n.z + 0.22 * s);
+        sphere(fl, n.x, n.y + 0.48 * s, n.z, 0.20 * s, 6, 4);
         break;
       }
       case 'barrel_cactus': {
-        // Short squat ribbed cylinder-ish box.
+        // Ribbed barrel body flaring slightly outward, topped by a rounded
+        // crown cap (the seam between the two is capped, reading as a rib).
         const body = get(PAL_GREEN);
-        box(body,
-          n.x - 0.30 * s, n.y, n.z - 0.30 * s,
-          n.x + 0.30 * s, n.y + 0.70 * s, n.z + 0.30 * s);
-        // Top cap (slightly wider)
-        box(body,
-          n.x - 0.34 * s, n.y + 0.62 * s, n.z - 0.34 * s,
-          n.x + 0.34 * s, n.y + 0.80 * s, n.z + 0.34 * s);
+        cylinder(body, n.x, n.y, n.z, 0.30 * s, 0.32 * s, 0.60 * s, 7, true, false);
+        cylinder(body, n.x, n.y + 0.60 * s, n.z, 0.34 * s, 0.20 * s, 0.20 * s, 7, true, true);
         break;
       }
       case 'reeds': {
-        // Three thin vertical boxes slightly offset.
+        // Three thin stem cylinders slightly offset.
         const reed = get(PAL_GREEN);
         for (const [ox, oz] of [[-0.10, 0], [0.06, -0.08], [0.04, 0.10]]) {
-          box(reed,
-            n.x + ox * s - 0.05 * s, n.y, n.z + oz * s - 0.05 * s,
-            n.x + ox * s + 0.05 * s, n.y + 1.2 * s, n.z + oz * s + 0.05 * s);
+          cylinder(reed, n.x + ox * s, n.y, n.z + oz * s, 0.05 * s, 0.035 * s, 1.2 * s, 6, false, false);
         }
-        // Seed heads
+        // Seed heads — small Y-stretched spheres.
         const head = get(PAL_EARTH);
         for (const [ox, oz] of [[-0.10, 0], [0.06, -0.08], [0.04, 0.10]]) {
-          box(head,
-            n.x + ox * s - 0.07 * s, n.y + 1.15 * s, n.z + oz * s - 0.07 * s,
-            n.x + ox * s + 0.07 * s, n.y + 1.40 * s, n.z + oz * s + 0.07 * s);
+          sphere(head, n.x + ox * s, n.y + 1.27 * s, n.z + oz * s, 0.09 * s, 6, 4, 1.3, 1.0);
         }
         break;
       }
       case 'gourd': {
-        // Round squat body with a short stem.
+        // Round squat body with a short stem cylinder.
         const body = get(PAL_GOURD);
-        box(body,
-          n.x - 0.38 * s, n.y, n.z - 0.38 * s,
-          n.x + 0.38 * s, n.y + 0.55 * s, n.z + 0.38 * s);
-        // Stem nub on top
+        sphere(body, n.x, n.y + 0.30 * s, n.z, 0.38 * s, 6, 4, 0.75, 1.0);
         const stem = get(PAL_GREEN);
-        box(stem,
-          n.x - 0.06 * s, n.y + 0.52 * s, n.z - 0.06 * s,
-          n.x + 0.06 * s, n.y + 0.72 * s, n.z + 0.06 * s);
+        cylinder(stem, n.x, n.y + 0.50 * s, n.z, 0.06 * s, 0.05 * s, 0.20 * s, 6, false, false);
         break;
       }
     }
