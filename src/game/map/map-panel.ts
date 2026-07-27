@@ -269,6 +269,14 @@ export function buildMapPanel(opts: MapPanelOptions): HTMLElement {
   const cloth = document.createElement('div');
   cloth.className = 'chart-cloth';
   const canvas = document.createElement('canvas');
+  // The chart is a control, not decoration: a controller player has to be able
+  // to put the focus ring on it and scroll. `pad-focusable` is how a non-button
+  // opts into input/ui-focus.ts's candidate list, and `tabIndex = -1` is what
+  // makes `focus()` on a canvas actually take (without it the ring would paint
+  // and the element would never be the active one). -1, not 0, so Tab order for
+  // mouse-and-keyboard players is unchanged.
+  canvas.classList.add('pad-focusable');
+  canvas.tabIndex = -1;
   cloth.appendChild(canvas);
   body.appendChild(cloth);
 

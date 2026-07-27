@@ -15,6 +15,7 @@ import { initWebGPU } from '../engine/gpu-device';
 import { reportError } from '../utils/metrics';
 import { STEAM_RELEASE, debugParams } from './release-flags';
 import { GamepadInput } from './input/gamepad';
+import { UiFocus } from './input/ui-focus';
 import {
   Renderer, LIGHTS_BUFFER_SIZE, DEFAULT_POST, STRIDE_CREATURE, STRIDE_PROP,
   MAX_WORLD_LIGHTS,
@@ -611,6 +612,16 @@ declare global {
       resetMapProfile(): void;
       /** Landmark names the chart would show right now. */
       mapLandmarks(): { kind: string; name: string; x: number; z: number }[];
+      /**
+       * Where the controller's focus ring is. Read-only, and nothing in
+       * input/ui-focus.ts consults it — a release build with no `__gameDebug`
+       * navigates identically. `osk` counts on-screen-keyboard attempts, which
+       * is the only way to prove that beat outside a Deck.
+       */
+      padFocus(): {
+        context: string | null; index: number; id: string;
+        label: string; count: number; osk: number;
+      };
       // --- Castle Vhaeron (the opening) ---
       /** Alarm phase, chest state, motte height, which storey you are on. */
       castle(): Record<string, unknown>;
@@ -6466,6 +6477,7 @@ async function boot() {
     },
     mapHas: (x: number, z: number) => discovery.has(x, z),
     mapView: () => getMapView(),
+    padFocus: () => uiFocus.snapshot(),
     mapProfile: () => getMapProfile(),
     resetMapProfile: () => { resetMapProfile(); },
     mapLandmarks: () => {
@@ -6951,6 +6963,13 @@ async function boot() {
     if (!open) {
       // If the NPC chat panel was just closed, reset its state.
       onNpcChatClosed();
+      // …and if it was the arrest panel, un-latch its re-entry guard. Escape
+      // has always closed that panel straight through PanelManager, bypassing
+      // `closeArrest()` and leaving this flag stuck true — after which
+      // `openArrestPanel`'s first line refused to ever open it again and the
+      // player was permanently un-arrestable. B closes panels now too, so a
+      // latent bug on one key became a reachable one on two.
+      arrestPanelOpen = false;
     }
   });
 
@@ -7141,7 +7160,7 @@ async function boot() {
           ['F8',         'Debug snapshot'],
           ['F9',         'Toggle auto-snapshot'],
         ];
-        for (const [key, desc] of controls) {
+        const addRow = ([key, desc]: [string, string]): void => {
           const row = document.createElement('div');
           row.className = 'panel-row';
           row.style.cssText = 'display:flex;gap:8px;align-items:baseline';
@@ -7163,10 +7182,37 @@ async function boot() {
           row.appendChild(keyEl);
           row.appendChild(descEl);
           el.appendChild(row);
-        }
+        };
+        for (const c of controls) addRow(c);
+
+        // Controller. This panel is the ONLY place the pad bindings are
+        // written down, and the pad can open it (Back), so it is also the
+        // only discoverable place — which is why it lists the two that a
+        // player would otherwise never find: Y for the pack, X for the bench.
+        const padTitle = document.createElement('h2');
+        padTitle.textContent = 'Controller';
+        padTitle.style.cssText = 'margin-top:14px';
+        el.appendChild(padTitle);
+        for (const c of ([
+          ['Left stick', 'Move  ·  pans the map while the chart is focused'],
+          ['Right stick', 'Camera'],
+          ['A',           'Interact / talk  ·  in a menu: press the highlighted control'],
+          ['B',           'Jump  ·  in a menu: close it'],
+          ['X',           'Crafting  ·  in the pack: drop one from the highlighted slot'],
+          ['Y',           'Inventory'],
+          ['D-pad ←→',    'Change active item  ·  in a menu: move the highlight'],
+          ['LB',          'Hold to speak to an NPC'],
+          ['RB',          'Next page (crafting)'],
+          ['Triggers',    'Right: attack  ·  on the chart: zoom in / out'],
+          ['LT / L3',     'Sprint'],
+          ['R3',          'Character customization'],
+          ['Start',       'Pause — world map, save and load'],
+          ['Back',        'This panel'],
+        ] as [string, string][])) addRow(c);
+
         const hint = document.createElement('div');
         hint.className = 'hint';
-        hint.textContent = 'Press H or Esc to close';
+        hint.textContent = 'Press H, Back or Esc to close';
         el.appendChild(hint);
         return el;
       });
@@ -9311,6 +9357,33 @@ async function boot() {
    */
   const gamepad = new GamepadInput();
   gamepad.enabled = debugParams().get('gamepad') !== 'off';
+
+  /**
+   * The pad's hands inside the panels (src/game/input/ui-focus.ts).
+   *
+   * `context()` is the whole context switch in five lines: whatever it returns
+   * is what the pad is driving. Death first because the death card is NOT a
+   * PanelManager panel — it is a plain overlay main.ts shows by hand, and it
+   * is the one screen a player MUST be able to leave, so it outranks
+   * everything. Otherwise it is simply whichever panel is open.
+   */
+  const uiFocus = new UiFocus({
+    context: () => {
+      if (isDead) return { id: 'death', root: deathOverlay };
+      const el = panels.openEl;
+      return el === null || panels.openId === null
+        ? null : { id: panels.openId, root: el };
+    },
+    close: () => {
+      // B backs out of a panel. It does NOT back out of dying: the death card
+      // has one exit and it is the Respawn button.
+      if (isDead || !panels.isOpen) return false;
+      audio.play('ui_click');
+      panels.close();
+      return true;
+    },
+  });
+
   const gamepadHooks = {
     onLook: (dx: number, dy: number) => {
       // The same sink as a pointer-locked mousemove (see the listener above),
@@ -9319,6 +9392,24 @@ async function boot() {
       if (panels.isOpen) return;
       if (flyMode) flyCam.onMouseMove(dx, dy);
       else orbitCam.onMouseMove(dx, dy);
+    },
+    uiActive: () => uiFocus.active,
+    uiAnalog: () => uiFocus.wantsAnalog,
+    onUi: (a: Parameters<UiFocus['handle']>[0]) => uiFocus.handle(a),
+    /**
+     * D-pad left/right in gameplay: step the active hotbar slot.
+     *
+     * A hook rather than a synthesised `Digit3`, because cycling needs to
+     * know where the selection IS and gamepad.ts deliberately holds no game
+     * state — the same reason `onLook` is a hook. `hotbar.select` is the
+     * exact call the digit keys and a mouse click already make, so the save
+     * and the re-render come along for free.
+     */
+    onHotbar: (dir: number) => {
+      const n = inventory.hotbar.length;
+      if (n === 0) return;
+      hotbar.select(((inventory.selected + dir) % n + n) % n);
+      audio.play('ui_click');
     },
   };
 
@@ -9333,6 +9424,11 @@ async function boot() {
     // while the sim is paused, and a pad held down through a pause must not
     // bank input. Clamped so an alt-tab does not fling the camera on return.
     gamepad.poll(Math.min(0.1, Math.max(0, (now - last) / 1000)), gamepadHooks);
+    // After the poll, so a panel opened by this frame's Start press is picked
+    // up on this frame. Armed by `connected`: with no pad attached the focus
+    // layer paints nothing and steals no focus, which is what keeps the
+    // mouse-and-keyboard experience byte-for-byte what it was.
+    uiFocus.tick(gamepad.connected);
     last = now;
     // Crash-recovery autosave: position + sim clock every 5 s while playing
     // outdoors on solid ground (interiors use arena coordinates; mid-flight

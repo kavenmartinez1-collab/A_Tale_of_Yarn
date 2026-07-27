@@ -61,7 +61,7 @@ const PANEL_CSS = `
 `;
 
 export class PanelManager {
-  private openEl: HTMLElement | null = null;
+  private openEl_: HTMLElement | null = null;
   private relock = false;
   /** Id of the open panel, or null. */
   openId: string | null = null;
@@ -78,6 +78,19 @@ export class PanelManager {
 
   get isOpen(): boolean {
     return this.openId !== null;
+  }
+
+  /**
+   * The open panel's root element, or null.
+   *
+   * Exposed for the controller focus layer (input/ui-focus.ts), which has to
+   * scope its candidate search and its MutationObserver to exactly one
+   * subtree. Querying `.game-panel` from the document would work today only
+   * because there is never more than one; asking the thing that owns the
+   * invariant is the version that stays true.
+   */
+  get openEl(): HTMLElement | null {
+    return this.openEl_;
   }
 
   /**
@@ -99,7 +112,7 @@ export class PanelManager {
     const el = build();
     el.classList.add('game-panel');
     document.body.appendChild(el);
-    this.openEl = el;
+    this.openEl_ = el;
     this.openId = id;
     const held = document.pointerLockElement === this.canvas;
     this.relock = held || forceRelock;
@@ -129,9 +142,9 @@ export class PanelManager {
     // Panels that bound listeners outside their own subtree (the map takes
     // arrow keys on `window` in the capture phase) get one event to unbind on.
     // Without it those listeners outlive the element and keep eating keys.
-    this.openEl?.dispatchEvent(new CustomEvent('panel-close'));
-    this.openEl?.remove();
-    this.openEl = null;
+    this.openEl_?.dispatchEvent(new CustomEvent('panel-close'));
+    this.openEl_?.remove();
+    this.openEl_ = null;
     this.openId = null;
   }
 }

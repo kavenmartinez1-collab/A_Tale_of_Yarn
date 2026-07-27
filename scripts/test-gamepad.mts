@@ -18,8 +18,10 @@
 
 import {
   applyDeadzone, stickToMoveKeys, mapPad, pressedEdges, releasedEdges,
-  BUTTON, DEFAULT_CONFIG, type PadSnapshot,
+  navDirection, BUTTON, DEFAULT_CONFIG, type PadSnapshot,
 } from '../src/game/input/gamepad';
+import { pickInDirection, type NavRect } from '../src/game/input/ui-focus';
+import { readFileSync } from 'node:fs';
 
 let pass = 0;
 let fail = 0;
@@ -172,8 +174,24 @@ setEq('barely-off-centre does not', stickToMoveKeys(0, -0.3), []);
   setEq('B → Space (jump)', jump, ['Space']);
 }
 {
-  const dpad = mapPad(padOf([0, 0, 0, 0], [BUTTON.DPAD_LEFT]), 1 / 60).intent.heldKeys;
-  setEq('d-pad mirrors the left stick', dpad, ['KeyA']);
+  // The d-pad NO LONGER walks. It used to mirror the left stick, which made it
+  // a second and worse way to do the one thing the pad already did well, while
+  // the two jobs a d-pad exists for — pick an item, pick a menu entry — had no
+  // binding at all. This is the regression guard for that reassignment.
+  for (const b of [BUTTON.DPAD_LEFT, BUTTON.DPAD_RIGHT, BUTTON.DPAD_UP, BUTTON.DPAD_DOWN]) {
+    const keys = mapPad(padOf([0, 0, 0, 0], [b]), 1 / 60).intent.heldKeys;
+    setEq(`d-pad ${b} no longer walks`, keys, []);
+  }
+  // …but it must still be tracked, or the hotbar step has no edge to fire on.
+  const left = mapPad(padOf([0, 0, 0, 0], [BUTTON.DPAD_LEFT]), 1 / 60);
+  eq('d-pad left is in the button state', left.buttons[BUTTON.DPAD_LEFT], true);
+  eq('d-pad right is in the button state',
+    mapPad(padOf([0, 0, 0, 0], [BUTTON.DPAD_RIGHT]), 1 / 60).buttons[BUTTON.DPAD_RIGHT], true);
+  const rest = mapPad(padOf(), 1 / 60).buttons;
+  setEq('one d-pad press is one hotbar step',
+    pressedEdges(rest, left.buttons).map(String), [String(BUTTON.DPAD_LEFT)]);
+  setEq('holding the d-pad does not walk the hotbar',
+    pressedEdges(left.buttons, left.buttons).map(String), []);
 }
 {
   // Push-to-talk on LB → the same KeyV the keyboard uses, so src/game/voice
@@ -253,6 +271,176 @@ setEq('barely-off-centre does not', stickToMoveKeys(0, -0.3), []);
   const { intent } = mapPad({ axes: [], buttons: [] }, 1 / 60);
   setEq('no axes at all → nothing held', intent.heldKeys, []);
   eq('no axes at all → no look', intent.look.dx, 0);
+}
+
+// ─── The panel context switch ────────────────────────────────────────────────
+
+{
+  // With a panel open the pad stops being a body. Everything that moves,
+  // jumps, sprints or swings has to go quiet, or the player is walking into
+  // the sea while they read their inventory.
+  const walking = padOf([0, -1, 0, 0], [BUTTON.B, BUTTON.L3, BUTTON.RT]);
+  const play = mapPad(walking, 1 / 60, DEFAULT_CONFIG, false);
+  const ui = mapPad(walking, 1 / 60, DEFAULT_CONFIG, true);
+  setEq('gameplay: stick + B + L3 → walk, jump, sprint',
+    play.intent.heldKeys, ['KeyW', 'Space', 'ShiftLeft']);
+  eq('gameplay: RT attacks', play.intent.attack, true);
+  setEq('panel: the same input holds nothing', ui.intent.heldKeys, []);
+  eq('panel: RT does not attack', ui.intent.attack, false);
+  eq('panel: the camera holds still', ui.intent.look.dx, 0);
+}
+{
+  // The two bindings that MUST survive the switch, because both are ways out
+  // of the panel rather than actions in the world. LB especially: the chat
+  // panel is the one place push-to-talk matters most, and the context switch
+  // going through it would have silently killed voice input.
+  const lb = mapPad(padOf([0, 0, 0, 0], [BUTTON.LB]), 1 / 60, DEFAULT_CONFIG, true);
+  setEq('panel: LB still opens the mic', lb.intent.heldKeys, ['KeyV']);
+  const start = mapPad(padOf([0, 0, 0, 0], [BUTTON.START]), 1 / 60, DEFAULT_CONFIG, true);
+  eq('panel: Start is still tracked for Escape', start.buttons[BUTTON.START], true);
+}
+{
+  // Every panel the pad can open must have a tracked button behind it, or the
+  // binding silently does nothing. R3 in particular: the character sheet was
+  // the last panel with no pad route at all.
+  for (const [name, b] of [['Y (inventory)', BUTTON.Y], ['Back (help)', BUTTON.BACK],
+    ['R3 (character)', BUTTON.R3], ['X (crafting)', BUTTON.X]] as const) {
+    eq(`${name} is tracked for its edge`,
+      mapPad(padOf([0, 0, 0, 0], [b]), 1 / 60).buttons[b], true);
+  }
+  const right = mapPad(padOf([0, 0, 0, 0], [BUTTON.RB]), 1 / 60, DEFAULT_CONFIG, true);
+  eq('RB is tracked for the tab cycle', right.buttons[BUTTON.RB], true);
+  const lt = mapPad(padOf([0, 0, 0, 0], [BUTTON.LT]), 1 / 60, DEFAULT_CONFIG, true);
+  eq('LT is tracked for the chart zoom', lt.buttons[BUTTON.LT], true);
+  setEq('panel: LT does not sprint', lt.intent.heldKeys, []);
+}
+
+// ─── Focus-cursor direction ──────────────────────────────────────────────────
+
+{
+  eq('d-pad up → nav up',
+    navDirection(padOf([0, 0, 0, 0], [BUTTON.DPAD_UP])).dy, -1);
+  eq('d-pad down → nav down',
+    navDirection(padOf([0, 0, 0, 0], [BUTTON.DPAD_DOWN])).dy, 1);
+  eq('d-pad left → nav left',
+    navDirection(padOf([0, 0, 0, 0], [BUTTON.DPAD_LEFT])).dx, -1);
+  eq('d-pad right → nav right',
+    navDirection(padOf([0, 0, 0, 0], [BUTTON.DPAD_RIGHT])).dx, 1);
+  const rest = navDirection(padOf());
+  eq('nothing pressed → no nav dx', rest.dx, 0);
+  eq('nothing pressed → no nav dy', rest.dy, 0);
+}
+{
+  // A menu has no diagonal neighbours. A d-pad caught between two detents must
+  // pick ONE answer, or a single press moves the ring twice and lands
+  // somewhere the player never aimed at.
+  const d = navDirection(padOf([0, 0, 0, 0], [BUTTON.DPAD_UP, BUTTON.DPAD_LEFT]));
+  eq('diagonal d-pad collapses to horizontal (dx)', d.dx, -1);
+  eq('diagonal d-pad collapses to horizontal (dy)', d.dy, 0);
+}
+{
+  // The nav threshold is deliberately far above the WALK threshold. A stick
+  // resting at 0.4 walks — costs nothing — but a stick at 0.4 that quietly
+  // steps the ring from Save onto Delete between the player looking down and
+  // pressing A is a lost save.
+  eq('stick at 0.4 walks', stickToMoveKeys(0, -0.4).length, 1);
+  eq('…but does not move the focus ring', navDirection(padOf([0, -0.4, 0, 0])).dy, 0);
+  eq('stick at 0.9 does move the ring', navDirection(padOf([0, -0.9, 0, 0])).dy, -1);
+}
+{
+  // Diagonal stick picks the dominant axis, same reasoning as the d-pad.
+  const d = navDirection(padOf([0.9, -0.75, 0, 0]));
+  eq('diagonal stick picks the dominant axis (dx)', d.dx, 1);
+  eq('diagonal stick picks the dominant axis (dy)', d.dy, 0);
+}
+{
+  // While the chart is focused the left stick is an analog pan, so it must not
+  // ALSO walk the ring — but the d-pad still has to, or the player can never
+  // leave the map.
+  const held = padOf([0.9, 0, 0, 0], [BUTTON.DPAD_DOWN]);
+  eq('chart focused: stick does not move the ring',
+    navDirection(padOf([0.9, 0, 0, 0]), DEFAULT_CONFIG, false).dx, 0);
+  eq('chart focused: d-pad still moves the ring',
+    navDirection(held, DEFAULT_CONFIG, false).dy, 1);
+  const ui = mapPad(padOf([0.9, 0.4, 0, 0]), 1 / 60, DEFAULT_CONFIG, true, false);
+  near('chart focused: the stick is still reported for the pan', ui.intent.stick.x,
+    (0.9 / Math.hypot(0.9, 0.4)) * ((Math.hypot(0.9, 0.4) - DZ) / (1 - DZ)), 1e-9);
+}
+
+// ─── Spatial navigation ──────────────────────────────────────────────────────
+
+{
+  // The inventory pack: 7 columns × 4 rows of 44 px cells, 6 px gap — the real
+  // layout from inventory-ui.ts, because a picker that works on a synthetic
+  // grid and not on this one is worthless.
+  const grid: NavRect[] = [];
+  for (let r = 0; r < 4; r++) {
+    for (let c = 0; c < 7; c++) grid.push({ x: 100 + c * 50, y: 200 + r * 50, w: 44, h: 44 });
+  }
+  eq('grid: right steps one column', pickInDirection(grid, 0, 1, 0), 1);
+  eq('grid: down steps one ROW, not one cell', pickInDirection(grid, 0, 0, 1), 7);
+  eq('grid: up from row 1 returns to row 0', pickInDirection(grid, 7, 0, -1), 0);
+  eq('grid: left from mid-row', pickInDirection(grid, 10, -1, 0), 9);
+  // The straight-line property: from the middle of the grid, down must land on
+  // the cell directly below and never drift a column sideways.
+  eq('grid: down from the middle stays in its column',
+    pickInDirection(grid, 10, 0, 1), 17);
+  // Wrapping, so the end of a row is never a dead press.
+  eq('grid: right at the end of a row wraps to its start',
+    pickInDirection(grid, 6, 1, 0), 0);
+  eq('grid: down on the last row wraps to the top of its column',
+    pickInDirection(grid, 24, 0, 1), 3);
+}
+{
+  // The save rail: a single column of buttons of differing widths, which is
+  // what the edge-to-edge cross measure exists for — centre-to-centre would
+  // punish "Overwrite" for being wider than "Load".
+  const rail: NavRect[] = [
+    { x: 900, y: 100, w: 200, h: 28 },
+    { x: 900, y: 140, w: 90, h: 24 },
+    { x: 900, y: 176, w: 140, h: 24 },
+    { x: 900, y: 212, w: 60, h: 24 },
+  ];
+  eq('rail: down steps one row', pickInDirection(rail, 0, 0, 1), 1);
+  eq('rail: up steps back', pickInDirection(rail, 2, 0, -1), 1);
+  eq('rail: down at the bottom wraps to the top', pickInDirection(rail, 3, 0, 1), 0);
+  eq('rail: left with nowhere to go stays put', pickInDirection(rail, 1, -1, 0), 1);
+}
+{
+  // A row of three buttons side by side — the arrest panel and the save row.
+  const row: NavRect[] = [
+    { x: 10, y: 50, w: 60, h: 22 },
+    { x: 80, y: 50, w: 60, h: 22 },
+    { x: 150, y: 50, w: 60, h: 22 },
+  ];
+  eq('row: right', pickInDirection(row, 0, 1, 0), 1);
+  eq('row: left', pickInDirection(row, 2, -1, 0), 1);
+  eq('row: right at the end wraps', pickInDirection(row, 2, 1, 0), 0);
+  eq('row: left at the start wraps', pickInDirection(row, 0, -1, 0), 2);
+}
+{
+  eq('empty candidate list is not a crash', pickInDirection([], 0, 1, 0), -1);
+  eq('a single control has nowhere to go',
+    pickInDirection([{ x: 0, y: 0, w: 10, h: 10 }], 0, 0, 1), 0);
+  eq('an out-of-range index falls back to the first',
+    pickInDirection([{ x: 0, y: 0, w: 10, h: 10 }], 9, 0, 1), 0);
+}
+
+// ─── Release safety ──────────────────────────────────────────────────────────
+
+{
+  // A release build never publishes `__gameDebug` (release-flags.ts), so an
+  // input layer that reached for it would navigate in dev and be dead on
+  // Steam — the worst shape a bug can take, because every harness would stay
+  // green. Static, not behavioural, on purpose: this has to hold for code
+  // paths no test happens to walk.
+  const files = ['../src/game/input/gamepad.ts', '../src/game/input/ui-focus.ts'];
+  for (const f of files) {
+    const src = readFileSync(new URL(f, import.meta.url), 'utf8');
+    // Strip comments first — the modules are allowed to TALK about the hook.
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    ok(`${f.split('/').pop()} never reads __gameDebug`, !code.includes('__gameDebug'));
+  }
 }
 
 // ─── Report ──────────────────────────────────────────────────────────────────
