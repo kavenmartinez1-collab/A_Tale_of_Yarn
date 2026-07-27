@@ -114,6 +114,7 @@ import { EcologyDirector } from './entities/ecology-director';
 import { VitalsHud } from './ui/vitals-hud';
 import { TorchBar } from './ui/torch-bar';
 import { Reticle, type ReticleMode } from './ui/reticle';
+import { LockIndicator } from './ui/lock-indicator';
 import {
   burnTorch, torchFlamePos, TORCH_BURN_S, TORCH_FLAME_SCALE,
   TORCH_LIGHT_RADIUS, TORCH_LIGHT_SORT_KEY, TORCH_LIGHT_WORLD,
@@ -150,6 +151,12 @@ import {
   type DefendTarget,
   CombatIndex, wantsAirborne,
 } from './entities/animal-ai';
+import { MeleeTokenPool } from './combat/attack-tokens';
+import {
+  pickLockTarget, cycleLockTarget, lockBreakReason, lockCameraYaw,
+  lockFacingYaw, easeAngle, indicatorFade, LOCK_EASE_PER_S,
+  type LockCandidate,
+} from './combat/lock-on';
 import {
   createProjectilePool, spawnProjectile, stepProjectiles, followAnchors,
   releaseProjectile,
@@ -296,13 +303,44 @@ declare global {
       /** Terrain height at a world XZ — lets harnesses find flat ground. */
       heightAt(x: number, z: number): number;
       /** Locomotion state — whether the player is grounded, swimming, falling. */
-      playerMotion(): { grounded: boolean; swimming: boolean; velY: number };
+      playerMotion(): { grounded: boolean; swimming: boolean; velY: number; yaw: number };
       /** Equip/clear armor slots by item id (null clears) — character capture. */
       setArmor(slots: { head?: string | null; body?: string | null; legs?: string | null }): void;
       /** Patch the character customisation (hair style/colour, body, tones). */
       setCustomization(partial: Partial<CharacterCustomization>): void;
       /** Force sun shadows on/off, or null to restore automatic. */
       setShadows(on: boolean | null): void;
+      /**
+       * Melee turn-taking state — see `combat/attack-tokens.ts`.
+       * `scripts/combat-feel-check.mjs` reads this to prove the cap holds.
+       */
+      attackTokens(): {
+        contenders: number; held: number; capacity: number;
+        peakHeld: number; deniedByToken: number; deniedByRate: number;
+        enabled: boolean;
+      };
+      /**
+       * Turn attack-token arbitration off, restoring the pre-token behaviour
+       * where every aggro'd enemy swings on its own clock.
+       *
+       * Exists so a harness can measure BEFORE and AFTER in one world, on one
+       * spawn, with one seed. Measuring "before" by checking out an older
+       * revision compares two different worlds and proves nothing about this
+       * one.
+       */
+      setAttackTokens(on: boolean): void;
+      /** Current Z-target id and its bearing, or null when not locked. */
+      lockOn(): { id: string; x: number; z: number; dist: number } | null;
+      /** Toggle/force Z-targeting. `null` toggles. Returns the resulting id. */
+      setLockOn(on: boolean | null): string | null;
+      /** Step to the next Z-target. Returns the resulting id. */
+      cycleLockOn(dir: number): string | null;
+      /**
+       * Recent blows landed on the player: attacker id and sim time, oldest
+       * first. Bounded ring; the harness derives simultaneous-attacker counts
+       * and DPS from it rather than from a bar reading.
+       */
+      attackLog(): { id: string; t: number }[];
       freezeAttackT(t: number | null): void;
       equipItem(id: string, count?: number): boolean;
       vitals(): Vitals;
@@ -1009,6 +1047,42 @@ async function boot() {
    * short-circuiting the aggro path), and both are tested.
    */
   const combatIndex = new CombatIndex();
+
+  /**
+   * Melee turn-taking for everything that swings at the player above ground —
+   * see `combat/attack-tokens.ts`.
+   *
+   * The dungeon has its own pool inside `DungeonCombat`, and the two never
+   * both matter: `tickEntities` returns early while the player is underground,
+   * so exactly one of them is advancing on any given tick.
+   */
+  const meleeTokens = new MeleeTokenPool();
+
+  /**
+   * Arbitration on/off, for A/B measurement only (`__gameDebug.setAttackTokens`).
+   * Always true in play — nothing in the shipping game turns it off.
+   */
+  let meleeTokensOn = true;
+
+  /**
+   * Ring buffer of blows landed on the player: who, and when in sim time.
+   *
+   * Preallocated and overwritten in place rather than pushed to, because this
+   * writes from the damage path. It is bounded at 256 entries — about a minute
+   * of a losing fight — which is all any harness needs to compute a windowed
+   * attacker count. The write is two stores and a modulo; it stays in the
+   * shipping build so the numbers a harness reads come from the same code the
+   * player runs, and `__gameDebug` (the only reader) is what strips in release.
+   */
+  const ATTACK_LOG_N = 256;
+  const attackLogId: string[] = new Array<string>(ATTACK_LOG_N).fill('');
+  const attackLogT = new Float64Array(ATTACK_LOG_N);
+  let attackLogW = 0;
+  const noteAttackOnPlayer = (id: string, t: number): void => {
+    attackLogId[attackLogW] = id;
+    attackLogT[attackLogW] = t;
+    attackLogW = (attackLogW + 1) % ATTACK_LOG_N;
+  };
 
   /** Shared, per-settlement memory of what the player did in front of whom. */
   const villageMemory = loadVillageMemory();
@@ -5766,7 +5840,50 @@ async function boot() {
       return true;
     },
     setShadows: (on: boolean | null) => { shadowOverride = on; },
+    attackTokens: () => ({
+      contenders: meleeTokens.contenderCount,
+      held: meleeTokens.heldCount,
+      capacity: meleeTokens.tokenCapacity,
+      peakHeld: meleeTokens.peakHeld,
+      deniedByToken: meleeTokens.deniedByToken,
+      deniedByRate: meleeTokens.deniedByRate,
+      enabled: meleeTokensOn,
+    }),
+    lockOn: () => {
+      const t = lockOnId === null ? undefined : lockedCandidate();
+      if (t === undefined) return null;
+      return {
+        id: t.id, x: t.x, z: t.z,
+        dist: Math.hypot(t.x - controller.pos[0], t.z - controller.pos[2]),
+      };
+    },
+    setLockOn: (on: boolean | null) => {
+      if (on === false) releaseLock();
+      else if (on === true) { releaseLock(); toggleLock(); }
+      else toggleLock();
+      return lockOnId;
+    },
+    cycleLockOn: (dir: number) => { cycleLock(dir); return lockOnId; },
+    setAttackTokens: (on: boolean) => {
+      meleeTokensOn = on;
+      // Clear on every flip so an A/B run's two halves cannot contaminate each
+      // other through stale contenders or a half-elapsed landing floor.
+      meleeTokens.reset();
+    },
+    attackLog: () => {
+      const out: { id: string; t: number }[] = [];
+      for (let i = 0; i < ATTACK_LOG_N; i++) {
+        const k = (attackLogW + i) % ATTACK_LOG_N;
+        if (attackLogId[k] !== '') out.push({ id: attackLogId[k]!, t: attackLogT[k]! });
+      }
+      return out;
+    },
     setCamera: (yaw: number, pitch: number, distance: number) => {
+      // A held lock re-eases the yaw every frame and would silently undo this
+      // the moment the harness let go of it. `boss-kill-real.mjs` aims with
+      // `setCamera` and fires 480 arrows through it; a lock-on that fought it
+      // would have turned that harness into a coin toss.
+      releaseLock();
       orbitCam.yaw = yaw;
       orbitCam.pitch = pitch;
       orbitCam.distance = distance;
@@ -5816,6 +5933,8 @@ async function boot() {
       grounded: controller.grounded,
       swimming: controller.swimming,
       velY: controller.velY,
+      /** Mesh facing, `atan2(dx, -dz)`. Z-targeting pins this at the target. */
+      yaw: controller.yaw,
     }),
     setArmor: (slots) => {
       for (const slot of ['head', 'body', 'legs'] as const) {
@@ -7099,10 +7218,31 @@ async function boot() {
         (c) => { custom = c; saveCustomization(c); }));
       return;
     }
+    // Tab CYCLES TARGETS while a lock is held, and only opens the pack
+    // otherwise.
+    //
+    // Overloading it is deliberate. Tab is the binding a player reaches for to
+    // cycle a target because every game with Z-targeting uses it, and the pack
+    // has a second, unambiguous binding (I) that is unaffected. The overload is
+    // strictly additive: with no lock, Tab does exactly what it always did, and
+    // `test-gamepad`/`controller-ui-check` drive the pack through KeyI and pad
+    // Y, neither of which routes through here.
+    if (e.code === 'Tab' && lockOnId !== null && !flyMode && !panels.isOpen) {
+      e.preventDefault();
+      cycleLock(e.shiftKey ? -1 : 1);
+      return;
+    }
     if ((e.code === 'Tab' || e.code === 'KeyI') && !flyMode) {
       e.preventDefault();
       audio.play('ui_click');
       panels.toggle('inventory', () => buildInventoryPanel(inventory, invChanged));
+      return;
+    }
+    // Z-targeting. Z for "Z-targeting" — the name the gesture already has, and
+    // one of the few letters this keyboard layout had left.
+    if (e.code === 'KeyZ' && !flyMode && !panels.isOpen) {
+      e.preventDefault();
+      toggleLock();
       return;
     }
     if (e.code === 'KeyB' && !flyMode) {
@@ -7144,6 +7284,8 @@ async function boot() {
           ['Left-click', 'Gather / attack / use  (hold with a bow to draw, release to shoot)'],
           ['X',          'Swap arrows — flint (common) / Tintreach (lightning)'],
           ['Right-click','Toggle pet stay/follow'],
+          ['Z / Middle-click', 'Lock on to the nearest enemy you are facing (again to release)'],
+          ['Tab',        'While locked on: next target (Shift+Tab for the previous one)'],
           ['E',          'Interact / talk / eat / drink / mount'],
           ['Mounted',    'Left-click is still YOUR weapon or bow — F and G are the mount’s'],
           ['F',          'Dragon fire breath / mount stomp'],
@@ -7203,8 +7345,10 @@ async function boot() {
           ['D-pad ←→',    'Change active item  ·  in a menu: move the highlight'],
           ['LB',          'Hold to speak to an NPC'],
           ['RB',          'Next page (crafting)'],
-          ['Triggers',    'Right: attack  ·  on the chart: zoom in / out'],
-          ['LT / L3',     'Sprint'],
+          ['Triggers',    'Right: attack  ·  left: lock on  ·  on the chart: zoom in / out'],
+          ['LT',          'Lock on to an enemy (again to release)'],
+          ['Right stick flick', 'While locked on: next target'],
+          ['L3',          'Sprint'],
           ['R3',          'Character customization'],
           ['Start',       'Pause — world map, save and load'],
           ['Back',        'This panel'],
@@ -7839,6 +7983,10 @@ async function boot() {
     // and the King stayed welded to his own corpse in a seated pose.
     bossHoldsTheDragon = tickCastleBoss(dtS);
 
+    // One arbitration per tick, before anything is stepped: expire finished
+    // turns, decide how many tokens this crowd gets, and pick who is next up.
+    meleeTokens.advance(dtS);
+
     // One scan per tick, shared by every creature's target selection.
     combatIndex.rebuild(
       entityManager.entities.values(),
@@ -7969,9 +8117,13 @@ async function boot() {
           // Everything an animal does with teeth or claws is melee, so it can
           // never reach a rider in the saddle: it hits the mount, or nothing
           // at all if the mount is out of reach overhead (attack-routing.ts).
+          noteAttackOnPlayer(e.id, simTime);
           applyAttackOnPlayer(damage, 'animal', 'melee',
             SPECIES_DEFS[e.species].size, e.y);
         },
+        // Turn-taking, so a pack menaces instead of mobbing. Wildlife brawling
+        // with each other is deliberately NOT arbitrated — see the pool.
+        tokens: meleeTokensOn ? meleeTokens : null,
       });
       // Growl/roar on entering aggro (wolf, bear, dragon, etc.).
       if (prevMode !== 'aggro' && e.mode === 'aggro') {
@@ -8422,6 +8574,132 @@ async function boot() {
     return (bowDrawing || bowLooseT > 0) && bowEquipped() ? 1 : 0;
   }
 
+  // ---------------------------------------------------------------------------
+  // Z-targeting (lock-on) — see `combat/lock-on.ts` for the maths and for why
+  // target-relative movement needs no code here.
+  // ---------------------------------------------------------------------------
+
+  /** Entity/NPC id currently locked onto, or null for free look. */
+  let lockOnId: string | null = null;
+
+  /** Rebuilt per query and reused, never reallocated. */
+  const lockCands: LockCandidate[] = [];
+
+  /**
+   * Everything the player may lock onto right now.
+   *
+   * Deliberately NOT restricted to things that are angry: locking a deer to
+   * line up a bow shot is the same gesture as locking a wolf that is already
+   * biting you, and a targeting system that refuses the first one reads as
+   * broken rather than as principled. What IS excluded is anything that must
+   * never be a target — the player's own pets and mounts (`owned`), corpses,
+   * and the mount currently being ridden.
+   */
+  function buildLockCandidates(): LockCandidate[] {
+    lockCands.length = 0;
+    // Corpses are INCLUDED, as non-hostile candidates, and that is load-bearing
+    // rather than sloppy. `lockBreakReason` distinguishes "the thing you were
+    // locked to died" from "it is no longer in the world at all", and only the
+    // first hands you the next enemy. Filtering the dead out here collapsed
+    // both cases into 'gone', so killing a target under your sword dropped you
+    // into free look instead of passing you its friend — the exact moment the
+    // handover exists for.
+    if (dungeonManager.isInside) {
+      for (const e of dungeonManager.dungeonEnemies()) {
+        lockCands.push({ id: e.id, x: e.x, z: e.z, hostile: e.mode !== 'dead' && e.hp > 0 });
+      }
+      return lockCands;
+    }
+    for (const e of entityManager.entities.values()) {
+      if (e.id === mountedEntityId) continue;
+      if (e.owned === true) continue;
+      lockCands.push({ id: e.id, x: e.x, z: e.z, hostile: e.mode !== 'dead' && e.hp > 0 });
+    }
+    // Hostile people, but never calm ones: a lock-on that snaps to the farmer
+    // you are talking to would be actively harmful, since the same stick also
+    // aims a bow.
+    for (const rt of npcRuntimes) {
+      if (rt.hp <= 0) continue;
+      const angry = rt.attitude === 'hostile'
+        || (guardsHostile && rt.npc.role === 'guard');
+      if (!angry) continue;
+      lockCands.push({ id: rt.npc.id, x: rt.wx, z: rt.wz, hostile: true });
+    }
+    return lockCands;
+  }
+
+  /** The locked candidate this frame, or undefined if it is gone. */
+  function lockedCandidate(): LockCandidate | undefined {
+    if (lockOnId === null) return undefined;
+    const id = lockOnId;
+    return buildLockCandidates().find((k) => k.id === id);
+  }
+
+  /** Drop the lock. Named so every exit reads the same at the call site. */
+  function releaseLock(): void { lockOnId = null; }
+
+  /**
+   * Acquire, or release if already locked. Returns the new state.
+   *
+   * Silently does nothing when there is nothing to lock: a toggle that clears
+   * your existing target because you pressed it while the next enemy was a
+   * metre out of range would be worse than unresponsive.
+   */
+  function toggleLock(): boolean {
+    if (lockOnId !== null) { releaseLock(); return false; }
+    if (isDead || panels.isOpen || flyMode) return false;
+    const picked = pickLockTarget(
+      buildLockCandidates(), controller.pos[0], controller.pos[2], orbitCam.yaw);
+    if (picked === null) return false;
+    lockOnId = picked;
+    audio.play('ui_click');
+    return true;
+  }
+
+  /** Flick left/right through the live targets without dropping the lock. */
+  function cycleLock(dir: number): void {
+    if (lockOnId === null) return;
+    const next = cycleLockTarget(
+      buildLockCandidates(), lockOnId,
+      controller.pos[0], controller.pos[2], orbitCam.yaw, dir);
+    if (next !== null && next !== lockOnId) {
+      lockOnId = next;
+      audio.play('ui_click');
+    }
+  }
+
+  /**
+   * Per-FRAME (not per sim step): hold the camera on the target and decide
+   * whether the lock survives.
+   *
+   * Wall-clock delta for the same reason `stepBowFirstPerson` uses one — this
+   * is camera framing, not simulation, and easing it on SIM_DT would move the
+   * camera at a different speed on a 30 fps machine than on a 144 fps one.
+   */
+  function stepLockOn(dtWall: number): void {
+    if (lockOnId === null) return;
+    if (isDead || flyMode) { releaseLock(); return; }
+
+    const px = controller.pos[0], pz = controller.pos[2];
+    const t = lockedCandidate();
+    const why = lockBreakReason(t, px, pz);
+    if (why !== null) {
+      // A target that died under your sword should hand you the next one that
+      // is already in your face, not dump you back into free look mid-swing.
+      // Out of range or gone entirely is a real disengagement, so that breaks.
+      const next = why === 'dead'
+        ? pickLockTarget(buildLockCandidates(), px, pz, orbitCam.yaw)
+        : null;
+      lockOnId = next;
+      if (next === null) return;
+    }
+    const cur = lockedCandidate();
+    if (cur === undefined) { releaseLock(); return; }
+
+    orbitCam.yaw = easeAngle(
+      orbitCam.yaw, lockCameraYaw(px, pz, cur.x, cur.z), LOCK_EASE_PER_S, dtWall);
+  }
+
   function stepBowFirstPerson(dtS: number): void {
     const want = bowFirstPersonTarget();
     const k = Math.min(1, FP_EASE_PER_S * dtS);
@@ -8667,6 +8945,8 @@ async function boot() {
   }
 
   const reticle = new Reticle();
+  /** The Z-target marker. Positioned from the render matrices each frame. */
+  const lockIndicator = new LockIndicator();
   /** Throttle for the aim resolve: the ray test is cheap, 60 Hz of it is not. */
   let reticleAccum = 0;
   const RETICLE_HZ = 15;
@@ -9308,6 +9588,15 @@ async function boot() {
   // than the canvas so letting go outside the canvas still fires instead of
   // leaving the string drawn forever; `pointerlockchange` covers the case
   // where focus is lost while held (tickBow cancels it).
+  // Middle mouse toggles Z-targeting. The one genuinely free mouse button:
+  // left is gather/attack/draw and right is the pet stay/follow toggle.
+  window.addEventListener('mousedown', (e) => {
+    if (e.button !== 1 || flyMode || panels.isOpen) return;
+    if (document.pointerLockElement !== canvas) return;
+    e.preventDefault();
+    toggleLock();
+  });
+
   window.addEventListener('mouseup', (e) => {
     if (e.button !== 0) return;
     if (!bowDrawing) return;
@@ -9411,6 +9700,12 @@ async function boot() {
       hotbar.select(((inventory.selected + dir) % n + n) % n);
       audio.play('ui_click');
     },
+    onLockCycle: (dir: number) => {
+      // No-op unless a lock is held — `cycleLock` guards that itself, which is
+      // why the pad can afford to fire this on every flick without knowing
+      // whether the player is targeting.
+      if (!panels.isOpen) cycleLock(dir);
+    },
   };
 
   function tick(now: number) {
@@ -9446,7 +9741,16 @@ async function boot() {
       // Block movement while dead.
       if (!isDead) {
         if (flyMode) flyCam.update(SIM_DT);
-        else controller.update(SIM_DT, orbitCam.yaw);
+        else {
+          // While locked, the body points at the target instead of at its own
+          // direction of travel — otherwise strafing a circle shows the enemy
+          // your shoulder for the whole orbit. Movement is untouched: it is
+          // already camera-relative, and the camera is already on the target.
+          const lt = lockOnId === null ? undefined : lockedCandidate();
+          const faceYaw = lt === undefined ? null
+            : lockFacingYaw(controller.pos[0], controller.pos[2], lt.x, lt.z);
+          controller.update(SIM_DT, orbitCam.yaw, faceYaw);
+        }
       }
       // Walk cycle: phase advances with distance, amplitude eases in/out.
       walkPhase += controller.moveSpeed * SIM_DT * 1.6;
@@ -9771,6 +10075,10 @@ async function boot() {
     // frame delta, not SIM_DT: this is camera framing, not simulation, and on a
     // 30 fps frame a SIM_DT ease would move half as far as it should.
     stepBowFirstPerson(Math.min(0.1, (now - fpLastMs) / 1000));
+    // Z-targeting rides the same wall-clock delta and the same reasoning.
+    // Deliberately AFTER the bow ease and BEFORE the camera is read below, so
+    // one frame's yaw is decided in one place.
+    if (!paused) stepLockOn(Math.min(0.1, (now - fpLastMs) / 1000));
     fpLastMs = now;
 
     // Camera + streaming follow the active viewpoint. In portrait mode the
@@ -9915,6 +10223,45 @@ async function boot() {
     // Camera forward from the view matrix's third rotation row (lookAt puts
     // the camera's -Z along the look direction). Shadow cascades fit to it.
     const cameraForward: Vec3 = [-view[2], -view[6], -view[10]];
+
+    // Z-target marker. Projected here rather than in the sim loop because this
+    // is the frame the matrices belong to — projecting against last frame's
+    // camera puts the ring a frame behind the thing it marks, which at a run
+    // is a visible lag between the enemy and its own halo.
+    {
+      const lt = lockOnId === null ? undefined : lockedCandidate();
+      if (lt === undefined || panels.isOpen || isDead) {
+        lockIndicator.hide();
+      } else {
+        const px = controller.pos[0], pz = controller.pos[2];
+        const dist = Math.hypot(lt.x - px, lt.z - pz);
+        // Mark the body, not the feet: `groundHeightAt` plus a little over half
+        // a person. Anything anchored at ground level reads as marking the
+        // floor in front of the enemy on a slope.
+        // `chunkManager.ground`, not the raw height field: carved ground is
+        // what creatures actually stand on, and inside a dungeon the raw field
+        // is the hillside overhead.
+        const ty = (dungeonManager.isInside ? controller.pos[1]
+          : chunkManager.ground.heightAt(lt.x, lt.z)) + 1.1;
+        const cx = view[0] * lt.x + view[4] * ty + view[8] * lt.z + view[12];
+        const cy = view[1] * lt.x + view[5] * ty + view[9] * lt.z + view[13];
+        const cz = view[2] * lt.x + view[6] * ty + view[10] * lt.z + view[14];
+        const cw = view[3] * lt.x + view[7] * ty + view[11] * lt.z + view[15];
+        const clipX = proj[0] * cx + proj[4] * cy + proj[8] * cz + proj[12] * cw;
+        const clipY = proj[1] * cx + proj[5] * cy + proj[9] * cz + proj[13] * cw;
+        const clipW = proj[3] * cx + proj[7] * cy + proj[11] * cz + proj[15] * cw;
+        // Behind the eye: no marker. Dividing by a negative w mirrors the point
+        // onto the wrong side of the screen, which is worse than hiding it.
+        if (clipW <= 0.001) {
+          lockIndicator.hide();
+        } else {
+          const rect = canvas.getBoundingClientRect();
+          const sx = rect.left + (clipX / clipW * 0.5 + 0.5) * rect.width;
+          const sy = rect.top + (0.5 - clipY / clipW * 0.5) * rect.height;
+          lockIndicator.update(sx, sy, indicatorFade(dist));
+        }
+      }
+    }
 
     // Moon: roughly opposite the sun but on a slightly inclined orbit, so it
     // drifts across the sky over successive nights instead of sitting fixed.

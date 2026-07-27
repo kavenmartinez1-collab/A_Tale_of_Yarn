@@ -33,7 +33,7 @@
  *  3. The archer neither shoots nor damages through a wall; it does with sight
  *  4. An idle enemy does not aggro through a wall, and does when it is opened
  *  5. An enemy already fighting does NOT forget the player when sight breaks
- *  6. The grace window bounds how fast a crowd can kill
+ *  6. Attack tokens bound how fast a crowd can kill (+6b: a duel is untouched)
  *  7. Enemies stay inside their room clamp
  *  8. Loot: determinism, the Tintreach boss rate, and where it may not appear
  */
@@ -50,6 +50,7 @@ import {
 import { DUNGEON_FIXTURES } from '../src/game/dungeon/dungeon-fixtures';
 import { layoutDungeon, mix32 } from '../src/game/dungeon/dungeon-layout';
 import { SPECIES_DEFS, type Species } from '../src/game/entities/entity-types';
+import { CROWD_TOKENS, LANDING_FLOOR_S } from '../src/game/combat/attack-tokens';
 import { TINTREACH_ID } from '../src/game/items';
 import type { DungeonSpec } from '../src/game/dungeon/dungeon-spec';
 
@@ -135,7 +136,19 @@ interface RunResult {
   mode: string;
   blockedByWall: number;
   blockedByGrace: number;
+  blockedByToken: number;
+  attackers: number;
+  peakAttackers: number;
+  /** Sim seconds at which each blow landed, in order. */
+  hitTimes: number[];
 }
+
+/**
+ * Read from the species table rather than written as a literal, so a retune of
+ * the skeleton's cadence moves the ceilings in section 6 with it instead of
+ * quietly invalidating them.
+ */
+const SKELETON_CADENCE_S = SPECIES_DEFS['skeleton'].attackCooldown ?? 1.2;
 
 /** Tick `enemies` against a stationary player for `seconds`. */
 function run(
@@ -147,11 +160,14 @@ function run(
   let damage = 0;
   let hits = 0;
   let shots = 0;
+  const hitTimes: number[] = [];
   const steps = Math.round(seconds / DT);
+  let now = 0;
   for (let i = 0; i < steps; i++) {
+    now = i * DT;
     combat.tick(enemies, DT, playerX, playerZ, {
       layout, origin: ORIGIN,
-      onAttackPlayer: (d) => { damage += d; hits++; },
+      onAttackPlayer: (d) => { damage += d; hits++; hitTimes.push(now); },
       onAttackEntity: () => {},
       onRangedAttack: wireProjectiles ? () => { shots++; } : undefined,
     });
@@ -160,6 +176,10 @@ function run(
     damage, hits, shots, mode: enemies[0].mode,
     blockedByWall: combat.blockedByWall,
     blockedByGrace: combat.blockedByGrace,
+    blockedByToken: combat.blockedByToken,
+    attackers: new Set(enemies.filter((e) => e.mode !== 'dead').map((e) => e.id)).size,
+    peakAttackers: combat.peakAttackers,
+    hitTimes,
   };
 }
 
@@ -310,11 +330,20 @@ function run(
 }
 
 // ---------------------------------------------------------------------------
-// 6. The grace window bounds how fast a crowd can kill
+// 6. Attack tokens bound how fast a crowd can kill
 //
-// Five skeletons in reach with nothing staggering them deal 25 damage the
-// instant their independent cooldowns line up, against 20 max HP. The window
-// does not weaken any single blow — it caps how many can land per second.
+// Five skeletons in reach with nothing coordinating them deal 25 damage the
+// instant their independent cooldowns line up, against 20 max HP.
+//
+// This used to be the dungeon's own 0.8 s grace window. That window still
+// exists, but it moved: `combat/attack-tokens.ts` now owns BOTH levers, the
+// concurrency cap (how many may swing) and the landing floor (how fast blows
+// may land), and applies them in the overworld too. See that module's header
+// for why removing either one would have been wrong.
+//
+// The ceiling below is derived from the token count and the species cadence
+// rather than from a duplicated `0.8` literal, so raising CROWD_TOKENS fails
+// this test instead of silently doubling dungeon damage.
 // ---------------------------------------------------------------------------
 
 {
@@ -329,17 +358,113 @@ function run(
   }
   const seconds = 4;
   const r = run(opened, crowd, 9.5, 4.5, seconds);
-  const maxHits = Math.ceil(seconds / 0.8) + 1;
-  check('a crowd cannot land more than one blow per grace window',
+  // Two things bound the rate; the crowd cannot beat the looser of them.
+  // Concurrency: CROWD_TOKENS holders on a skeleton's 1.45 s cadence.
+  // Rate: one blow per LANDING_FLOOR_S, whatever the concurrency.
+  const byTokens = Math.ceil(seconds / (SKELETON_CADENCE_S / CROWD_TOKENS));
+  const byFloor = Math.ceil(seconds / LANDING_FLOOR_S);
+  const maxHits = Math.min(byTokens, byFloor) + 1;
+  check('a crowd cannot out-hit its share of attack tokens',
     r.hits <= maxHits, `${r.hits} hits in ${seconds}s (ceiling ${maxHits})`);
+  // The mutation guard. Without it the ceiling above is satisfied perfectly by
+  // a crowd that never attacks at all, which is precisely what a broken token
+  // layer produces. The counter moved when the lever did: with concurrency
+  // capped, few blows ever reach the landing floor, so `blockedByGrace` is
+  // usually 0 now and `blockedByToken` is where the suppression shows up.
   check('...and the crowd really was trying to land more',
-    r.blockedByGrace > 0, `${r.blockedByGrace} suppressed`);
-  check('...but every enemy still fights (the window is not a mute button)',
+    r.blockedByToken > 0, `${r.blockedByToken} swings refused a token`);
+
+  // BOTH LEVERS ASSERTED DIRECTLY, and this matters more than it looks.
+  //
+  // The damage ceiling above cannot tell the two apart, because each lever
+  // masks the other's failure: with the concurrency cap opened to eight the
+  // landing floor still holds the damage down, and with the floor removed the
+  // cap still does. Measured rather than assumed — the ceiling assertion
+  // passed unchanged under both mutations, which is exactly the vacuous green
+  // this file's A/B design exists to prevent.
+  //
+  // The literals are deliberate pins, in the style of the CHARACTER_MAX_VERTS
+  // assertion: changing the shipped design is allowed, changing it silently
+  // is not.
+  check('at most two enemies are ever committed to a swing at once',
+    r.peakAttackers <= 2, `peak ${r.peakAttackers} simultaneous attackers`);
+  let minGap = Infinity;
+  for (let i = 1; i < r.hitTimes.length; i++) {
+    minGap = Math.min(minGap, r.hitTimes[i]! - r.hitTimes[i - 1]!);
+  }
+  check('no two blows land closer together than the landing floor',
+    r.hitTimes.length < 2 || minGap >= 0.75,
+    `closest pair ${minGap.toFixed(3)} s apart`);
+  check('...but every enemy still fights (tokens are not a mute button)',
     r.hits > 0, `${r.hits} hits`);
-  // Without the window this is 5 x 5 damage every 1.45 s.
+  // Without any coordination this is 5 x 5 damage every 1.45 s.
   const unstaggered = 5 * 5 * Math.floor(seconds / 1.45);
-  check('the crowd deals materially less than an unstaggered one would',
+  check('the crowd deals materially less than an uncoordinated one would',
     r.damage < unstaggered, `${r.damage} vs ${unstaggered}`);
+}
+
+// ---------------------------------------------------------------------------
+// 6c. The landing floor, against the cadence it actually exists for
+//
+// Section 6 uses skeletons (1.45 s cadence), where two tokens already space
+// blows ~0.72 s apart and the 0.8 s floor is barely the binding constraint —
+// so removing the floor entirely does not move that test, which was measured,
+// not assumed.
+//
+// Goblins swing at 1.2 s. Two of them alternating is a blow every 0.6 s, which
+// is FASTER than the floor and faster than the dungeon ever allowed. This is
+// the case that proves concurrency and rate are genuinely two levers rather
+// than one, and the case that fails if anyone deletes the floor believing
+// tokens made it redundant.
+// ---------------------------------------------------------------------------
+
+{
+  const opened = arena();
+  for (let z = 2; z <= 7; z++) openDoor(opened, z);
+  const crowd: DungeonEnemy[] = [];
+  for (let i = 0; i < 4; i++) {
+    const e = makeEnemy('goblin', 7.5, 2.5 + i);
+    e.id = `dungeon:0,0:g${i}`;
+    e.mode = 'aggro';
+    crowd.push(e);
+  }
+  const r = run(opened, crowd, 9.5, 4.5, 6);
+  check('goblins still fight', r.hits > 0, `${r.hits} hits`);
+  let minGap = Infinity;
+  for (let i = 1; i < r.hitTimes.length; i++) {
+    minGap = Math.min(minGap, r.hitTimes[i]! - r.hitTimes[i - 1]!);
+  }
+  check('two goblin token-holders cannot out-pace the landing floor',
+    r.hitTimes.length < 2 || minGap >= 0.75,
+    `closest pair ${minGap.toFixed(3)} s apart (two tokens alone would allow 0.6)`);
+  check('...and the floor is what is doing it (blows were suppressed)',
+    r.blockedByGrace > 0, `${r.blockedByGrace} suppressed by rate`);
+}
+
+// ---------------------------------------------------------------------------
+// 6b. ...and a LONE enemy is untouched by any of it
+//
+// The regression that would be cheapest to ship without noticing. Every
+// assertion in sections 1-5 uses a single enemy, so if tokens had broken the
+// solo case this file would have gone red everywhere at once — but it is worth
+// one explicit test that says so, because the failure mode of a badly-tuned
+// pool is a duel that silently loses its first blow.
+// ---------------------------------------------------------------------------
+
+{
+  const opened = arena();
+  for (let z = 2; z <= 7; z++) openDoor(opened, z);
+  const lone = makeEnemy('skeleton', 9.0, 4.5);
+  lone.id = 'dungeon:0,0:solo';
+  lone.mode = 'aggro';
+  const seconds = 4;
+  const r = run(opened, [lone], 9.5, 4.5, seconds);
+  // 4 s at a 1.45 s cadence, first blow at t=0: 3 blows.
+  const expected = Math.floor(seconds / SKELETON_CADENCE_S) + 1;
+  check('a lone skeleton keeps its full unmodified cadence',
+    r.hits === expected, `${r.hits} hits, expected ${expected}`);
+  check('...and never has a swing refused a token',
+    r.blockedByToken === 0, `${r.blockedByToken} refused`);
 }
 
 // ---------------------------------------------------------------------------

@@ -947,6 +947,12 @@ export class DungeonManager {
     // payout on the next delve.
     this.resident.enemies = [];
     this.paidKills.clear();
+    // Same reasoning one line up, applied to the combat state: attack tokens
+    // are keyed by enemy id, and those ids die with the delve. `DungeonCombat`
+    // is held for the manager's whole life (not per dungeon, whatever its old
+    // comment claimed), so without this the next delve inherits contenders for
+    // enemies that no longer exist.
+    this.combat.reset();
     for (const b of this.resident.buffers) b.destroy();
     this.resident = null;
 

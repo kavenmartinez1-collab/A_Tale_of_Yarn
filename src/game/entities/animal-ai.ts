@@ -27,6 +27,9 @@ import {
 } from './entity-types';
 import { animalStride } from './animal-mesh';
 import { meleeReachHeight } from '../attack-routing';
+import {
+  CIRCLE_SPEED_MUL, CONTEND_PAD, circleGoal, type MeleeArbiter,
+} from '../combat/attack-tokens';
 import type { EntityState } from './entity-manager';
 import {
   CombatIndex, HUNT_SIGHT, RETARGET_S, courageOf, factionOf,
@@ -297,6 +300,19 @@ export interface AnimalAICtx {
    * before the caller wires anything up.
    */
   onRangedAttack?: (e: EntityState, shot: RangedShot) => void;
+
+  /**
+   * Turn-taking for melee aimed at the PLAYER — see `combat/attack-tokens.ts`.
+   *
+   * Absent means "no coordination", which is exactly the behaviour every
+   * caller had before tokens existed: each creature swings on its own clock.
+   * That is the right degradation for a caller that has not built a pool, and
+   * it is what keeps this module's own unit tests free to omit it.
+   *
+   * The caller owns the pool and must `advance(dtS)` it ONCE per tick before
+   * stepping any entity, the same contract `combat` already has.
+   */
+  tokens?: MeleeArbiter | null;
 }
 
 /** A hostile an owned animal has been asked to deal with. */
@@ -519,6 +535,15 @@ function engage(
    * a guess dressed as a measurement.
    */
   rise: number | null,
+  /**
+   * Turn-taking for melee against the PLAYER, or null for none.
+   *
+   * Null is what every mob-vs-mob call passes, and it reproduces the old
+   * everyone-swings-at-once behaviour exactly. Wildlife brawling in a field is
+   * not a fight anyone is trying to read, so coordinating it would be cost
+   * with no legibility to buy.
+   */
+  arbiter: MeleeArbiter | null,
 ): void {
   const c = e as CombatState;
   const reach = attackReach(def);
@@ -575,10 +600,49 @@ function engage(
   // is swinging at them.
   const grounded = rise === null || Math.abs(rise) <= meleeReachHeight(def.size);
 
+  // ATTACK TOKENS — see `combat/attack-tokens.ts`.
+  //
+  // Only bodies close enough to be IN the fight contend for a turn. Past
+  // `CONTEND_PAD` an enemy is simply walking in, which needs nobody's
+  // permission and must not consume a token it cannot use yet; that would let
+  // a distant straggler lock out the wolf already at your throat.
+  //
+  // The test runs before the reach check on purpose. A denied enemy has to
+  // stop CLOSING, not merely stop swinging — an enemy that walks all the way
+  // in and then stands politely in your face is the same shoulder-to-shoulder
+  // scrum as before, just quieter.
+  if (arbiter !== null && grounded && dist <= reach + CONTEND_PAD
+      && !arbiter.requestSwing(e.id, e.species)) {
+    // Denied: hold the ring and strafe. `circleGoal` returns a point, so this
+    // still goes through `moveToward` and keeps the caller's collision, room
+    // clamp and terrain handling untouched.
+    const goal = circleGoal(e.id, e.x, e.z, tx, tz, reach, def.speed, dtS);
+    moveToward(e, goal.x, goal.z, def.speed * CIRCLE_SPEED_MUL, dtS,
+      ctx.heightAt, isWater, collide, radius);
+    // `moveToward` points the body down its path of travel; a circling animal
+    // that faces its own tangent has turned its back on you and reads as
+    // leaving. Face the target instead — the same rule the ranged back-off
+    // above follows, and the thing that makes the ring read as a threat.
+    if (dist > 0.001) e.yaw = Math.atan2(dx / dist, -(dz / dist));
+    // Park the swing clock at a full cadence exactly as the blocked branch
+    // below does, and for the same reason: `creature-anim.ts` starts a windup
+    // when `stateTimer` reaches the move's `contactT`, so a circling enemy
+    // whose clock sat at zero would windup on every frame it orbited.
+    e.stateTimer = attackCadence(def);
+    e.y = isWater ? -0.5 : ctx.heightAt(e.x, e.z);
+    return;
+  }
+
   if (dist <= reach && grounded) {
     e.stateTimer -= dtS;
     if (e.stateTimer <= 0) {
-      onHit();
+      // The swing goes out either way — `noteSwing` starts the follow-through
+      // that eventually frees the token, and a turn that ended in a blow the
+      // landing floor swallowed still has to END, or the holder keeps its
+      // token forever and the rotation stalls. What the floor suppresses is
+      // the DAMAGE; on screen it reads as a blow that did not tell.
+      if (arbiter === null || arbiter.mayLand(e.species)) onHit();
+      arbiter?.noteSwing(e.id);
       e.stateTimer = attackCadence(def);
     }
     if (dist > 0.001) e.yaw = Math.atan2(dx / dist, -(dz / dist));
@@ -869,7 +933,9 @@ export function stepAnimal(
           ? (speciesDef.rangedDmg ?? aggroDamage(e.species))
           : aggroDamage(e.species));
       }, isWater, collide, radius,
-      ctx.playerY === undefined ? null : ctx.playerY - e.y);
+      ctx.playerY === undefined ? null : ctx.playerY - e.y,
+      // The only call that takes turns: this is the one aimed at the player.
+      ctx.tokens ?? null);
       break;
     }
 
@@ -940,7 +1006,10 @@ export function stepAnimal(
         else ctx.onAttackEntity?.(target.id, dmg);
         // `null`: a CombatTarget has no y. Mob-vs-mob keeps the horizontal-only
         // test it has always had rather than getting a fabricated one.
-      }, isWater, collide, radius, null);
+        // `null` arbiter for the same class of reason: a wolf taking a deer is
+        // not a fight the player is reading, so nothing is bought by
+        // choreographing it.
+      }, isWater, collide, radius, null, null);
       break;
     }
 

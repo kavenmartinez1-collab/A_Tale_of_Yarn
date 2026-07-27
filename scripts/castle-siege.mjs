@@ -316,9 +316,20 @@ let breathTicksDuringMob = 0;
       f: window.__gameDebug.castleFight(),
     }));
     engaged = Math.max(engaged, s2.g.filter((p) => p.mode === 'aggro').length);
-    mobHpEnd = s2.hp;
+    // Breath FIRST, and `mobHpEnd` only from samples taken before any landed.
+    //
+    // It used to record the hp and then check, so the contaminated sample's hp
+    // was already in the number the beat reported. That was invisible while the
+    // garrison killed fast enough to finish inside 18 s, and stopped being
+    // invisible when attack tokens capped the garrison to two attackers: the
+    // window now runs long enough for the orbiting dragon to get a breath in,
+    // and the beat aborted with 4.84 hp of MIXED damage on the books.
+    //
+    // Keeping only pre-breath samples means `mobHpEnd - mobHpStart` is melee
+    // and nothing else, by construction, which is what the beat always claimed.
     breathTicksDuringMob = s2.f.breathHits - f0.breathHits;
-    if (breathTicksDuringMob > 0) break;   // contaminated; stop and say so
+    if (breathTicksDuringMob > 0) break;
+    mobHpEnd = s2.hp;
     if (mobHpEnd <= 8) break;
   }
   await snap('under-attack-in-the-courtyard');
@@ -327,10 +338,17 @@ verdict.mobHp = [mobHpStart, mobHpEnd];
 verdict.mobEngaged = engaged;
 verdict.breathTicksDuringMob = breathTicksDuringMob;
 expect('the garrison engages once hunting', engaged > 0, `${engaged} in aggro`);
-expect('no breath tick contaminated the garrison-damage measurement',
-  breathTicksDuringMob === 0, `${breathTicksDuringMob} breath tick(s) landed too`);
+// The garrison is now capped at two simultaneous attackers by the melee token
+// pool (`combat/attack-tokens.ts`), so this beat measures a deliberately
+// slower grind than it used to. What it must still prove is that the grind is
+// real and that it is MELEE — hence the pre-breath-only sampling above.
+expect('the garrison damage measured is melee only, with no breath in it',
+  mobHpEnd < mobHpStart || breathTicksDuringMob === 0,
+  `hp ${mobHpStart} -> ${mobHpEnd}, ${breathTicksDuringMob} breath tick(s) after the window`);
 expect('the garrison actually hurts the player', mobHpEnd < mobHpStart,
   `hp ${mobHpStart} -> ${mobHpEnd} from melee alone`);
+expect('...and no more than two of them are ever engaged at once',
+  engaged <= 2, `${engaged} in aggro simultaneously`);
 
 // And they can be killed.
 {

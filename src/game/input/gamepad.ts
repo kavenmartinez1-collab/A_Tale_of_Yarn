@@ -118,6 +118,19 @@ const MOVE_THRESHOLD = 0.35;
  */
 const NAV_THRESHOLD = 0.6;
 
+/**
+ * Right-stick travel that counts as a target-cycle flick, and the travel it
+ * must fall back below before another one can fire.
+ *
+ * Two thresholds, not one. The right stick is also the camera, so a player
+ * swinging the view past a single threshold would cycle targets on the way out
+ * AND on the way back; the gap is what makes a flick a deliberate gesture
+ * rather than a side effect of looking around. 0.85 is far enough out that
+ * ordinary camera work never reaches it.
+ */
+const FLICK_ON = 0.85;
+const FLICK_OFF = 0.5;
+
 /** Repeat rates for held menu navigation, in seconds. */
 const NAV_FIRST_DELAY = 0.34;
 const NAV_REPEAT = 0.13;
@@ -236,11 +249,17 @@ export function mapPad(
   // left/right now step the hotbar (an edge, handled in poll()); in a panel
   // all four move the focus ring.
   if (!uiMode) {
-    // Sprint on L3 or the left trigger — the two places every player's thumb
-    // already looks for it. Jump on B: the brief specifies A for interact, and
-    // a movement layer with no jump cannot clear a fence.
-    if (isDown(pad, BUTTON.L3, cfg.triggerThreshold)
-      || isDown(pad, BUTTON.LT, cfg.triggerThreshold)) heldKeys.add('ShiftLeft');
+    // Sprint on L3 ONLY.
+    //
+    // It used to be L3 *or* LT. LT is now Z-targeting (see the edge handler in
+    // poll()), and a trigger that both locked on and sprinted would have made
+    // every lock-on a sprint — which, since lock-on is the thing you press to
+    // stand and fight, is exactly backwards. L3 keeps the binding every
+    // player's thumb already looks for; LT was the redundant half of a pair.
+    //
+    // Jump on B: the brief specifies A for interact, and a movement layer with
+    // no jump cannot clear a fence.
+    if (isDown(pad, BUTTON.L3, cfg.triggerThreshold)) heldKeys.add('ShiftLeft');
     if (isDown(pad, BUTTON.B, cfg.triggerThreshold)) heldKeys.add('Space');
   }
 
@@ -338,6 +357,17 @@ export interface GamepadHooks {
   onUi?: (a: UiAction) => boolean;
   /** Gameplay d-pad left/right: step the active hotbar slot by `dir`. */
   onHotbar?: (dir: number) => void;
+  /**
+   * Right-stick flick while Z-targeting: step to the next target, `dir` -1 or
+   * +1 (screen left / right).
+   *
+   * A hook rather than a synthesised key, following `onHotbar`. The keyboard's
+   * cycle binding is Tab, and Tab with no lock held opens the pack — so a pad
+   * flick routed through a synthetic Tab would open the inventory every time
+   * the player nudged the camera stick while not locked on. There is no DOM
+   * event that means this, so it does not pretend there is.
+   */
+  onLockCycle?: (dir: number) => void;
 }
 
 /**
@@ -352,6 +382,8 @@ export interface GamepadHooks {
  *   right trigger          → `mousedown`/`mouseup` button 0 (attack, bow draw)
  *   d-pad left/right       → `onHotbar(±1)`             (active item)
  *   X                      → `keydown` `KeyB`           (crafting)
+ *   LT                     → `keydown` `KeyZ`           (Z-targeting toggle)
+ *   right stick flick      → `onLockCycle(±1)`          (next target)
  *
  * PANEL (`hooks.uiActive()`), where the pad becomes a cursor:
  *   d-pad / left stick     → `onUi({kind:'nav'})`, repeat-rated
@@ -381,6 +413,14 @@ export class GamepadInput {
   private navDx = 0;
   private navDy = 0;
   private navTimer = 0;
+  /**
+   * Latch for the right-stick target-cycle flick.
+   *
+   * True while the stick is past `FLICK_ON`; the cycle fires on the rising
+   * edge only. Without the latch a held stick would cycle once per frame and
+   * run through the whole target list in a fifth of a second.
+   */
+  private flickLatched = false;
 
   /** True when a pad has been seen this session — for the HUD/glyph work. */
   get connected(): boolean { return this.padIndex >= 0; }
@@ -416,6 +456,7 @@ export class GamepadInput {
     this.navDx = 0;
     this.navDy = 0;
     this.navTimer = 0;
+    this.flickLatched = false;
   }
 
   /**
@@ -516,12 +557,38 @@ export class GamepadInput {
         hooks.onUi?.({ kind: 'tab', dir: 1 });
       } else if (ui && (b === BUTTON.LT || b === BUTTON.RT)) {
         hooks.onUi?.({ kind: 'zoom', dir: b === BUTTON.RT ? -1 : 1 });
+      } else if (!ui && b === BUTTON.LT) {
+        // Z-targeting, as a TOGGLE rather than a hold.
+        //
+        // Hold-to-lock is the older convention, but a hold needs held-key
+        // state, and held state on a pad has exactly one failure mode that
+        // matters: yank the controller mid-fight and the flag never clears.
+        // `releaseAll()` covers synthesised held KEYS; it would not have
+        // covered a lock flag without a second mechanism. A toggle has no such
+        // state to leak, and it matches the keyboard's Z exactly, so the two
+        // input paths cannot drift apart.
+        window.dispatchEvent(new KeyboardEvent('keydown',
+          { code: 'KeyZ', bubbles: true, cancelable: true }));
       } else if (!ui && b === BUTTON.DPAD_LEFT) {
         hooks.onHotbar?.(-1);
       } else if (!ui && b === BUTTON.DPAD_RIGHT) {
         hooks.onHotbar?.(1);
       }
     }
+    // Right-stick flick → next target. Gameplay only: in a panel the right
+    // stick does nothing and the same motion must not cycle anything.
+    if (!ui) {
+      const rx = pad.axes[2] ?? 0;
+      if (!this.flickLatched && Math.abs(rx) >= FLICK_ON) {
+        this.flickLatched = true;
+        hooks.onLockCycle?.(rx > 0 ? 1 : -1);
+      } else if (this.flickLatched && Math.abs(rx) <= FLICK_OFF) {
+        this.flickLatched = false;
+      }
+    } else {
+      this.flickLatched = false;
+    }
+
     for (const b of releasedEdges(this.buttons, buttons)) {
       if (b === BUTTON.A) {
         window.dispatchEvent(new KeyboardEvent('keyup',
