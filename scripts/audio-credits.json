@@ -1,0 +1,57 @@
+{
+  "_readme": [
+    "Audio credits manifest for A Tale of Yarn.",
+    "",
+    "The game imports ZERO audio files. Every sound is synthesized at runtime by",
+    "src/game/audio/audio-engine.ts from the recipe table in sfx.ts, so 'credits'",
+    "is empty and is supposed to be empty.",
+    "",
+    "This file exists as the GUARD for the first imported file somebody adds.",
+    "scripts/test-audio-credits.mts walks the shipped asset directories and fails",
+    "if it finds an audio file with no entry here, if an entry names a file that",
+    "does not exist, or if any licence is outside policy.allowed.",
+    "",
+    "TO ADD AN IMPORTED SOUND you must do all three, or the test goes red:",
+    "  1. add an entry to 'credits' below,",
+    "  2. add the identical entry to AUDIO_CREDITS in src/game/audio/sfx.ts",
+    "     (the in-bundle copy the credits panel renders from - the test asserts",
+    "     the two are deep-equal, so they cannot drift),",
+    "  3. make sure the licence is one of policy.allowed, verbatim.",
+    "",
+    "Entry shape: { file, url, author, licence, note? }",
+    "  file    - path from the repo root, forward slashes",
+    "  url     - where it was obtained",
+    "  author  - who made it",
+    "  licence - verbatim from policy.allowed",
+    "  note    - optional: edits made, required attribution string, etc."
+  ],
+
+  "policy": {
+    "allowed": [
+      "CC0-1.0",
+      "CC-BY-4.0"
+    ],
+    "forbiddenPatterns": [
+      { "pattern": "NC / NonCommercial", "why": "Commercial Steam release. NC forbids it outright." },
+      { "pattern": "SA / ShareAlike", "why": "Copyleft on a derivative in a closed-source build." },
+      { "pattern": "BBC", "why": "BBC Sound Effects are personal/educational/research use only." },
+      { "pattern": "GPL / AGPL", "why": "Incompatible with the Steamworks SDK." },
+      { "pattern": "ND / NoDerivatives", "why": "Any pitch-shift, trim or mix is a derivative." }
+    ],
+    "attribution": {
+      "CC0-1.0": "No attribution obligation. The entry is recorded anyway so provenance is auditable.",
+      "CC-BY-4.0": "Attribution required. The manifest entry IS the attribution and the credits panel renders it."
+    }
+  },
+
+  "scannedDirs": ["public", "src", "app"],
+
+  "scanNote": [
+    "dist/ is not scanned: it is a build product of the directories above, and",
+    "scripts/ is not scanned because everything under it is generated test",
+    "fixture or audition evidence (piper_fixture, voice_fixture, whisper_fixture,",
+    "shots/audition) - all gitignored, none of it ships."
+  ],
+
+  "credits": []
+}

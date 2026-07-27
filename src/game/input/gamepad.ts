@@ -1,3 +1,13 @@
+/** A pad-synthesised mouse button. Marked so main.ts's pointer-lock gate can
+ * admit it: a pad player who never clicked the canvas holds no pointer lock,
+ * and without the mark RT could not attack at all (found by the audio agent,
+ * fixed here). `cancelable` for symmetry with the keyboard synthesis. */
+function padMouse(type: 'mousedown' | 'mouseup'): MouseEvent {
+  const ev = new MouseEvent(type, { button: 0, bubbles: true, cancelable: true });
+  (ev as { __pad?: boolean }).__pad = true;
+  return ev;
+}
+
 /**
  * Gamepad input — the code half of controller support.
  *
@@ -449,7 +459,7 @@ export class GamepadInput {
     }
     this.held.clear();
     if (this.attackHeld) {
-      window.dispatchEvent(new MouseEvent('mouseup', { button: 0, bubbles: true }));
+      window.dispatchEvent(padMouse('mouseup'));
       this.attackHeld = false;
     }
     this.buttons = {};
@@ -630,8 +640,7 @@ export class GamepadInput {
     // Attack is press-and-hold, not an edge: a bow draws while the trigger is
     // down and looses on release (main.ts:9224/9234).
     if (intent.attack !== this.attackHeld) {
-      window.dispatchEvent(new MouseEvent(
-        intent.attack ? 'mousedown' : 'mouseup', { button: 0, bubbles: true }));
+      window.dispatchEvent(padMouse(intent.attack ? 'mousedown' : 'mouseup'));
       this.attackHeld = intent.attack;
     }
 

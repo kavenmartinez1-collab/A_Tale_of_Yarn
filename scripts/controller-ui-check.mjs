@@ -906,6 +906,196 @@ await reset();
 await bootOk('overlays');
 
 // ═════════════════════════════════════════════════════════════════════════════
+section('7b. Settings, Controls and Help — reachable and usable with a pad only');
+// ═════════════════════════════════════════════════════════════════════════════
+
+await reset();
+{
+  await tap(B.START);
+  await frames(12);
+  say((await focus()).context === 'pause', 'the pause screen is up');
+
+  // ---- the three buttons exist on the rail and the pad can reach them ------
+  const railBtns = await D(() => [...document.querySelectorAll('#pause-screen .rail button')]
+    .map((b) => (b.textContent || '').trim().split('\n')[0].trim()));
+  say(railBtns.some((t) => /^Settings/i.test(t)), 'a Settings button is on the pause rail',
+    railBtns.join(' | ').slice(0, 150));
+  say(railBtns.some((t) => /^Controls/i.test(t)), 'a Controls button is on the pause rail');
+  say(railBtns.some((t) => /^How to play|^Help/i.test(t)), 'a Help button is on the pause rail');
+
+  // ---- Settings opens by pad, and the world is STILL paused ---------------
+  const beforeSim = await D(() => window.__gameDebug.simTime());
+  const toSettings = await seek((f) => /^Settings/i.test(f.label || ''));
+  say(toSettings.hit, 'the pad can reach Settings', `${toSettings.steps} steps`);
+  await tap(B.A);
+  await frames(14);
+
+  const inSettings = await D(() => ({
+    sheet: !!document.querySelector('#pause-screen .chart-sheet'),
+    settings: !!document.getElementById('settings-sheet'),
+    title: (document.querySelector('#pause-screen .chart-title') || {}).textContent || '',
+    paused: window.__gameDebug.paused(),
+    context: window.__gameDebug.padFocus().context,
+  }));
+  say(inSettings.sheet && inSettings.settings,
+    'Settings opened inside the pause screen', JSON.stringify(inSettings).slice(0, 150));
+  // The whole reason for swapping the chart body instead of opening a new
+  // panel id: a settings screen reached from pause must not restart the world.
+  say(inSettings.paused === true, 'the world is STILL paused behind Settings');
+  say(inSettings.context === 'pause', 'the pad focus context is still `pause`');
+
+  await frames(30);
+  const simDrift = (await D(() => window.__gameDebug.simTime())) - beforeSim;
+  say(simDrift === 0, 'the sim clock did not advance while Settings was open',
+    `drift ${simDrift}`);
+
+  // ---- a setting APPLIES LIVE ---------------------------------------------
+  const KEYS = ['volMaster', 'volMusic', 'volSfx', 'volVoice', 'mouseSensitivity', 'renderScale'];
+  const before = await D(() => {
+    const o = window.__gameDebug.settings();
+    return { volMaster: o.volMaster, volMusic: o.volMusic, volSfx: o.volSfx,
+      volVoice: o.volVoice, mouseSensitivity: o.mouseSensitivity, renderScale: o.renderScale };
+  });
+  // Walk the ring onto a stepper rather than clicking it directly — the claim
+  // is that a PAD can change a setting, so the pad has to be what changes it.
+  const bump = await seek((f) => {
+    const t = (f.label || '').trim();
+    return t === '−' || t === '+';
+  }, 12, 6);
+  say(bump.hit, 'the pad can land on a volume stepper', `${bump.steps} steps`);
+  await tap(B.A);
+  await frames(8);
+  const after0 = await D(() => {
+    const o = window.__gameDebug.settings();
+    return { volMaster: o.volMaster, volMusic: o.volMusic, volSfx: o.volSfx,
+      volVoice: o.volVoice, mouseSensitivity: o.mouseSensitivity, renderScale: o.renderScale };
+  });
+  const live = await D(() => window.__gameDebug.settings());
+  const stored = await page.evaluate(() => {
+    try { return JSON.parse(localStorage.getItem('artifex-settings:v1') || 'null'); }
+    catch { return null; }
+  });
+  const diverged = stored ? KEYS.filter((k) => Math.abs(stored[k] - live[k]) > 1e-9) : KEYS;
+  // WHICH slider the ring lands on depends on the geometry of the sheet, and
+  // pinning it to one would make this beat a test of the layout rather than of
+  // the pad. The claim is that a pad press moves a setting; name whichever one
+  // moved so a regression still says what broke.
+  const moved = KEYS.filter((k) => Math.abs(before[k] - after0[k]) > 1e-9);
+  say(moved.length > 0, 'pressing A on a stepper moves a value',
+    moved.length ? moved.map((k) => `${k} ${before[k]} → ${after0[k]}`).join(', ')
+      : `nothing moved (${JSON.stringify(before)})`);
+  // The contract that matters: whatever the panel shows, storage agrees. One
+  // code path writes both, so a mismatch means the panel and the save drifted.
+  say(stored !== null && diverged.length === 0,
+    'the live settings and the persisted settings agree',
+    diverged.length ? `diverged: ${diverged.join(', ')}` : 'all numeric fields match');
+
+  // ---- Controls and Help are reachable and have real content --------------
+  await reset();
+  await tap(B.START);
+  await frames(12);
+  const toControls = await seek((f) => /^Controls/i.test(f.label || ''));
+  say(toControls.hit, 'the pad can reach Controls');
+  await tap(B.A);
+  await frames(14);
+  const controls = await D(() => {
+    const body = document.querySelector('#pause-screen .chart-body');
+    const txt = body ? body.textContent || '' : '';
+    // Read the key CHIPS as elements. `textContent` on the container joins
+    // every node with no separator, so "…craftingLTLock on…" defeats any word
+    // boundary — an earlier version of this beat reported a false failure that
+    // way, which is exactly the kind of green-that-means-nothing this project
+    // keeps finding.
+    const leaves = [...(body ? body.querySelectorAll('*') : [])]
+      .filter((e) => e.children.length === 0);
+    const chips = leaves.map((e) => (e.textContent || '').trim());
+    const rowFor = (key) => {
+      const el = leaves.find((e) => (e.textContent || '').trim() === key);
+      return el && el.parentElement ? (el.parentElement.textContent || '') : '';
+    };
+    const zChip = chips.find((c) => c.indexOf('Z') === 0);
+    return {
+      chars: txt.length,
+      hasLT: chips.indexOf('LT') !== -1,
+      hasL3: chips.indexOf('L3') !== -1,
+      ltSaysLock: /lock on/i.test(rowFor('LT')),
+      l3SaysSprint: /sprint/i.test(rowFor('L3')),
+      zLock: !!zChip && /lock on/i.test(rowFor(zChip)),
+      paused: window.__gameDebug.paused(),
+    };
+  });
+  say(controls.chars > 300, 'Controls has real content', `${controls.chars} chars`);
+  // The bindings that changed most recently — the panel is the only place a
+  // player can learn them, so stale text here is a real defect.
+  say(controls.hasLT && controls.ltSaysLock, 'Controls documents LT = lock on',
+    `chip=${controls.hasLT}, row mentions lock on=${controls.ltSaysLock}`);
+  say(controls.hasL3 && controls.l3SaysSprint, 'Controls documents L3 = sprint',
+    `chip=${controls.hasL3}, row mentions sprint=${controls.l3SaysSprint}`);
+  say(controls.zLock, 'Controls documents Z / middle-click = lock on');
+  say(controls.paused === true, 'the world is still paused behind Controls');
+
+  await reset();
+  await tap(B.START);
+  await frames(12);
+  const toHelp = await seek((f) => /^How to play|^Help/i.test(f.label || ''));
+  say(toHelp.hit, 'the pad can reach Help');
+  await tap(B.A);
+  await frames(14);
+  const help = await D(() => {
+    const body = document.querySelector('#pause-screen .chart-body');
+    const txt = body ? body.textContent || '' : '';
+    return {
+      chars: txt.length,
+      castle: /castle/i.test(txt),
+      thirst: /thirst|drink/i.test(txt),
+      paused: window.__gameDebug.paused(),
+    };
+  });
+  say(help.chars > 200, 'Help has real content', `${help.chars} chars`);
+  say(help.castle && help.thirst, 'Help covers escaping the castle and staying alive');
+  say(help.paused === true, 'the world is still paused behind Help');
+
+  // ---- B backs out of a sheet, not straight out of the pause screen -------
+  await tap(B.B);
+  await frames(14);
+  const afterBack = await D(() => ({
+    context: window.__gameDebug.padFocus().context,
+    hasChart: !!document.querySelector('#pause-screen .chart-cloth canvas'),
+  }));
+  say(afterBack.context === 'pause' && afterBack.hasChart,
+    'B returns to the map rather than closing the pause screen',
+    JSON.stringify(afterBack));
+}
+await bootOk('settings/controls/help');
+
+// ═════════════════════════════════════════════════════════════════════════════
+section('7c. Settings survive a reload');
+// ═════════════════════════════════════════════════════════════════════════════
+
+{
+  // Write a value that is nothing like the default, reload, and read it back
+  // through the live store — not through localStorage, which would only prove
+  // the write happened and not that the game applies it on boot.
+  await D(() => { window.__gameDebug.settings().set({ volVoice: 0.23, voiceEnabled: false }); });
+  await frames(6);
+  const wrote = await D(() => window.__gameDebug.settings());
+  say(wrote && Math.abs(wrote.volVoice - 0.23) < 1e-9 && wrote.voiceEnabled === false,
+    'a setting can be written through the store', JSON.stringify(wrote).slice(0, 120));
+
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => window.__gameReady === true, undefined, { timeout: 120_000 });
+  await page.evaluate(() => { window.__padBoot = 1; }); // this reload is deliberate
+  await frames(10);
+
+  const after = await page.evaluate(() => window.__gameDebug.settings());
+  say(after && Math.abs(after.volVoice - 0.23) < 1e-9 && after.voiceEnabled === false,
+    'and it is still there after a reload', JSON.stringify(after).slice(0, 120));
+
+  // Put it back so the rest of the run (and the next run) starts clean.
+  await page.evaluate(() => { window.__gameDebug.settings().reset(); });
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 section('8. The mouse must still work, and must not desync the ring');
 // ═════════════════════════════════════════════════════════════════════════════
 

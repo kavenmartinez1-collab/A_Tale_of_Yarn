@@ -227,6 +227,12 @@ export class DungeonManager {
     private readonly specProvider: SpecProvider | null = null,
   ) {}
 
+  /** Melee tokens currently held by dungeon enemies — the music engine's
+   *  combat signal underground. The pool lives in dungeon-combat.ts behind
+   *  this manager; without a passthrough, dungeon fights read as calm
+   *  forever (MUSIC_HOOK.md's flagged gap). */
+  get meleeHeld(): number { return this.combat.tokens.heldCount; }
+
   get isInside(): boolean {
     return this.resident !== null;
   }

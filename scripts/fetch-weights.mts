@@ -127,6 +127,51 @@ const SHIP: Want[] = [
     file: 'tokenizer_config.json',
     why: 'special-token map — <|startofprev|> is how the vocabulary bias is injected',
   },
+  // ── Villager voices ───────────────────────────────────────────────────────
+  // The destination repo id is NOT the source repo id. `rhasspy/piper-voices`
+  // is one repo holding every voice in every language; the game asks for
+  // `rhasspy/piper-en-us-joe-medium`, which puts these two files in a
+  // directory of their own. That matters twice over: `pack-steam.mjs` ships a
+  // model directory only if its name contains `--`, and the depot's
+  // local-server maps `<org>--<repo>` straight back to the repo id the worker
+  // requests. Vendoring the whole voices repo would drag in ~900 voices.
+  {
+    repo: 'rhasspy/piper-en-us-joe-medium',
+    file: 'en_US-joe-medium.onnx',
+    from: 'rhasspy/piper-voices',
+    fromFile: 'en/en_US/joe/medium/en_US-joe-medium.onnx',
+    why: 'villager voices — piper VITS under ORT wasm on the CPU, never the GPU queue',
+  },
+  {
+    repo: 'rhasspy/piper-en-us-joe-medium',
+    file: 'en_US-joe-medium.onnx.json',
+    from: 'rhasspy/piper-voices',
+    fromFile: 'en/en_US/joe/medium/en_US-joe-medium.onnx.json',
+    why: 'phoneme id map + sample rate for the voice above',
+  },
+];
+
+/**
+ * Files that are BUILT here rather than downloaded, checked the same way.
+ *
+ * The pronunciation lexicon cannot come from HF: it is derived from CMUdict
+ * (BSD-2-Clause) by scripts/build-lexicon.mts. It exists because the shipped
+ * game cannot phonemize with eSpeak NG — GPL-3.0, and pack-steam.mjs refuses to
+ * build a depot containing it.
+ */
+const BUILT: Array<{ repo: string; file: string; build: string; why: string }> = [
+  {
+    repo: 'rhasspy/piper-en-us-joe-medium',
+    file: 'lexicon-en-us.txt',
+    build: 'scripts/build-lexicon.mts',
+    why: 'English G2P dictionary (CMUdict, BSD-2-Clause) — the non-GPL eSpeak replacement',
+  },
+  {
+    repo: 'rhasspy/piper-en-us-joe-medium',
+    file: 'LICENSE-cmudict.txt',
+    build: 'scripts/build-lexicon.mts',
+    why: 'the BSD-2-Clause notice CMUdict requires be redistributed with it',
+  },
 ];
 
 /**
@@ -301,6 +346,23 @@ async function main() {
     total += bytes;
     if (!skipped) downloaded += bytes;
     rows.push([rel, `${fmt(bytes)}${skipped ? ' (present)' : ''}`, want.why]);
+  }
+
+  // Built artifacts — generate any that are missing, then report them like the
+  // downloads so `--check` shows one complete picture of what the depot needs.
+  for (const b of BUILT) {
+    const destDir = dirFor(b.repo);
+    const p = path.join(destDir, b.file);
+    const rel = path.relative(REPO_ROOT, p).replace(/\\/g, '/');
+    if (!fs.existsSync(p) && !checkOnly) {
+      console.log(`${b.repo} — building ${b.file}`);
+      const { execFileSync } = await import('node:child_process');
+      execFileSync('npx', ['tsx', b.build], { cwd: REPO_ROOT, stdio: 'inherit', shell: true });
+    }
+    const present = fs.existsSync(p);
+    const size = present ? fs.statSync(p).size : 0;
+    total += size;
+    rows.push([rel, present ? fmt(size) : 'MISSING', b.why]);
   }
 
   console.log('');

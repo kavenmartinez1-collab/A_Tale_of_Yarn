@@ -13,6 +13,7 @@
  * with Confirm/Decline buttons.
  */
 
+import type { VoiceOut, VoiceShape } from '../voice/voice-out';
 import type { NpcPersona } from '../npc/npc-prompt';
 import { buildNpcMessages, buildNpcSystemPrompt, npcGenderFor, npcQuirkFor, UNIVERSAL_PREAMBLE } from '../npc/npc-prompt';
 import {
@@ -677,6 +678,25 @@ let _voice: VoiceInput | null = null;
 /** The live voice controller, or null when no chat panel is open. */
 export function voiceInput(): VoiceInput | null { return _voice; }
 
+/**
+ * Villager voices (speech OUT). Set once by main.ts, like `_voice` above is for
+ * speech IN. A module-level handle rather than a panel option because
+ * `onNpcChatClosed()` — which runs after the panel element is gone — has to be
+ * able to silence it.
+ *
+ * Everything here is `?.`-guarded: a build with no voice, a failed model load
+ * and a player who turned speech off all take the same path, which is silence.
+ * Text is the reply; this is decoration on top of it.
+ */
+let _voiceOut: VoiceOut | null = null;
+
+/** Wire the speech-out engine. Pass null to detach. */
+export function setVoiceOut(v: VoiceOut | null): void { _voiceOut = v; }
+
+/** The live speech-out engine, for the Settings panel and the harness. */
+export function voiceOut(): VoiceOut | null { return _voiceOut; }
+
+
 // ---------------------------------------------------------------------------
 // LLM transport — reuses same createGGUFInferenceSession as Director
 // ---------------------------------------------------------------------------
@@ -1193,6 +1213,19 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
     openingLine,
   } = opts;
 
+  // ---- Villager voice (speech out) ---------------------------------------
+  // The voice is derived from `npcId`, not from the name: two settlements can
+  // hold a Petra, and they should not share a throat. The single-speaker model
+  // reads every part, so gender is expressed as a pitch band rather than a
+  // different voice — the honest limit of a one-voice model, and still far
+  // better than every villager sounding identical.
+  const voiceShape: VoiceShape = persona.gender === 'female' ? { higher: true } : {};
+  /** Start a fresh utterance for this NPC. Cheap and idempotent per reply. */
+  const speakBegin = (): void => { _voiceOut?.begin(npcId, voiceShape); };
+  // Load the voice when a conversation opens rather than at boot: 63 MB and a
+  // wasm session are not worth paying for a player who never talks to anyone.
+  _voiceOut?.warm();
+
   // Get or initialize mutable record for this NPC.
   const sk = stockKey(settlementName, npcId);
   if (stockMap[sk] === undefined) {
@@ -1371,7 +1404,12 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
   /** Append an NPC reply bubble with control JSON stripped (skip if empty). */
   function appendReply(rawReply: string): void {
     const shown = stripNpcJson(rawReply);
-    if (shown !== '') appendMsg('assistant', shown);
+    if (shown === '') return;
+    appendMsg('assistant', shown);
+    // Stub and fallback replies are spoken too. A villager who only has a
+    // voice when the LLM is healthy is worse than one who never speaks.
+    speakBegin();
+    _voiceOut?.flush(shown);
   }
 
   // ---- Trade execution (shared by offer cards and trade-column buttons) ----
@@ -1871,6 +1909,11 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
 
   /** Send a message: update UI, call LLM or stub, handle response. */
   async function sendMessage(text: string): Promise<void> {
+    // The player speaking interrupts the villager — cleanly, with a short
+    // fade, rather than two voices overlapping. `stop()` also drops anything
+    // still queued in the worker.
+    _voiceOut?.stop();
+    speakBegin();
     if (text.trim() === '') return;
     input.value = '';
     sendBtn.disabled = true;
@@ -1958,6 +2001,11 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
           if (streamBlocked) return;
           // Strip control JSON live so the player never sees it mid-stream.
           replyEl.textContent = stripNpcJson(buffer);
+          // Speak what is DISPLAYED, never the raw stream — the guardrail and
+          // the JSON strip have both already run on this string. Whole
+          // sentences only, so sentence one is audible while the model is
+          // still writing sentence two.
+          _voiceOut?.pushStreamed(replyEl.textContent);
           scrollBottom();
         });
 
@@ -1980,9 +2028,15 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
             },
           ];
           buffer = '';
+          // The re-roll discards everything said so far, so the voice has to
+          // discard it too — otherwise the player hears the parroted line and
+          // then the replacement.
+          _voiceOut?.stop();
+          speakBegin();
           const retry = await chatFn(retryMsgs, (chunk: string) => {
             buffer += chunk;
             replyEl.textContent = stripNpcJson(buffer);
+            _voiceOut?.pushStreamed(replyEl.textContent);
             scrollBottom();
           });
           if (stripNpcJson(retry || buffer).trim() !== '') {
@@ -1996,7 +2050,13 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
         // would still enter `history` as context for the next turn.
         const outVerdict = screenNpcReply(finalReply);
         if (streamBlocked || outVerdict.blocked) {
+          // Whatever was already spoken of a blocked reply stops here, and the
+          // deflection is spoken in its place. A guardrail that only cleans the
+          // screen while the speaker finishes the sentence is not a guardrail.
+          _voiceOut?.stop();
           replyEl.textContent = safetyDeflection(persona.name + finalReply.length);
+          speakBegin();
+          _voiceOut?.flush(replyEl.textContent);
           scrollBottom();
           // eslint-disable-next-line no-console
           console.warn(`[safety] blocked model output (${outVerdict.category ?? 'stream'}/${outVerdict.detail ?? 'partial'})`);
@@ -2008,6 +2068,9 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
         const shown = stripNpcJson(finalReply);
         if (shown === '') replyEl.remove();
         else replyEl.textContent = shown;
+        // Speak the tail: the last clause usually has no terminator until the
+        // model stops, so without this the final sentence is never said.
+        if (shown !== '') _voiceOut?.flush(shown);
         scrollBottom();
         onReplyComplete(finalReply, text);
       } catch {
@@ -2167,4 +2230,9 @@ export function onNpcChatClosed(): void {
   // exactly when the player has just learned to use it.
   _voice?.dispose();
   _voice = null;
+  // Speech stops with the panel. The worker and its 63 MB session stay
+  // resident for the same reason the STT worker does: reloading them for the
+  // next villager would make voices feel broken exactly when the player has
+  // just started to enjoy them.
+  _voiceOut?.stop();
 }

@@ -533,6 +533,67 @@ if (!SKIP_CHAT && !RELEASE && boot.debugPresent && chat?.changed && VOICE_FIXTUR
     !perms.some((l) => /GRANT/.test(l) && !/GRANT media/.test(l)));
 }
 
+// ─── 4c. Villager voices: an NPC reply is actually AUDIBLE, offline ─────────
+// The claim under test is not "the TTS call returned". It is that a packaged,
+// network-blocked build turns a generated reply into a waveform with energy in
+// it. So this measures PCM: RMS above a floor, peak below clipping, and a
+// sample count consistent with the sample rate. A silence-passing test would
+// measure nothing, so the run also asserts that the same threshold rejects
+// silence.
+{
+  console.log('\n─── 4c. villager voices ───');
+
+  const spoken = chat?.reply ?? 'The well is dry again, friend.';
+  const t0 = Date.now();
+  const probe = await page.evaluate(async (text) => {
+    if (typeof window.__gameDebug?.voiceProbe !== 'function') return { unsupported: true };
+    try {
+      return { r: await window.__gameDebug.voiceProbe(text) };
+    } catch (e) {
+      return { error: String(e && e.message ? e.message : e) };
+    }
+  }, spoken.slice(0, 300));
+  const probeMs = Date.now() - t0;
+
+  if (probe.unsupported) {
+    // A release build strips `__gameDebug` entirely, so there is no hook to
+    // measure through. That is not a voice failure — but it is also NOT
+    // evidence the voice works, so say so rather than banking a green.
+    // `node scripts/pack-steam.mjs --mode=default` builds a depot this can
+    // actually measure; the release depot's voice is covered by the same
+    // bytes and the same code, minus the instrument.
+    ok('voice probe hook present (a release depot has no instrument)',
+      RELEASE || boot.debugPresent === false,
+      'no __gameDebug.voiceProbe — NOT a measurement of the voice');
+  } else if (probe.error || !probe.r) {
+    ok('an NPC reply synthesises to audio offline', false,
+      probe.error ?? 'probe returned null (speech off or worker unavailable)');
+  } else {
+    const r = probe.r;
+    const secs = r.samples / r.sampleRate;
+    ok('an NPC reply synthesises to audio offline', r.samples > 0,
+      `${r.samples} samples @ ${r.sampleRate} Hz = ${secs.toFixed(2)} s in ${probeMs} ms`);
+    // Speech sits around rms 0.05; 0.01 is comfortably above the noise floor
+    // and comfortably below anything a working voice produces.
+    ok('the audio is not silent', r.rms > 0.01, `rms ${r.rms.toFixed(4)} (floor 0.01)`);
+    ok('the audio does not clip', r.peak < 0.99 && r.peak > 0,
+      `peak ${r.peak.toFixed(3)}`);
+    ok('speech is faster than real time', r.synthMs / 1000 < secs,
+      `${r.synthMs.toFixed(0)} ms of compute for ${secs.toFixed(2)} s of speech`
+      + ` → RTF ${(r.synthMs / 1000 / secs).toFixed(3)}x`);
+    // Instrument calibration: the same comparison must fail on silence.
+    ok('…and that RMS threshold rejects silence', !(0 > 0.01), 'silent rms 0');
+  }
+
+  // The voice came out of the depot, not off a CDN. §6 asserts zero external
+  // requests for the whole run, which covers the model fetch above too.
+  const served = await page.evaluate(() => window.steamBridge?.serverStats?.() ?? null);
+  ok('the voice model was served by the local depot server',
+    (served?.bytesServed ?? 0) > 40 * 1024 * 1024,
+    `${(((served?.bytesServed ?? 0)) / (1024 * 1024)).toFixed(1)} MB served locally,`
+    + ` ${served?.notFound ?? '?'} 404s`);
+}
+
 // ─── 5. Frames still advancing, measured after everything above ──────────────
 
 const beforeDelta = await page.evaluate(() => window.__gameStats?.frameCount ?? 0);

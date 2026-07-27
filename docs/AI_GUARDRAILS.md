@@ -29,6 +29,12 @@ category:
 | Sexual content involving minors | Yes — hard block, both directions | Illegal in every target market. No legitimate use in this product. |
 | Other mature content (sex, violence, drugs, crime, blasphemy) | Not blocked | Legal. Core to the product. Handled by store age-rating, not by filtering. |
 
+Since the villager-voice work, live-generated dialogue is also **spoken aloud**.
+That does not add a category — the text a voice reads has already passed every
+layer below, and the voice cannot originate content — but it does change what
+the Content Survey has to disclose, and it adds one ordering requirement that
+is enforced in code. See *Spoken dialogue* below.
+
 A filter that blocked more than this would not make the game safer — it would
 break the feature it is protecting, and quietly. Nobody files a bug report
 saying "the blacksmith declined to discuss my divorce."
@@ -113,6 +119,28 @@ costs microseconds and can be read by a human.
 **Honest limit:** term matching is not semantic and a determined user can work
 around it. It is one layer of four, and layer 1 is the one that matters most.
 
+### 3b. Spoken dialogue (text-to-speech)
+
+NPC replies are spoken as well as written. Three facts a reviewer can check:
+
+- **The voice never speaks anything the player has not been shown.** The speech
+  engine is fed the panel's *displayed* string — the one already through
+  `screenNpcReply` and `stripNpcJson` — never the raw model stream.
+  `npc-chat-panel.ts` passes `replyEl.textContent`, and `speakableText()` in
+  `src/game/voice/voice-out.ts` is a second, independent strip.
+- **A blocked reply is silenced, not just hidden.** When the output-side
+  guardrail fires mid-stream, `VoiceOut.stop()` cuts the utterance within 80 ms
+  and the deflection is spoken in its place. A filter that cleans the screen
+  while the speaker finishes the sentence is not a filter.
+- **The voice is not generative.** `en_US-joe-medium` is a fixed single-speaker
+  VITS acoustic model; it converts phonemes to a waveform. It cannot author
+  words, and it does not clone any living person's voice. Per-NPC variation is
+  arithmetic — a deterministic pitch/rate seed derived from the NPC's id — not a
+  second model.
+
+Speech is off-thread and CPU-only, runs entirely offline, and can be turned off
+in Settings. Nothing the player types or hears leaves the machine.
+
 ### 4. Player-facing disclosure
 
 Two disclosures, both in the game itself:
@@ -122,6 +150,12 @@ Two disclosures, both in the game itself:
   nothing they type is sent anywhere, it can be wrong or offensive, and it is
   not a person. `AI_DISCLOSURE_TEXT` in `src/game/ui/npc-chat-panel.ts`.
 - A **persistent** `replies are AI-generated` line under the input box.
+
+The first-run notice covers spoken dialogue by construction: the voice reads
+the same generated reply the notice is about, so a player who has been told the
+words are AI-generated has been told the speech is. Speech adds no separate
+consent surface, and it is **opt-outable** — Settings › Voice — which the text
+is not.
 
 This addresses EU AI Act **Article 50(1)**, applicable from **2 August 2026**,
 and it is *also* one of the five conjunctive conditions of the Article 50(2)
