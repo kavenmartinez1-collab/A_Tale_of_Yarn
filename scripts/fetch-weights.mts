@@ -149,6 +149,34 @@ const SHIP: Want[] = [
     fromFile: 'en/en_US/joe/medium/en_US-joe-medium.onnx.json',
     why: 'phoneme id map + sample rate for the voice above',
   },
+  // The SECOND voice, and the reason there is one: joe is male, and resampling
+  // a male voice upwards does not produce a woman — the formants ride along
+  // and it becomes a fast small man. Every female NPC synthesizes here.
+  //
+  // ljspeech was chosen on LICENCE first and pitch second. Its MODEL_CARD
+  // gives the dataset as LJ Speech (https://keithito.com/LJ-Speech-Dataset/),
+  // whose own statement is "This dataset is in the public domain in the US
+  // (and most likely other countries as well). There are no restrictions on
+  // its use." — the same commercial-safe class as joe's CC0. The rejected
+  // candidates and why are recorded in scripts/audio-credits.json.
+  //
+  // It also happens to need almost no resampling: measured natural f0 219 Hz
+  // against joe's 100 Hz, so the female band sits at 0.85..1.07 rather than
+  // the 1.3x costume the old single-model design was forced into.
+  {
+    repo: 'rhasspy/piper-en-us-ljspeech-medium',
+    file: 'en_US-ljspeech-medium.onnx',
+    from: 'rhasspy/piper-voices',
+    fromFile: 'en/en_US/ljspeech/medium/en_US-ljspeech-medium.onnx',
+    why: 'female villager voices — public-domain LJ Speech, same ORT wasm CPU path',
+  },
+  {
+    repo: 'rhasspy/piper-en-us-ljspeech-medium',
+    file: 'en_US-ljspeech-medium.onnx.json',
+    from: 'rhasspy/piper-voices',
+    fromFile: 'en/en_US/ljspeech/medium/en_US-ljspeech-medium.onnx.json',
+    why: 'phoneme id map + sample rate for the female voice above',
+  },
 ];
 
 /**
@@ -158,6 +186,14 @@ const SHIP: Want[] = [
  * (BSD-2-Clause) by scripts/build-lexicon.mts. It exists because the shipped
  * game cannot phonemize with eSpeak NG — GPL-3.0, and pack-steam.mjs refuses to
  * build a depot containing it.
+ *
+ * It is built into joe's directory ONLY, and the ljspeech directory
+ * deliberately has no copy: the lexicon maps English words to IPA and is a
+ * property of the language, not of the speaker. Both models consume the same
+ * IPA through their own phoneme_id_map (ljspeech's is a strict superset of
+ * joe's and agrees on every shared phoneme's id). tts-worker.ts fetches it
+ * once from this path for both voices; steam-pack-check.mjs asserts both
+ * directories reach the depot so the sharing cannot rot silently.
  */
 const BUILT: Array<{ repo: string; file: string; build: string; why: string }> = [
   {

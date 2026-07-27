@@ -18,6 +18,7 @@
  */
 
 import type { GPUContext } from '../../engine/gpu-device';
+import { STEAM_RELEASE } from '../release-flags';
 import type { InferenceSession } from '../../engine/inference';
 import { DUNGEON_FIXTURES } from '../dungeon/dungeon-fixtures';
 import { mix32 } from '../dungeon/dungeon-layout';
@@ -302,7 +303,12 @@ export class DungeonDirector implements SpecProvider {
   private async ensureChat(): Promise<DirectorChatFn> {
     if (this.chat !== null) return this.chat;
 
-    const mock = typeof window !== 'undefined' ? window.__DIRECTOR_MOCK__ : undefined;
+    // Test seam, sealed in the Steam release build: an injected function that
+    // replaces the model is exactly the kind of surface a shipped game must
+    // not expose (release-flags strips __gameDebug for the same reason; this
+    // one lived one module over and was missed by that pass).
+    const mock = (!STEAM_RELEASE && typeof window !== 'undefined')
+      ? window.__DIRECTOR_MOCK__ : undefined;
     if (typeof mock === 'function') {
       this.chat = async (messages) => ({
         text: String(await mock(messages)),

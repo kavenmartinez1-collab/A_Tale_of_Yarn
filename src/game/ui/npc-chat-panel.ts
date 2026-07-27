@@ -16,6 +16,7 @@
 import type { VoiceOut, VoiceShape } from '../voice/voice-out';
 import type { NpcPersona } from '../npc/npc-prompt';
 import { buildNpcMessages, buildNpcSystemPrompt, npcGenderFor, npcQuirkFor, UNIVERSAL_PREAMBLE } from '../npc/npc-prompt';
+import { STEAM_RELEASE } from '../release-flags';
 import {
   screenPlayerInput, screenNpcReply, safetyDeflection,
 } from '../npc/content-safety';
@@ -707,6 +708,27 @@ declare global {
   }
 }
 
+/**
+ * The e2e reply-injection seam, or null in a Steam release build.
+ *
+ * `__NPC_CHAT_MOCK__` lets a Playwright spec supply villager replies without
+ * loading a 2.4 GB model, which is why several specs are affordable at all. It
+ * is also, in a shipped build, an arbitrary function that decides what every
+ * NPC in the game says — the same class of surface as `__gameDebug`, but it sat
+ * outside that strip and survived into release. Nothing assigns it in a
+ * release build, but "nothing assigns it" is not a guarantee when the consumer
+ * is a bare `typeof window.X === 'function'` that anything on the page can
+ * satisfy.
+ *
+ * Every read goes through here so the seal is one decision rather than four
+ * `if`s that have to stay in agreement. Mirrors the guard on the identical
+ * seam in `director.ts`.
+ */
+function chatMock(): ((messages: ChatMessage[]) => string | Promise<string>) | null {
+  if (STEAM_RELEASE) return null;
+  return typeof window.__NPC_CHAT_MOCK__ === 'function' ? window.__NPC_CHAT_MOCK__ : null;
+}
+
 export type NpcChatFn = (
   messages: ChatMessage[],
   onToken?: (chunk: string) => void,
@@ -1158,7 +1180,7 @@ export async function preloadNpcChat(
 ): Promise<boolean> {
   if (_liveChatFn !== null) return true;
   if (_chatFnBuilding) return false;
-  if (typeof window.__NPC_CHAT_MOCK__ === 'function') return true;
+  if (chatMock() !== null) return true;
   _chatFnBuilding = true;
   try {
     _liveChatFn = await buildLiveChatFn(gpu, npcModel);
@@ -1215,16 +1237,25 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
 
   // ---- Villager voice (speech out) ---------------------------------------
   // The voice is derived from `npcId`, not from the name: two settlements can
-  // hold a Petra, and they should not share a throat. The single-speaker model
-  // reads every part, so gender is expressed as a pitch band rather than a
-  // different voice — the honest limit of a one-voice model, and still far
-  // better than every villager sounding identical.
-  const voiceShape: VoiceShape = persona.gender === 'female' ? { higher: true } : {};
+  // hold a Petra, and they should not share a throat. Gender selects which of
+  // the two vendored acoustic models speaks the part — women are synthesized
+  // on a female voice rather than on a man resampled upwards, which is what
+  // the player heard and correctly rejected. See `BANDS` in voice-out.ts.
+  //
+  // Gender is read from the NAME, not from `persona.gender`, and that is
+  // deliberate: `persona.gender` is not assigned until further down this same
+  // function (`persona.gender = npcGenderFor(persona.name)`), so reading the
+  // field here would see `undefined` on any panel opened without a preceding
+  // `warmNpcApproach` — and every woman would silently fall back to the male
+  // model. Calling the function directly cannot be broken by statement order.
+  const voiceGender = npcGenderFor(persona.name);
+  const voiceShape: VoiceShape = { gender: voiceGender };
   /** Start a fresh utterance for this NPC. Cheap and idempotent per reply. */
   const speakBegin = (): void => { _voiceOut?.begin(npcId, voiceShape); };
   // Load the voice when a conversation opens rather than at boot: 63 MB and a
   // wasm session are not worth paying for a player who never talks to anyone.
-  _voiceOut?.warm();
+  // Warm only the model THIS NPC needs; the other gender's model stays unread.
+  _voiceOut?.warm(voiceGender);
 
   // Get or initialize mutable record for this NPC.
   const sk = stockKey(settlementName, npcId);
@@ -1943,9 +1974,10 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
     const messages = buildNpcMessages(persona, history.slice(0, -1), text);
 
     if (stubMode) {
-      // Use __NPC_CHAT_MOCK__ if set (for e2e injection).
-      if (typeof window.__NPC_CHAT_MOCK__ === 'function') {
-        const reply = String(await window.__NPC_CHAT_MOCK__(messages));
+      // Use __NPC_CHAT_MOCK__ if set (for e2e injection; never in a release build).
+      const mock = chatMock();
+      if (mock !== null) {
+        const reply = String(await mock(messages));
         appendReply(reply);
         onReplyComplete(reply, text);
       } else {
@@ -1962,9 +1994,9 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
         let chatFn = _liveChatFn;
         if (chatFn === null) {
           // Check for mock first.
-          if (typeof window.__NPC_CHAT_MOCK__ === 'function') {
-            chatFn = async (msgs: ChatMessage[]) =>
-              String(await window.__NPC_CHAT_MOCK__!(msgs));
+          const mock = chatMock();
+          if (mock !== null) {
+            chatFn = async (msgs: ChatMessage[]) => String(await mock(msgs));
             _liveChatFn = chatFn;
           } else if (gpu !== undefined && !_chatFnBuilding) {
             _chatFnBuilding = true;

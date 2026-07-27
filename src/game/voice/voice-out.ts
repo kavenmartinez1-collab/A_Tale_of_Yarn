@@ -54,28 +54,104 @@ function mix32(a: number, b: number, c = 0): number {
 /** Salt, so an id's voice cannot collide with its combat or colour rolls. */
 const VOICE_SALT = 0x5010ce;
 
+/** Which acoustic model synthesizes a voice. Two are vendored; see tts-worker. */
+export type VoiceModelId = 'male' | 'female';
+
+export type VoiceGender = 'male' | 'female';
+
 export interface VoiceParams {
   noiseScale: number;
   lengthScale: number;
   noiseW: number;
   pitch: number;
+  /** The model to synthesize on. The worker keeps one ORT session per value. */
+  model: VoiceModelId;
 }
 
 export interface VoiceShape {
-  /** Deeper and slower — the Evil King. */
+  /** Deeper and slower — the Evil King. Implies the male model. */
   deeper?: boolean;
-  /** Higher — the single-speaker voice reading a woman's part. */
-  higher?: boolean;
+  /** The NPC's gender, from `npcGenderFor(name)`. Chooses the acoustic model. */
+  gender?: VoiceGender;
+}
+
+/**
+ * MEASURED natural f0 of each vendored model, in Hz, on the audition line at
+ * pitch 1.0 — median of per-frame YIN over the voiced frames, averaged across
+ * the noise-parameter sweep. Produced by `scripts/voice-audition.mts`; re-run
+ * it if a model is ever replaced.
+ *
+ * These are not decoration. Every band below is expressed as a target in Hz
+ * and converted to a resample ratio through these numbers, so the bands mean
+ * something acoustic rather than something arbitrary.
+ */
+export const MODEL_F0 = { male: 99.6, female: 219.2 } as const;
+
+/**
+ * Pitch bands, as [lo, hi, slots].
+ *
+ * WHY TWO MODELS, NOT ONE MODEL RESAMPLED. The previous design synthesized
+ * every NPC on joe — a male voice — and gave women a `higher` band of
+ * 1.08..1.30. That does not produce a woman. Resampling moves the FORMANTS
+ * with the pitch, so a male voice played 1.3x fast is a small man, not a
+ * woman; the player reported exactly that. Worse, the `higher` band
+ * (1.08..1.30) OVERLAPPED the villager band (0.88..1.12), so a woman who
+ * rolled low landed underneath most of the men. Both defects are structural
+ * and neither is fixable by moving numbers around on one model.
+ *
+ * So gender now selects a MODEL, and the band inside each model exists only to
+ * separate one villager from her neighbour. Both bands sit near 1.0 (±12-15%),
+ * which is the range where the resample is a pitch change rather than a
+ * costume — the female voice is a female voice before we touch it.
+ *
+ * WHY SLOTS RATHER THAN A CONTINUOUS DRAW. A continuous draw can put two
+ * villagers 0.1 Hz apart, which is the very thing a "distinct voices" claim is
+ * supposed to exclude. Quantising to slots makes any two DISTINCT slots at
+ * least ~3 Hz of nominal f0 apart by construction — a property that can be
+ * proved from this table instead of hoped for from a sample. Two NPCs can land
+ * in the same slot; they are then separated by rate and breathiness, which is
+ * honest — two men in a village really can share a pitch.
+ *
+ *   male    0.88..1.12, 8 slots  ->  87.6..111.6 Hz, 3.41 Hz apart
+ *   female  0.85..1.07, 16 slots -> 186.3..234.5 Hz, 3.21 Hz apart
+ *   deeper  0.72..0.82, 4 slots  ->  71.7.. 81.7 Hz, 3.32 Hz apart
+ *
+ * The male ceiling (111.6) sits 74.7 Hz below the female floor (186.3), so no
+ * woman can land under any man — the relation the old design violated. The
+ * king's ceiling (81.7) sits below every villager's floor (87.6), which is the
+ * disjointness the original comment claimed and only `deeper` ever had.
+ */
+const BANDS: Record<'male' | 'female' | 'deeper', readonly [number, number, number]> = {
+  male: [0.88, 1.12, 8],
+  female: [0.85, 1.07, 16],
+  deeper: [0.72, 0.82, 4],
+};
+
+/**
+ * Breathiness of the VITS duration predictor, per model.
+ *
+ * Per-model because the two voices were trained with different defaults —
+ * joe's config asks for noise_w 0.8, ljspeech's for 0.333. Feeding ljspeech
+ * joe's 0.68..0.94 would drive it to nearly three times its intended duration
+ * noise and it wobbles. Each band is centred on its own model's default.
+ */
+const NOISE_W: Record<VoiceModelId, readonly [number, number]> = {
+  male: [0.68, 0.94],
+  female: [0.24, 0.44],
+};
+
+/** Nominal f0 in Hz for a finished voice — the number the bands are stated in. */
+export function nominalF0(v: VoiceParams): number {
+  return MODEL_F0[v.model] * v.pitch;
 }
 
 /**
  * The voice for an id. Same id, same voice, every session, on every machine.
  *
- * The model is single-speaker (`config.json` has no `num_speakers`), so the
- * axes available are duration (`lengthScale`), the two VITS noise scales, and
- * resampling for pitch. Pitch does the heavy lifting: ±12% is roughly a
- * major second either way, which is comfortably audible between neighbours
- * without turning anyone into a chipmunk.
+ * Gender picks the acoustic model; the band inside that model picks the
+ * villager. The remaining axes — speaking rate, duration noise, timbre noise —
+ * are continuous, because they are what separates two NPCs who share a pitch
+ * slot and they need no separation guarantee of their own.
  *
  * `lengthScale` is multiplied by `pitch` so that the resample — which shortens
  * the waveform by exactly `pitch` — nets out to the intended speaking rate.
@@ -85,25 +161,22 @@ export function voiceFor(id: string, shape: VoiceShape = {}): VoiceParams {
   const rng = mulberry32(mix32(idHash(id), VOICE_SALT));
   const r = rng();                      // the one roll that decides pitch
 
-  // Pitch is a re-map into a BAND, not an offset applied to a shared roll.
-  // That was the first design and it had a measurable bug: an offset let the
-  // Evil King land 1.5 Hz from the deepest villager, because a villager who
-  // already rolled the bottom of the range and a king shifted down from the
-  // middle arrive at the same place. Disjoint bands cannot do that.
-  //   villager  0.88 .. 1.12   (±12%, about a major second either way)
-  //   higher    1.08 .. 1.30   (the single male model reading a woman's part)
-  //   deeper    0.72 .. 0.82   (the Evil King — below every villager, always)
-  const band = shape.deeper ? [0.72, 0.82]
-    : shape.higher ? [1.08, 1.30]
-      : [0.88, 1.12];
-  const pitch = band[0] + r * (band[1] - band[0]);
+  // The king is male and deeper; otherwise gender selects the model outright.
+  const model: VoiceModelId = shape.deeper ? 'male' : (shape.gender ?? 'male');
+  const [lo, hi, slots] = BANDS[shape.deeper ? 'deeper' : model];
+  // floor(r * slots) is uniform over 0..slots-1; r === 1 is not reachable from
+  // mulberry32 but clamp anyway rather than trust a float.
+  const slot = Math.min(slots - 1, Math.floor(r * slots));
+  const pitch = lo + (slot / (slots - 1)) * (hi - lo);
 
   const rate = 0.94 + rng() * 0.16;     // 0.94 .. 1.10
-  const noiseW = 0.68 + rng() * 0.26;   // breathiness of the duration predictor
+  const [nwLo, nwHi] = NOISE_W[model];
+  const noiseW = nwLo + rng() * (nwHi - nwLo);
   const noiseScale = 0.60 + rng() * 0.14;
 
   return {
     pitch,
+    model,
     // The resample shortens the waveform by exactly `pitch`, so multiply it
     // back in or every high voice would also gabble. The king is slower again.
     lengthScale: rate * pitch * (shape.deeper ? 1.14 : 1),
@@ -215,13 +288,15 @@ export class VoiceOut {
   get pending(): number { return this.queue.length; }
 
   /**
-   * Start loading the voice. Safe to call repeatedly; the first call wins.
-   * Deliberately NOT called at boot — 63 MB and a wasm session are not worth
-   * paying for a player who never talks to anyone. The chat panel warms it.
+   * Start loading a voice. Safe to call repeatedly; the first call per model
+   * wins. Deliberately NOT called at boot — 63 MB and a wasm session are not
+   * worth paying for a player who never talks to anyone. The chat panel warms
+   * it, and warms only the model the NPC in front of the player needs: the
+   * other 63 MB stays unread until somebody of the other gender speaks.
    */
-  warm(): void {
+  warm(model: VoiceModelId = 'male'): void {
     if (!this.opts.enabled()) return;
-    this.ensureWorker()?.postMessage({ type: 'load' });
+    this.ensureWorker()?.postMessage({ type: 'load', model });
   }
 
   private ensureWorker(): Worker | null {
@@ -338,7 +413,8 @@ export class VoiceOut {
 
   /**
    * Begin a reply from a given speaker. Resets the streaming cursor.
-   * `shape` lets a caller ask for the deeper or higher band.
+   * `shape` carries the NPC's gender — which picks the acoustic model — and
+   * the Evil King's `deeper` flag.
    */
   begin(npcId: string, shape: VoiceShape = {}): void {
     this.stop();

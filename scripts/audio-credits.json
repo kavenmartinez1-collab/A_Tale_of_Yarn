@@ -23,7 +23,16 @@
     "  url     - where it was obtained",
     "  author  - who made it",
     "  licence - verbatim from policy.allowed",
-    "  note    - optional: edits made, required attribution string, etc."
+    "  note    - optional: edits made, required attribution string, etc.",
+    "",
+    "'voiceModels' below is a SEPARATE list with its own policy. Those are the",
+    "neural TTS voices the villagers speak with. They are not imported audio",
+    "files - nothing under models/ is scanned by the walk - but they are",
+    "third-party trained weights that ship in the depot, so their provenance",
+    "belongs in the same manifest. They are kept out of 'credits' on purpose:",
+    "'credits' is deep-equality-checked against AUDIO_CREDITS in sfx.ts, which",
+    "is what the in-game credits panel renders, and a 63 MB ONNX file is not a",
+    "sound effect."
   ],
 
   "policy": {
@@ -53,5 +62,76 @@
     "shots/audition) - all gitignored, none of it ships."
   ],
 
-  "credits": []
+  "credits": [],
+
+  "voiceModelPolicy": {
+    "allowed": [
+      "CC0-1.0",
+      "Public Domain"
+    ],
+    "why": [
+      "A Piper voice inherits the licence of the speech it was trained on, and",
+      "those licences vary wildly between voices in the same repository. The",
+      "bar here is the same one the SFX policy sets: commercially usable in a",
+      "paid Steam release, in the EU as well as the US, with no copyleft reach",
+      "into a closed-source build. Public-domain / CC0 training data clears it",
+      "outright. Anything needing a case-by-case reading does not.",
+      "",
+      "The forbidden patterns in policy.forbiddenPatterns apply here too and",
+      "the guard checks them against these entries as well - NC in particular,",
+      "which is what disqualified the otherwise obvious female candidate."
+    ]
+  },
+
+  "voiceModels": [
+    {
+      "dir": "models/rhasspy--piper-en-us-joe-medium",
+      "file": "models/rhasspy--piper-en-us-joe-medium/en_US-joe-medium.onnx",
+      "voice": "en_US-joe-medium",
+      "role": "male NPCs and the Evil King",
+      "url": "https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/joe/medium",
+      "licenceUrl": "https://huggingface.co/rhasspy/piper-voices/raw/main/en/en_US/joe/medium/MODEL_CARD",
+      "author": "rhasspy (Piper) — dataset: OHF-Voice/voice-datasets",
+      "licence": "CC0-1.0",
+      "note": "MODEL_CARD states License: CC0. Dataset https://github.com/OHF-Voice/voice-datasets. Measured natural f0 99.6 Hz."
+    },
+    {
+      "dir": "models/rhasspy--piper-en-us-ljspeech-medium",
+      "file": "models/rhasspy--piper-en-us-ljspeech-medium/en_US-ljspeech-medium.onnx",
+      "voice": "en_US-ljspeech-medium",
+      "role": "female NPCs",
+      "url": "https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/ljspeech/medium",
+      "licenceUrl": "https://keithito.com/LJ-Speech-Dataset/",
+      "author": "Piper voice by Bryce Beattie (https://brycebeattie.com/files/tts/) — dataset: LJ Speech, Linda Johnson via LibriVox",
+      "licence": "Public Domain",
+      "note": "MODEL_CARD gives dataset https://keithito.com/LJ-Speech-Dataset/ with 'License: public domain'. The dataset page states verbatim: 'This dataset is in the public domain in the US (and most likely other countries as well). There are no restrictions on its use.' Source audio is LibriVox (public domain), text is Project Gutenberg. Measured natural f0 219.2 Hz, so it needs almost no resampling to sit in the female band."
+    }
+  ],
+
+  "voiceModelsRejected": [
+    {
+      "voice": "en_US-hfc_female-medium",
+      "licence": "CC BY-NC-SA 4.0",
+      "licenceUrl": "https://huggingface.co/rhasspy/piper-voices/raw/main/en/en_US/hfc_female/medium/MODEL_CARD",
+      "why": "NonCommercial AND ShareAlike. Two independent disqualifications for a paid, closed-source release. This is the voice most guides recommend for 'a female Piper voice' — recorded here so it does not get re-proposed."
+    },
+    {
+      "voice": "en_US-lessac-medium",
+      "licence": "Blizzard 2013 / CSTR Lessac licence",
+      "licenceUrl": "https://www.cstr.ed.ac.uk/projects/blizzard/2013/lessac_blizzard2013/license.html",
+      "why": "The MODEL_CARD points at a bespoke challenge licence rather than naming terms. A licence that needs a lawyer to read is not 'unambiguously commercial-safe'."
+    },
+    {
+      "voice": "en_US-amy-medium",
+      "licence": "unstated — deferred to https://github.com/MycroftAI/mimic3-voices",
+      "licenceUrl": "https://huggingface.co/rhasspy/piper-voices/raw/main/en/en_US/amy/medium/MODEL_CARD",
+      "why": "The MODEL_CARD names no licence at all, only a repository to go and look in. Unresolved provenance fails the bar by definition."
+    },
+    {
+      "voice": "en_US-kristin-medium",
+      "licence": "Public Domain (LibriVox)",
+      "licenceUrl": "https://huggingface.co/rhasspy/piper-voices/raw/main/en/en_US/kristin/medium/MODEL_CARD",
+      "why": "Licence is CLEAN and this was the runner-up, not a rejection on legal grounds. Dropped on acoustics: measured natural f0 148 Hz, so reaching the female band needs a 1.11-1.59x resample — the same formant-dragging that made the single-model design sound like a sped-up man. ljspeech needs ~1.0x."
+    }
+  ]
 }

@@ -24,6 +24,23 @@
  *   6. no licence matches a FORBIDDEN_AUDIO_LICENCES pattern
  *   7. the JSON manifest and the in-bundle AUDIO_CREDITS are deep-equal
  *   8. the JSON policy block and the exported allow-list agree
+ *   9. every vendored PIPER VOICE has a licence record, and that record is
+ *      inside the voice-model policy (see below)
+ *
+ * WHY 9 IS A SEPARATE LIST. The villagers speak with neural TTS weights, not
+ * with imported .wav files: nothing under `models/` is reachable by the walk,
+ * and the extension list would never match a `.onnx`. But those weights are
+ * third-party, they ship in the depot, and a Piper voice inherits the licence
+ * of whatever speech it was trained on — which differs per voice inside a
+ * single HuggingFace repository. `en_US-hfc_female-medium`, the voice most
+ * guides recommend when somebody wants a female Piper voice, is
+ * CC BY-NC-SA 4.0: unusable here, and nothing in the build would have said so.
+ * So the manifest carries a `voiceModels` list and this guard fails if a
+ * vendored voice is missing from it.
+ *
+ * They are NOT folded into `credits`, because `credits` is deep-equality
+ * checked against AUDIO_CREDITS in sfx.ts — the array the in-game credits
+ * panel renders — and a 63 MB acoustic model is not a sound effect.
  */
 
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
@@ -121,10 +138,26 @@ check('walk reached the source tree', filesSeen > 100,
 // 2. Manifest load
 // ---------------------------------------------------------------------------
 
+/** One vendored neural TTS voice, with the provenance that justifies shipping it. */
+interface VoiceModelCredit {
+  dir: string;
+  file: string;
+  voice: string;
+  role: string;
+  url: string;
+  licenceUrl: string;
+  author: string;
+  licence: string;
+  note?: string;
+}
+
 interface ManifestShape {
   policy: { allowed: string[] };
   scannedDirs: string[];
   credits: AudioCredit[];
+  voiceModelPolicy?: { allowed: string[] };
+  voiceModels?: VoiceModelCredit[];
+  voiceModelsRejected?: Array<{ voice: string; licence: string; why: string }>;
 }
 
 let manifest: ManifestShape | null = null;
@@ -205,6 +238,102 @@ check('policy.allowed matches ALLOWED_AUDIO_LICENCES',
 check('manifest scannedDirs matches this guard',
   JSON.stringify(manifest?.scannedDirs ?? []) === JSON.stringify(ASSET_DIRS),
   'the manifest documents which dirs are audited; keep it true');
+
+// ---------------------------------------------------------------------------
+// 9. Vendored TTS voices
+// ---------------------------------------------------------------------------
+
+const voiceModels = manifest?.voiceModels ?? [];
+const voicePolicy = manifest?.voiceModelPolicy?.allowed ?? [];
+
+check('manifest has a voiceModelPolicy.allowed array', Array.isArray(manifest?.voiceModelPolicy?.allowed));
+check('manifest has a voiceModels array', Array.isArray(manifest?.voiceModels));
+check('voiceModels is not empty', voiceModels.length > 0,
+  'the villagers speak with SOMETHING; if this list is empty either a voice lost '
+  + 'its licence record or the TTS path was deleted');
+
+for (const v of voiceModels) {
+  const id = v.voice ?? '(no voice)';
+  check(`voice has dir: ${id}`, typeof v.dir === 'string' && v.dir.length > 0);
+  check(`voice has url: ${id}`, typeof v.url === 'string' && v.url.length > 0);
+  check(`voice has licenceUrl: ${id}`, typeof v.licenceUrl === 'string' && v.licenceUrl.length > 0,
+    'the licence has to be checkable by somebody who is not you');
+  check(`voice has author: ${id}`, typeof v.author === 'string' && v.author.length > 0);
+  check(`voice has licence: ${id}`, typeof v.licence === 'string' && v.licence.length > 0);
+
+  const lic = String(v.licence ?? '');
+  for (const f of FORBIDDEN_AUDIO_LICENCES) {
+    check(`voice licence not forbidden (${f.pattern}): ${id}`, !f.pattern.test(lic),
+      `'${lic}' — ${f.why}`);
+  }
+  check(`voice licence allowed: ${id}`, voicePolicy.includes(lic),
+    `'${lic}' is not one of: ${voicePolicy.join(', ')}. A Piper voice inherits its `
+    + 'training data\'s licence; widening this list is a deliberate decision.');
+}
+
+/**
+ * COVERAGE FROM THE SOURCE, not from the disk.
+ *
+ * `models/` is gitignored, so a checkout with no weights would make a
+ * disk-only scan pass by finding nothing — the vacuous-green failure mode this
+ * file exists to avoid. The authoritative list of voices the game will try to
+ * speak with is in tts-worker.ts, and it is there whether or not the weights
+ * have been fetched.
+ */
+const workerSrc = readFileSync(path.join(ROOT, 'src', 'game', 'voice', 'tts-worker.ts'), 'utf-8');
+const referencedVoices = [...workerSrc.matchAll(/local\/([A-Za-z0-9._-]*piper[A-Za-z0-9._-]*)/g)]
+  .map((m) => m[1]);
+const uniqueVoices = [...new Set(referencedVoices)];
+
+check('tts-worker.ts references at least one piper voice', uniqueVoices.length > 0,
+  'the regex found no voice directories — if the worker was restructured, this '
+  + 'guard is no longer reading it and must be updated');
+
+for (const dirName of uniqueVoices) {
+  check(`voice referenced by tts-worker.ts is licensed: ${dirName}`,
+    voiceModels.some((v) => v.dir === `models/${dirName}`),
+    `tts-worker.ts synthesizes on models/${dirName} but audio-credits.json has no `
+    + 'voiceModels entry for it. Vendoring a voice without recording its licence is '
+    + 'how an NC-licensed voice reaches a paid build.');
+}
+
+// ...and when the weights ARE present, the records must point at real bytes.
+const MODELS_DIR = path.join(ROOT, 'models');
+if (existsSync(MODELS_DIR)) {
+  for (const v of voiceModels) {
+    check(`voice file on disk: ${v.voice}`, existsSync(path.join(ROOT, v.file)),
+      `${v.file} is credited but absent — run npm run weights`);
+  }
+  const onDisk = readdirSync(MODELS_DIR)
+    .filter((d) => d.includes('--') && /piper/i.test(d)
+      && statSync(path.join(MODELS_DIR, d)).isDirectory());
+  for (const d of onDisk) {
+    check(`vendored voice is licensed: ${d}`,
+      voiceModels.some((v) => v.dir === `models/${d}`),
+      `models/${d} is vendored and would be packed into the depot with no licence record`);
+  }
+}
+
+// The rejected list is evidence of diligence, and it is also a live regression
+// guard: it keeps the NC voice named so nobody re-proposes it, and the check
+// below proves the forbidden matcher would actually have caught it.
+const rejected = manifest?.voiceModelsRejected ?? [];
+check('rejected voice candidates are recorded', rejected.length > 0,
+  'the licence review found unusable candidates; recording them is what stops '
+  + 'the next person repeating the search');
+for (const r of rejected) {
+  check(`rejected entry has a reason: ${r.voice ?? '(no voice)'}`,
+    typeof r.why === 'string' && r.why.length > 0);
+}
+const ncCandidate = rejected.find((r) => /hfc_female/.test(r.voice ?? ''));
+check('the NC female voice is named as rejected', ncCandidate !== undefined,
+  'en_US-hfc_female-medium is the first hit for "piper female voice" and is '
+  + 'CC BY-NC-SA; it must stay on the record as refused');
+check('...and the forbidden matcher bites on its licence',
+  ncCandidate !== undefined
+  && FORBIDDEN_AUDIO_LICENCES.some((f) => f.pattern.test(ncCandidate.licence)),
+  `'${ncCandidate?.licence}' should match an NC/SA pattern — if it does not, the `
+  + 'patterns have drifted and would let it through');
 
 // ---------------------------------------------------------------------------
 // Self-test of the forbidden patterns
