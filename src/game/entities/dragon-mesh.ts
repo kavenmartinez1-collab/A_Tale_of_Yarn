@@ -58,7 +58,7 @@ import {
 import {
   bonePart, buildWing, chainBones, chainRidge, mix, norm,
   ridgePart, sampleChain, spikePart, tailFinPart,
-  type Vec3, type WingSpec,
+  type ChainSample, type Vec3, type WingSpec,
 } from './draconic-parts';
 
 // ---------------------------------------------------------------------------
@@ -141,21 +141,87 @@ export function dragonStride(species: Species = 'dragon'): number {
 // Body plan
 // ---------------------------------------------------------------------------
 
-export function buildDragon(species: Species, pose: AnimalPose, variant: number): Part[] {
+/**
+ * Per-species overrides for the two colours the builder derives rather than
+ * reads from a table.
+ *
+ * Both defaults are relationships, not choices — the membrane is the body
+ * desaturated and darkened, the eye is molten gold — and both of those
+ * relationships break on a near-black dragon: a membrane at 0.6x of 0.08 is
+ * indistinguishable from the body, and a gold eye on a black-and-red boss is
+ * the wrong accent entirely. Rather than fork four hundred lines of dragon,
+ * the two colours that need to move are a parameter.
+ *
+ * Omitted fields keep the derived defaults exactly, so `buildDragon(sp, pose,
+ * v)` is unchanged for the existing dragon and the golden hashes hold.
+ */
+export interface DragonStyle {
+  /** Wing membrane. Default: the body colour dimmed and desaturated. */
+  membrane?: Color3;
+  /** Iris. Default: molten gold. */
+  eye?: Color3;
+  /** Material for the eye. Default `MAT.HORN` (glossy, low tint). */
+  eyeMaterial?: number;
+  /**
+   * Extra parts, appended last, given the solved body.
+   *
+   * This is how a species adds a saddle, barding or a crest without forking
+   * the builder. It receives the surface solvers rather than the bounding box
+   * on purpose: `makeBoxSpherePart` inscribes an ELLIPSOID, so anything
+   * anchored to `bodyTop` hovers over the back with daylight under it, and
+   * this rig has already lost a saddle to exactly that.
+   */
+  extras?: (frame: DragonFrame) => Part[];
+}
+
+/** The solved body, handed to `DragonStyle.extras`. All lengths in metres. */
+export interface DragonFrame {
+  /** `SPECIES_DEFS[species].size` — every other number is a multiple of it. */
+  s: number;
+  /** Gait bob already folded into the body masses this frame. */
+  bob: number;
+  hipY: number;
+  bodyH: number;
+  /** Torso HALF-width and HALF-length. */
+  bodyW: number;
+  bodyL: number;
+  /** Bounding-box lid of the torso. Almost never what you want — see below. */
+  bodyTop: number;
+  /** Real hide height over (x, z). Anchor to this, not to `bodyTop`. */
+  torsoTopAt: (x: number, z: number) => number;
+  /** Real hide z at the rear, at height y. */
+  rearZAt: (y: number) => number;
+  /** Head chain (the head-yaw twist). Hang skull geometry off this. */
+  headRots: Rot[];
+  /** Cranium ellipsoid centre and half-extents. */
+  craniumC: Vec3;
+  craniumR: Vec3;
+  /** The sampled neck and tail curves, joints and all. */
+  neck: ChainSample;
+  tail: ChainSample;
+  /** Wing fold, 0 furled .. 1 fully out, and the current beat, -1..1. */
+  spread: number;
+  beat: number;
+}
+
+export function buildDragon(
+  species: Species, pose: AnimalPose, variant: number, style?: DragonStyle,
+): Part[] {
   const s = SPECIES_DEFS[species].size; // 3.5 for dragon
   const bodyC = applyVariant(BASE_COLORS[species], variant);   // dark crimson
   const bellyC = BELLY_COLORS[species];                        // darker underbelly
   const accentC = ACCENT_COLORS[species];                      // near-black horn
 
   // Wing membrane — desaturated, darker hide stretched thin.
-  const membraneC: Color3 = [
+  const membraneC: Color3 = style?.membrane ?? [
     Math.min(1, bodyC[0] * 0.62),
     Math.min(1, bodyC[1] * 0.50 + 0.03),
     Math.min(1, bodyC[2] * 0.50 + 0.03),
   ];
   // Molten gold eye. The old head had no eye at all, which is most of why it
   // read as a lump with a mouth: an eye is where a face resolves.
-  const eyeC: Color3 = [0.96, 0.74, 0.16];
+  const eyeC: Color3 = style?.eye ?? [0.96, 0.74, 0.16];
+  const eyeMat = style?.eyeMaterial ?? MAT.HORN;
 
   const hipY = s * HIP;
   const bodyH = s * BODY_H;
@@ -397,7 +463,7 @@ export function buildDragon(species: Species, pose: AnimalPose, variant: number)
       ex + s * 0.032, crY + s * 0.060, ez + s * 0.052, 0.8, 5, 3, MAT.SCALE));
     parts.push(makeBoxSpherePart(eyeC, headRots,
       ex - s * 0.019, crY + s * 0.004, ez - s * 0.024,
-      ex + s * 0.023, crY + s * 0.030, ez + s * 0.024, 1, 5, 3, MAT.HORN));
+      ex + s * 0.023, crY + s * 0.030, ez + s * 0.024, 1, 5, 3, eyeMat));
   }
 
   // Two horn pairs off the skull rear, swept back and out — and a pair of
@@ -483,6 +549,18 @@ export function buildDragon(species: Species, pose: AnimalPose, variant: number)
     });
   }
   parts.push(ridgePart(accentC, [], backSpikes, 4));
+
+  // Per-species additions — barding, a saddle, a crest. Called last so it can
+  // see everything: the solved neck and tail chains, the real hide surface,
+  // and the head chain to hang horns off. See `DragonStyle.extras`.
+  if (style?.extras !== undefined) {
+    parts.push(...style.extras({
+      s, bob, hipY, bodyH, bodyW, bodyL, bodyTop,
+      torsoTopAt, rearZAt, headRots,
+      craniumC: [0, crY, crZ], craniumR: [crW, crH, crD],
+      neck, tail, spread, beat,
+    }));
+  }
 
   return parts;
 }

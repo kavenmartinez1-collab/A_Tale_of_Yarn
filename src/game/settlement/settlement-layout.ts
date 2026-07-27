@@ -15,9 +15,14 @@
 
 import { mulberry32 } from '../mesh-utils';
 import type { SettlementKind, SettlementSite } from './settlement-scatter';
-import { planFor } from './settlement-plans';
+import { padHalfExtents, planFor } from './settlement-plans';
+import {
+  buildSettlementPaths, EMPTY_PATHS, type ResolvedPaths,
+} from './settlement-paths';
 
-export { castleGateLocal, faceDir, faceCenter, quantYaw } from './settlement-plans';
+export {
+  castleGateLocal, faceDir, faceCenter, quantYaw, padHalfExtents,
+} from './settlement-plans';
 
 /** Bump when layout logic changes materially (golden hash will change). */
 export const LAYOUT_VERSION = 4;
@@ -117,16 +122,15 @@ export interface ResolvedSettlement {
   site: SettlementSite;
   name: string;
   pads: ResolvedPad[];
-}
-
-/** Rotated half-extents of a yaw-quantized pad (still axis-aligned). */
-export function padHalfExtents(pad: BuildingPad): { hx: number; hz: number } {
-  const c = Math.abs(Math.cos(pad.yaw));
-  const s = Math.abs(Math.sin(pad.yaw));
-  return {
-    hx: (pad.w / 2) * c + (pad.d / 2) * s,
-    hz: (pad.w / 2) * s + (pad.d / 2) * c,
-  };
+  /**
+   * Streets, stairs and terraces joining the pads (settlement-paths.ts).
+   *
+   * Resolved here rather than by the caller because it needs exactly what this
+   * function already has — the pads, their floor heights, and the heightfield —
+   * and because both consumers (mesh and collider) must see the SAME network
+   * or the player walks on a staircase that is not the one being drawn.
+   */
+  paths: ResolvedPaths;
 }
 
 /** Lift a layout to world space against the heightfield. */
@@ -134,7 +138,11 @@ export function resolveSettlement(
   site: SettlementSite,
   heightAt: (x: number, z: number) => number,
 ): ResolvedSettlement {
-  const { name, pads } = layoutSettlement(site.kind, site.seed);
+  // A forced site may pin its display name (the spawn town stays "Greenholm"
+  // wherever the river fix moves its pin — the player's mental map and every
+  // bug report use that name). Layout still derives pads from the seed.
+  const { name: rolled, pads } = layoutSettlement(site.kind, site.seed);
+  const name = site.name ?? rolled;
   const resolved: ResolvedPad[] = pads.map((pad) => {
     const wx = site.x + pad.x;
     const wz = site.z + pad.z;
@@ -147,5 +155,11 @@ export function resolveSettlement(
     );
     return { ...pad, wx, wy, wz };
   });
-  return { site, name, pads: resolved };
+  // Ruins get no circulation: a collapsed hall has no doors to join, and the
+  // one or two spurs a shrine and a well would produce look like municipal
+  // works in a place that has been empty for a century.
+  const paths = site.kind === 'ruins'
+    ? EMPTY_PATHS
+    : buildSettlementPaths(site, resolved, resolved.map((p) => p.wy), heightAt);
+  return { site, name, pads: resolved, paths };
 }

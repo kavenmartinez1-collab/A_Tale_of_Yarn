@@ -21,7 +21,7 @@ const WORLD_SEED = 1337;
 const base = createHeightField(WORLD_SEED);
 const roads = createRoadNetwork(WORLD_SEED, base);
 
-// Near spawn first: the forced castle at (-191, 166) is where a player starts.
+// Near spawn first: the forced castle at (-219, -346) is where a player starts.
 const g = roads.graphIn(-4000, -4000, 4000, 4000);
 
 interface Site {

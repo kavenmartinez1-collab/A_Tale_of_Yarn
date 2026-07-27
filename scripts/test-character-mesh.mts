@@ -13,6 +13,7 @@ import {
   CHARACTER_HEIGHT, CHARACTER_MAX_VERTS, type HeldItem,
   type ArmorTier,
 } from '../src/game/character/character-mesh';
+import { torchFlamePos } from '../src/game/torch';
 
 /** Update ONLY on deliberate character-mesh changes (see header).
  * Regenerated 2026-07-24 for the pos3+normal3+color3+materialId (10-float)
@@ -154,7 +155,7 @@ check('recolor preserves geometry (same count)',
 // capsules/cylinders (hafts/grips/shafts) — no longer "N boxes of 36
 // verts" — so we assert invariants (adds geometry, stays in budget,
 // deterministic) instead of an exact `extra % 36 === 0` vertex count.
-const HELD_KINDS: HeldItem['kind'][] = ['sword', 'axe', 'pickaxe', 'bow', 'staff'];
+const HELD_KINDS: HeldItem['kind'][] = ['sword', 'axe', 'pickaxe', 'bow', 'staff', 'torch'];
 for (const kind of HELD_KINDS) {
   const held = buildCharacterMesh(DEFAULT_CUSTOMIZATION, IDLE_POSE,
     { kind, color: [0.7, 0.7, 0.7] });
@@ -169,6 +170,42 @@ for (const kind of HELD_KINDS) {
   const hb = aabb(held);
   check(`held ${kind} sits on the right side`, hb.hi[0] > 0.35,
     `maxX=${hb.hi[0].toFixed(2)}`);
+}
+
+// The torch's flame anchor and its burning head must agree.
+//
+// torch.ts pins the point light and the billboard flame to TORCH_HEAD, a
+// body-local constant that DUPLICATES numbers written in `heldParts`. Nothing
+// in the type system links the two, and a torch whose flame floats 20 cm off
+// the end of its own stick is the sort of thing that ships. Held geometry is
+// appended last, so the tail of the buffer past the unarmed mesh IS the torch.
+{
+  const withTorch = buildCharacterMesh(DEFAULT_CUSTOMIZATION, IDLE_POSE,
+    { kind: 'torch', color: [0.75, 0.55, 0.20] });
+  const tail = withTorch.subarray(idle.length);
+  let lo = [Infinity, Infinity, Infinity];
+  let hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < tail.length; i += 10) {
+    for (let a = 0; a < 3; a++) {
+      lo[a] = Math.min(lo[a], tail[i + a]);
+      hi[a] = Math.max(hi[a], tail[i + a]);
+    }
+  }
+  // Rest pose, no yaw, no swing: the anchor is the raw body-local constant.
+  const flame = torchFlamePos(0, 0, 0, 0, 0);
+  check('the torch flame sits on top of the torch head',
+    flame[1] >= hi[1] - 0.12 && flame[1] <= hi[1] + 0.10,
+    `flame y ${flame[1].toFixed(3)}, torch top y ${hi[1].toFixed(3)}`);
+  check('and on the shaft, not beside it',
+    Math.abs(flame[0] - (lo[0] + hi[0]) / 2) < 0.06
+    && flame[2] >= lo[2] - 0.06 && flame[2] <= hi[2] + 0.06,
+    `flame xz [${flame[0].toFixed(3)}, ${flame[2].toFixed(3)}] vs torch x `
+    + `${lo[0].toFixed(3)}..${hi[0].toFixed(3)} z ${lo[2].toFixed(3)}..${hi[2].toFixed(3)}`);
+  // And the walk swing has to move it the same way the arm does.
+  const swung = torchFlamePos(0, 0, 0, 0, 1);
+  check('a walk swing carries the flame with the arm',
+    Math.hypot(swung[1] - flame[1], swung[2] - flame[2]) > 0.05,
+    `moved ${Math.hypot(swung[1] - flame[1], swung[2] - flame[2]).toFixed(3)} m at full swing`);
 }
 
 // A swing moves the held item (same pitch as the right arm).

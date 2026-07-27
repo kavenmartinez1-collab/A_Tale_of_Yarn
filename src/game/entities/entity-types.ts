@@ -25,7 +25,11 @@ export type Species =
   | 'goblin'
   | 'goblin_archer'
   | 'skeleton'
-  | 'dread_king';
+  | 'dread_king'
+  // --- the final boss and his mount (biomes: [] — placed by script, never
+  //     scattered; see king-mesh.ts and black-dragon-mesh.ts) ---
+  | 'evil_king'
+  | 'black_dragon';
 
 /**
  * What a species will pick a fight with, beyond the player.
@@ -87,6 +91,7 @@ export interface SpeciesDef {
    * it belongs on the animal.
    */
   canFly?: boolean;
+
 
   // -------------------------------------------------------------------------
   // Mob-vs-mob combat. All optional: every field below has a default that
@@ -390,6 +395,98 @@ export const SPECIES_DEFS: Record<Species, SpeciesDef> = {
     reachBonus: 1.6,
     disposition: 'undead',
     fearless: true,
+    biomes: [],
+  },
+  evil_king: {
+    // The final boss. `size` is not a taste decision: the brief is that he
+    // stands exactly twice the player's 1.62 m, and `HUMANOID_PLANS.evil_king`
+    // closes his helm at 1.296 x size, so 3.24 / 1.296 = 2.5 and nothing else
+    // will do. `scripts/test-boss-mesh.mts` asserts it against the measured
+    // mesh; change one of the three numbers and it fails.
+    //
+    // Stats below are TUNED, not placeholders any more — see the block at the
+    // end of this def. `reachBonus` was always real: his greatsword is 2.6 m
+    // of blade and the hitbox has to agree with what the player sees.
+    name: 'The Evil King',
+    size: 2.5,
+    speed: 4.6,
+    // 300, not 420. The player's best starter weapon is a sword at 4 damage a
+    // swing, so 420 is 105 connected hits and 300 is 75 — and he is the SECOND
+    // half of the fight, after 260 hp of dragon. The pair is ~140 swings, which
+    // at the openings this fight actually gives is two to three minutes. 420
+    // made it five-plus, which is not difficulty, it is arithmetic.
+    hp: 300,
+    rare: false,
+    mountable: false,
+    aggro: true,
+    // 5, not 14. `MAX_HP` is 20: at 14 he two-shots a full-health player and
+    // one-shots a hurt one, so the fight had no recoverable mistakes at all.
+    // At 5 it is four blows, ~7.6 s at his cadence — long enough to read a
+    // losing exchange and disengage, short enough that standing in front of
+    // him is still fatal.
+    attackDmg: 5,
+    // 1.9 s, not the shared 1.2: the cadence rule in `clips-attack.ts` is
+    // `max(recovery) + max(windup) <= attackCooldown - SWING_GAP`, and his
+    // overhead alone is 1.30 s. Also the fastest cadence at which
+    // `test-anim.mts` still sees six blows in twelve seconds.
+    attackCooldown: 1.9,
+    reachBonus: 2.4,
+    disposition: 'undead',
+    fearless: true,
+    // The handoff shed in `animal-ai.stepAnimal` keys off this. Without it the
+    // unseated King arrived at the ordinary AI still wearing the borrowed
+    // `owned` flag, followed the player around like a pet, and every blow he
+    // did throw was swallowed by the caller's owned-guard — the fight's final
+    // phase dealt zero damage.
+    biomes: [],
+  },
+  black_dragon: {
+    // His mount. 4.4 against the wild dragon's 3.5 — a 19 m wingspan, a saddle
+    // 4.4 m up, and a head at 7.1 m. Everything scales off `size` inside
+    // `buildDragon`, so this one number is the whole of "make him bigger".
+    //
+    // It was 5.0 first, and the offline mounted preview is why it is not: at
+    // that scale the King's crown reached 7.5 m against a dragon head at 8.4 m
+    // and a 22 m span, and he read as luggage. The rider has to be a peer of
+    // the head he sits behind or the boss of the fight is the animal.
+    name: 'Black Dragon',
+    size: 4.4,
+    speed: 7.5,
+    // 260, not 600. The dragon is only reachable during its swoops and once it
+    // has landed, so its health is not "how long the fight is" but "how many
+    // openings the player has to convert". 600 was 150 sword hits against
+    // roughly one connected hit per swoop — a fight measured in tens of
+    // minutes. 260 is 65 hits, which is about six converted swoops to force it
+    // down and a short brawl on the ground after that.
+    //
+    // `castle-fight.ts` reads this through `e.hp / SPECIES_DEFS.black_dragon.hp`
+    // to pick its phase, so the 65%/30% thresholds move with it automatically.
+    hp: 260,
+    // `rare: false` and `mountable: false` even though he is neither common nor
+    // unrideable, because both flags mean something narrower than they read.
+    // `rare` is eligibility for the overworld rare-scatter pass, and this
+    // animal is placed by the castle script and nothing else — a `rare: true`
+    // species with `biomes: []` is a species the scatter chain silently
+    // rejects anyway. `mountable` is the PLAYER's mount list, which drives
+    // taming, save serialisation and the mount UI; the King rides him through
+    // `kingRiderPlacement`, not through `main.ts:tickMount`.
+    rare: false,
+    mountable: false,
+    canFly: true,
+    aggro: true,
+    // 6, not 20. Twenty is the player's ENTIRE health bar: the bite was a
+    // guaranteed one-shot kill from full, which turns the grounded phase — the
+    // phase the whole fight is built to reach — into a coin flip decided
+    // before the player can react. At 6 the bite is the heaviest single blow
+    // in the game and still leaves three of them to kill.
+    attackDmg: 6,
+    attackCooldown: 1.8,
+    reachBonus: 2.0,
+    disposition: 'predator',
+    fearless: true,
+    // Same shed as the King's (see `animal-ai.stepAnimal`): once the fight
+    // grounds him and hands him to the ordinary AI, `owned` would make him a
+    // follower who never bites.
     biomes: [],
   },
 };

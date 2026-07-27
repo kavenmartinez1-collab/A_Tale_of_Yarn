@@ -31,12 +31,17 @@ const filter = process.argv[3] || '';
  * hunting for the nearest town (2 km from spawn) by teleporting around either
  * misses it or silently lands somewhere else and reports success.
  */
+// Re-resolved 2026-07-26 when settlement siting became river-aware: every one
+// of these moved except the ruin, and the castle is the forced near-spawn pin,
+// which changed cells outright. Coordinates are settlement CENTRES from
+// `settlementSiteAt` on seed 1337 — re-derive them, do not nudge them by hand,
+// or a shot ends up framed on empty ground next to the town it names.
 const SITES = {
-  ruins: [-179, 661],
-  ranch: [142, 309],
-  village: [-383, -860],
-  town: [1753, -1138],
-  castle: [-191, 166],
+  ruins: [-151, 641],
+  ranch: [-190, 239],
+  village: [100, -660],
+  town: [1172, -2674],
+  castle: [-242, -320],
 };
 
 /**

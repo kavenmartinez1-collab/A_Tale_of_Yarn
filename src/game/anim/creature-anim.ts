@@ -262,6 +262,17 @@ function speciesAnim(species: Species): SpeciesAnim {
       return { set: SKELETON_CLIPS, planted: true, flapBase: 0, freeHz: 0, idleRate, attacks };
     case 'dread_king':
       return { set: DREAD_KING_CLIPS, planted: true, flapBase: 0, freeHz: 0, idleRate, attacks };
+    // The final boss. Same clip set as the Dread King — he is the same rig at
+    // a bigger scale, and a bespoke clip library for one actor is a library
+    // nobody keeps in sync. `idleRate` already slows with `size`, so his idle
+    // breathes more heavily than the Dread King's without anything else.
+    case 'evil_king':
+      return { set: DREAD_KING_CLIPS, planted: true, flapBase: 0, freeHz: 0, idleRate, attacks };
+    // His mount. A heavier animal than the wild dragon, so a slower resting
+    // beat: `flapBase` is rad/s, and a 22 m wingspan beating at the wild
+    // dragon's 2.4 looks like a bat.
+    case 'black_dragon':
+      return { set: WINGED_CLIPS, planted: false, flapBase: 1.7, freeHz: 0, idleRate, attacks };
 
     default:
       return animalGait(species) !== null

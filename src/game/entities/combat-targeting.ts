@@ -96,8 +96,13 @@ const PACK_COURAGE = 0.55;
  */
 export type Faction = 'wild' | 'warband';
 
+// The Evil King and his mount are warband too. Without this `factionOf`
+// silently returns 'wild' for both and the boss's own dragon is a legitimate
+// target for him — a mount that fights its rider is the sort of thing that
+// only shows up in the fight, at the end, once.
 const WARBAND = new Set<string>(
-  ['goblin', 'goblin_archer', 'skeleton', 'dread_king']);
+  ['goblin', 'goblin_archer', 'skeleton', 'dread_king',
+    'evil_king', 'black_dragon']);
 
 export function factionOf(species: Species): Faction {
   return WARBAND.has(species) ? 'warband' : 'wild';

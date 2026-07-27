@@ -19,7 +19,7 @@ import { treesForChunk, type TreeKind } from '../tree-scatter';
 import { buildChunkIndices, buildChunkVertices, CHUNK_SIZE, INDEX_COUNT } from './chunk-mesh';
 import { buildGrassTuftMesh, GRASS_TUFT_VERTS } from '../grass-mesh';
 import { grassForChunk } from './grass-scatter';
-import { carveRoads, createRoadNetwork, type RoadNetwork } from '../world/roads';
+import { carveRoads, sharedRoadNetwork, type RoadNetwork } from '../world/roads';
 
 const LOAD_RADIUS = 6;                    // 13x13 = 169 chunks, 832 m square
 const UNLOAD_RADIUS = LOAD_RADIUS + 1;    // hysteresis
@@ -97,7 +97,10 @@ export class ChunkManager {
     private readonly heightField: HeightField,
     private readonly biomeField: BiomeField,
   ) {
-    this.roadNetwork = createRoadNetwork(heightField.seed, heightField);
+    // Shared per seed: the settlement manager's road travellers need the same
+    // graph, and building a second copy would pay for every castle's Dijkstra
+    // sweep twice for identical answers.
+    this.roadNetwork = sharedRoadNetwork(heightField.seed, heightField);
     this.groundField = carveRoads(heightField, this.roadNetwork);
     const indexData = buildChunkIndices();
     this.indexBuffer = renderer.device.createBuffer({

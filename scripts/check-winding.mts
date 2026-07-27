@@ -14,6 +14,7 @@
 import {
   box, bevelBox, cylinder, cone, sphere, capsule, taperedCapsule, gableRoof, quad, tri,
 } from '../src/game/mesh-utils';
+import { castleWindingSamples } from '../src/game/castle/castle-mesh';
 
 type Tri = { a: number[]; b: number[]; c: number[]; n: number[] };
 
@@ -96,6 +97,13 @@ failures += audit('taperedCapsule Y', v((a) => taperedCapsule(a, 0, -1, 0, 0, 1,
 failures += audit('gableRoof', v((a) => gableRoof(a, -1, -1, 1, 1, 0, 1)), [0, 0, 0], false);
 failures += audit('quad', v((a) => quad(a, [0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1])), [0, 0, 0], false);
 failures += audit('tri', v((a) => tri(a, [0, 0, 0], [1, 0, 0], [1, 0, 1])), [0, 0, 0], false);
+
+// Castle Vhaeron reimplements box / bevelBox / ramp with indexed writes rather
+// than calling mesh-utils (a castle is ~600k pushes otherwise), so it needs its
+// own entries here or it is audited by nothing at all.
+for (const s of castleWindingSamples()) {
+  failures += audit(s.name, s.verts, s.centre, s.convex);
+}
 
 console.log(failures === 0
   ? '\nall primitives wound correctly'

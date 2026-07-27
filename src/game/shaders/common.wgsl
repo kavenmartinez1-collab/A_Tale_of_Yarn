@@ -179,6 +179,7 @@ const MAT_KNIT:   i32 = 16;
 const MAT_FELT:   i32 = 17;
 const MAT_BONE:   i32 = 18;
 const MAT_HORN:   i32 = 19;
+const MAT_QUILT:  i32 = 20;
 
 // Material *table* row indices — distinct from the MAT_* texture layers above.
 // Keep in sync with the `MAT` enum in render/material-table.ts.
@@ -199,6 +200,9 @@ const MAT_ID_THATCH:  i32 = 18;
 const MAT_ID_GRASS:   i32 = 21;
 const MAT_ID_EMBER:   i32 = 24;
 const MAT_ID_PORTAL:  i32 = 25;
+const MAT_ID_GLASS_HOT: i32 = 27;
+const MAT_ID_CRAFTSTONE: i32 = 29;
+const MAT_ID_CRAFTSLATE: i32 = 30;
 
 // --- small noise toolkit ----------------------------------------------------
 

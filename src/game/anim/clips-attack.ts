@@ -958,6 +958,129 @@ const kingThrust = move('king_thrust', 'thrust', 0.66, 0.34, [
   swing(Ch.BodySink, { dur: 0.66, contact: 0.34, wind: 0.040, hit: -0.060, follow: 0.020 }),
 ], { weight: 0.7, minRange: 0, maxRange: 99 });
 
+// ===========================================================================
+// THE FINAL BOSS AND HIS MOUNT
+//
+// Distinct move objects, not aliases of the Dread King's and the dragon's.
+// `test-anim.mts` asserts that move names are globally unique and that no two
+// attacks share a `Clip` object, and it is right to: a shared clip means a
+// shared identity in `animDebug`, in the contact-frame sync and in any future
+// per-move tuning, so two species pointing at one object is a bug waiting for
+// the day someone changes it for one of them.
+//
+// The cadence rule binds here as it does on the Dread King:
+//
+//     max(recovery) + max(windup) <= attackCooldown - SWING_GAP
+//
+// At `evil_king`'s 1.9 s that is 0.56 + 0.74 = 1.30 <= 1.76. Everything below
+// is authored against it, and `SPECIES_DEFS.evil_king.attackCooldown` is not
+// free to move without re-checking it.
+// ===========================================================================
+
+/**
+ * The King's sweep. The Dread King's cleave, slower and with more reach.
+ *
+ * `maxRange` is 5.6 against the Dread King's 4.2 because the blade really is
+ * longer — 3.1 m of it on a 3.24 m man — and `reachBonus: 2.4` on the species
+ * def is authored against this number. Weapon and hitbox agree or the player
+ * learns a spacing that the animation contradicts.
+ */
+const evilKingCleave = move('evil_king_cleave', 'cleave', 1.15, 0.62, [
+  swing(Ch.ForeSwing, {
+    dur: 1.15, contact: 0.62, wind: -0.42, hit: 1.16, follow: 0.24, windAt: 0.70,
+  }),
+  swing(Ch.TailSway, { dur: 1.15, contact: 0.62, wind: 0.66, hit: -0.76, windAt: 0.72 }),
+  swing(Ch.HeadYaw, { dur: 1.15, contact: 0.62, wind: 0.46, hit: -0.54 }),
+  swing(Ch.HeadPitch, { dur: 1.15, contact: 0.62, wind: -0.20, hit: 0.22 }),
+  swing(Ch.BodySink, { dur: 1.15, contact: 0.62, wind: 0.065, hit: 0.022, follow: -0.012 }),
+], { minRange: 1.8, maxRange: 5.6 });
+
+/** The overhead. Everything he has, brought down through the blade. */
+const evilKingOverhead = move('evil_king_overhead', 'cleave', 1.30, 0.74, [
+  swing(Ch.ForeSwing, {
+    // `Ch.ForeSwing`'s range is [-0.5, 1.3] and the additive idle layer stacks
+    // on TOP of the clip, so both ends need headroom. The windup is the one
+    // that bites here: -0.54 put the arm 0.04 past the floor at full cock and
+    // the pose clamped, which shortens the wind-up without shortening the
+    // clip — a boss who telegraphs for a beat and then does not go as far back
+    // as he looked like he would.
+    dur: 1.30, contact: 0.74, wind: -0.44, hit: 1.16, follow: 0.32, windAt: 0.74,
+  }),
+  swing(Ch.HeadPitch, { dur: 1.30, contact: 0.74, wind: -0.46, hit: 0.60, windAt: 0.72 }),
+  swing(Ch.BodySink, {
+    dur: 1.30, contact: 0.74, wind: -0.105, hit: 0.125, follow: 0.022, windAt: 0.74,
+  }),
+  swing(Ch.TailSway, { dur: 1.30, contact: 0.74, wind: 0.26, hit: -0.22 }),
+  swing(Ch.JawOpen, { dur: 1.30, contact: 0.74, wind: 0.30, hit: 0.66, follow: 0.14 }),
+], { weight: 0.85, minRange: 0, maxRange: 4.2 });
+
+/** Guard break — the one fast thing he does, and the punish for standing off. */
+const evilKingThrust = move('evil_king_thrust', 'thrust', 0.72, 0.36, [
+  swing(Ch.ForeSwing, {
+    dur: 0.72, contact: 0.36, wind: -0.26, hit: 1.12, follow: 0.18, windAt: 0.48,
+  }),
+  swing(Ch.TailSway, { dur: 0.72, contact: 0.36, wind: -0.32, hit: 0.38 }),
+  swing(Ch.HeadPitch, { dur: 0.72, contact: 0.36, wind: -0.12, hit: 0.30 }),
+  swing(Ch.BodySink, { dur: 0.72, contact: 0.36, wind: 0.042, hit: -0.065, follow: 0.022 }),
+], { weight: 0.7, minRange: 0, maxRange: 99 });
+
+/**
+ * The mount's bite. Slower than the wild dragon's — this animal is 26% longer
+ * and a head that size does not snap.
+ */
+const blackDragonBite = move('black_dragon_bite', 'bite', 0.70, 0.38, [
+  swing(Ch.FlapAmp, {
+    dur: 0.70, contact: 0.38, rest: 0.30, wind: 0.94, hit: 0.55, follow: 0.34,
+    windAt: 0.55,
+  }),
+  swing(Ch.FlapRate, {
+    dur: 0.70, contact: 0.38, rest: 1.0, wind: 1.8, hit: 1.15, follow: 0.9, windAt: 0.55,
+  }),
+  swing(Ch.JawOpen, { dur: 0.70, contact: 0.38, wind: 0.70, hit: 0.96, follow: 0.10, lag: 0.02 }),
+  swing(Ch.HeadPitch, { dur: 0.70, contact: 0.38, wind: -0.38, hit: 0.42 }),
+  swing(Ch.HeadYaw, { dur: 0.70, contact: 0.38, wind: 0.26, hit: -0.18 }),
+  swing(Ch.BodySink, { dur: 0.70, contact: 0.38, wind: 0.07, hit: -0.09 }),
+  swing(Ch.TailSway, { dur: 0.70, contact: 0.38, wind: -0.36, hit: 0.46 }),
+], { minRange: 0, maxRange: 6.0 });
+
+/**
+ * Fire, on the same open-and-HOLD shape as the wild dragon's: the jaw cracks,
+ * clamps shut on the inhale, then snaps wide at contact and stays wide while
+ * it burns. Shortened to 1.05 s from 0.95 s wall-to-wall so it still fits the
+ * boss's cadence with the longer bite.
+ */
+const blackDragonBreath = move('black_dragon_breath', 'breath', 1.05, 0.48, [
+  track(Ch.JawOpen, [
+    [0, 0, Ease.Smooth],
+    [0.19, 0.16, Ease.Smooth],   // cracks open
+    [0.34, 0.04, Ease.In],       // clamps shut: the inhale
+    [0.48, 0.94, Ease.Out],      // snaps wide — CONTACT
+    [0.84, 0.88, Ease.Out],      // held wide while it burns
+    [0.95, 0.26, Ease.Out],
+    [1.05, 0, Ease.Smooth],
+  ]),
+  track(Ch.FlapAmp, [
+    [0, 0.30, Ease.Smooth], [0.33, 0.88, Ease.Out], [0.48, 0.54, Ease.Smooth],
+    [0.84, 0.40, Ease.Smooth], [1.05, 0.30, Ease.Smooth],
+  ]),
+  track(Ch.FlapRate, [
+    [0, 1.0, Ease.Smooth], [0.33, 1.6, Ease.Out], [0.55, 0.85, Ease.Smooth],
+    [1.05, 1.0, Ease.Smooth],
+  ]),
+  track(Ch.HeadPitch, [
+    [0, 0, Ease.Smooth], [0.34, -0.42, Ease.Out], [0.48, 0.16, Ease.Out],
+    [0.84, 0.24, Ease.Smooth], [1.05, 0, Ease.Smooth],
+  ]),
+  track(Ch.BodySink, [
+    [0, 0, Ease.Smooth], [0.34, -0.070, Ease.Out], [0.48, 0.030, Ease.Out],
+    [1.05, 0, Ease.Smooth],
+  ]),
+// `minRange` 1.6, not 4.0: the selector never offers a move whose window the
+// bite already covers end to end, and the bite reaches 6 m on this animal. At
+// 4.0 the breath was unreachable — `test-anim.mts` catches exactly that, which
+// is the only reason anyone would ever find out.
+], { minRange: 1.6, maxRange: 30 });
+
 export const ATTACK_MOVES: Record<Species, readonly AttackMove[]> = {
   wolf:        [wolfLunge, wolfSnap],
   bear:        [bearSwipe, bearBackhand, bearMaul],
@@ -975,6 +1098,8 @@ export const ATTACK_MOVES: Record<Species, readonly AttackMove[]> = {
   goblin_archer: [archerLoose, archerJab],
   skeleton:      [skeletonChop, skeletonThrust, skeletonBackhand],
   dread_king:    [kingCleave, kingOverhead, kingThrust],
+  evil_king:     [evilKingCleave, evilKingOverhead, evilKingThrust],
+  black_dragon:  [blackDragonBite, blackDragonBreath],
 };
 
 /** Every attack clip, for validation sweeps. */

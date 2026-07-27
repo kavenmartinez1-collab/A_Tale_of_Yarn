@@ -78,7 +78,14 @@ export function createStarterInventory(): Inventory {
     { id: 'gold_small',     count: 99 },
     { id: 'gold_small',     count: 99 },
     // Combat / survival.
-    { id: 'arrow',          count: 99 },
+    // Two quivers, and the ratio is the design. `flint_arrow` is the bow's
+    // ammunition — craftable, cheap, and there is enough of it here to hunt
+    // and skirmish without thinking about it. Tintreach is rare boss loot, and
+    // a dozen is enough to learn what the weapon does and to win a fight you
+    // had no business winning; it is not enough to make it your default. It
+    // does not come back — see tintreach.ts.
+    { id: 'flint_arrow',    count: 48 },
+    { id: 'arrow',          count: 12 },
     { id: 'healing_potion', count: 20 },
     { id: 'stamina_potion', count: 20 },
     { id: 'warming_potion', count: 10 },
@@ -99,7 +106,13 @@ export function createStarterInventory(): Inventory {
     // dragon scales) plus crafting metals.
     { id: 'dragon_scale',   count: 20 },
     { id: 'iron_ingot',     count: 99 },
-    { id: 'bronze_ingot',   count: 50 },
+    // No bronze ingots. The pack is 28 slots and this kit had filled all but
+    // one of them, so adding the flint quiver above took the last spare — and
+    // a pack with no free slot is a dead end, because crafting needs somewhere
+    // to put its output (see `dropSlot`). Bronze was the entry worth losing:
+    // the player starts in full iron armour with iron tools, so its only use
+    // is forging a tier they have already outgrown, and 99 iron ingots and 99
+    // coal are still here for anything that matters.
     { id: 'leather',        count: 99 },
     { id: 'hide',           count: 99 },
     { id: 'coal',           count: 99 },
@@ -120,6 +133,12 @@ function slots(inv: Inventory, area: SlotArea): Slot[] {
 /**
  * Add `count` of an item: tops up existing stacks first (pack then hotbar),
  * then fills empty pack slots. Returns the leftover that did not fit.
+ *
+ * Tintreach arrows used to be special-cased here, and are no longer. There was
+ * a chokepoint that collapsed every grant of them into a single slot, because
+ * the design was one unique quiver per save. They are now rare, finite,
+ * consumable boss loot, so they have to be able to accumulate across stacks
+ * like anything else — see the header of tintreach.ts.
  */
 export function addItem(inv: Inventory, id: GameItemId, count = 1): number {
   const max = itemDef(id).stack;

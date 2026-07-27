@@ -22,7 +22,43 @@ import { CHUNK_SIZE } from '../src/game/terrain/chunk-mesh';
 // flatness budget 7 -> 9, which moves every castle candidate in the world.
 // (resource scatter clears settlement.radius + 3, same as trees.)
 // Previous: 0xa99c17d2
-const GOLDEN_HASH: number | null = 0xe7d39c42;
+// Rebaselined 2026-07-26: settlement flatness now tests the WHOLE footprint.
+// It used to sample one ring at 0.7*radius and compare each sample to the
+// CENTRE, which let three things through: nothing outside 0.7*radius was
+// checked at all (the outer 20 m of a 68 m castle), measuring against the
+// centre halved the apparent tilt of a uniformly sloping site, and MIN_HEIGHT
+// was centre-only so a footprint could have its rim in the sea. Now a disc
+// (centre + rings at 0.45/0.75/1.0) judged on true spread, with the lowest
+// sample required to clear the sand line. Candidates 8 -> 40 to hold density
+// under the stricter test, with an outer-ring-first early exit so the common
+// rejection costs 2-3 samples rather than 25. Net: 178 -> 192 settlements,
+// castles 7 -> 8. Castles keep the loosest budget deliberately — a fortress
+// belongs on commanding ground.
+// 2026-07-26 (later the same day). Castle/town flatness tightened (5x14 ring
+// sampling, castle 24 -> 20, town 11 -> 9, CANDIDATES 40 -> 96), which moves
+// settlement positions and therefore the clearings carved around them.
+// Previous: 0x6ca07961
+// Updated 0x395d6805 on 2026-07-26: castle-grounds keep-out added (resource-scatter.ts) — the motte is bare.
+// 2026-07-26, population pass: `rollKind` rebalanced 40/22/15/13/10 ->
+// 26/14/22/19/19 so the world is not half empty ruins (reasoning lives in
+// test-settlement-scatter.mts). Settlements moved and changed kind, and
+// resource scatter carves the same `radius + 3` clearing settlements do, so
+// the rock and bush fields move with them. Nothing in resource-scatter.ts
+// itself changed.
+// Previous: 0x395d6805
+// 2026-07-26, river pass: `settlementSiteAt` now rejects any candidate whose
+// footprint crosses a river, and the forced near-spawn castle moved cells
+// because its pin was sitting in one (full reasoning in
+// test-settlement-scatter.mts). Resource scatter carves the same `radius + 3`
+// clearing settlements do, so the rock and bush fields move with the sites that
+// moved. Nothing in resource-scatter.ts itself changed — note in particular
+// that its OWN river reading is untouched: reeds and gourds still want
+// `riverFactor >= 0.05` on a bank at h in [0.5, 6], and rivers themselves have
+// not moved at all. What changed is only that no settlement is standing on one
+// any more, so a few bank nodes that used to fall inside a town's keep-out now
+// survive.
+// Previous: 0x4ef74ded
+const GOLDEN_HASH: number | null = 0xc46b506f;
 
 const WORLD_SEED = 1337;
 

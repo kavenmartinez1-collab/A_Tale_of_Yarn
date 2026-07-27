@@ -14,7 +14,7 @@
  */
 
 import type { NpcPersona } from '../npc/npc-prompt';
-import { buildNpcMessages, buildNpcSystemPrompt, npcGenderFor } from '../npc/npc-prompt';
+import { buildNpcMessages, buildNpcSystemPrompt, npcGenderFor, npcQuirkFor, UNIVERSAL_PREAMBLE } from '../npc/npc-prompt';
 import {
   screenPlayerInput, screenNpcReply, safetyDeflection,
 } from '../npc/content-safety';
@@ -842,6 +842,10 @@ async function buildLiveChatFn(
   const ctx: ForkedChatContext = session.forkKV !== undefined ? session.forkKV() : session;
   _chatCtx = ctx;
   _chatEmptyThink = model.emptyThink;
+  // Start on the shared part of every villager's prompt straight away. The
+  // model is resident and the player is, by construction, still walking — this
+  // is the cheapest GPU time in the session.
+  warmNpcPreamble(ctx);
 
   return async (messages: ChatMessage[], onToken?: (chunk: string) => void) => {
     // Marathon-conversation guard: the attention kernel rejects prompts at or
@@ -870,7 +874,11 @@ async function buildLiveChatFn(
         msgs = [msgs[0], ...msgs.slice(3)];
       }
     }
-    // Serialize against any in-flight warm prefill on the same fork.
+    // Serialize against any in-flight warm prefill on the same fork — but cut
+    // it short first. The player has spoken; finishing a speculative prefill
+    // ahead of them is exactly backwards, and the partial cache it leaves is
+    // still a valid prefix for this turn to extend.
+    cancelNpcWarm();
     const prior = _genChain;
     let release!: () => void;
     _genChain = new Promise<void>((r) => { release = r; });
@@ -889,7 +897,7 @@ async function buildLiveChatFn(
           sawToken = true;
           onToken?.(chunk);
         },
-        { enableThinking: false, emptyThink: model.emptyThink },
+        { enableThinking: false, emptyThink: model.emptyThink, prefillChunk: NPC_PREFILL_CHUNK },
       );
       // TTFT watchdog: if no token arrives within the deadline (GPU
       // contention, pathological prefill), abort and throw — the caller's
@@ -925,6 +933,25 @@ async function buildLiveChatFn(
  *  unaffected once the first token lands. */
 const NPC_TTFT_DEADLINE_MS = 20_000;
 
+/**
+ * Prefill chunk for every NPC generation, warm or real.
+ *
+ * Two independent reasons, both measured, and they agree for once:
+ *
+ * - **Smoothness.** A prefill chunk is one GPU submission that the renderer
+ *   waits behind. At the engine default of 512 a chunk is ~4 s of GPU on a
+ *   ~1,500-token prompt; at 64 it is well under a second, so a warm prefill
+ *   running while the player walks costs frame rate instead of a stall. This is
+ *   the same call the Dungeon Director already made (DIRECTOR_PREFILL_CHUNK).
+ * - **Speed.** Smaller chunks are also *faster* here: sweeping the chunk over a
+ *   fixed 934-token prompt gave 123 tok/s at 64 against 100 tok/s at 512.
+ *
+ * Do NOT raise this above the engine's activation-buffer width (512). Larger
+ * chunks do not error — they silently produce wrong output. generate.ts clamps
+ * it now, but the clamp is a backstop, not a licence.
+ */
+const NPC_PREFILL_CHUNK = 64;
+
 // Cached chat function (lazily initialized, stays resident for the whole
 // session — the model is never unloaded between conversations).
 let _liveChatFn: NpcChatFn | null = null;
@@ -941,6 +968,8 @@ let _chatCtx: ForkedChatContext | null = null;
 let _chatEmptyThink = true;
 /** Serializes generate() calls on the fork (warm prefill vs. chat turns). */
 let _genChain: Promise<unknown> = Promise.resolve();
+/** In-flight warm prefill, so a real turn can cut in front of it. */
+let _warmHandle: { abort(): void } | null = null;
 
 /**
  * Warm-prefill the NPC's system prompt into the chat KV fork while the player
@@ -949,6 +978,10 @@ let _genChain: Promise<unknown> = Promise.resolve();
  * cached tokens are a strict prefix of the real turn-1 prompt — turn 1 then
  * prefills only the player's message instead of ~1000 system-prompt tokens.
  * No-op until the live model is loaded; errors are swallowed (best-effort).
+ *
+ * Safe to call speculatively (e.g. when the player walks up to an NPC): the
+ * only cost of warming the wrong villager is GPU time the player was not
+ * waiting on, and a real turn aborts it (see cancelNpcWarm).
  */
 export function warmNpcChat(persona: NpcPersona): void {
   const ctx = _chatCtx;
@@ -966,10 +999,115 @@ export function warmNpcChat(persona: NpcPersona): void {
         // prompt, keeping the strict-prefix invariant.
         { temperature: 0, topP: 1, repetitionPenalty: 1.0, maxNewTokens: 1 },
         undefined,
-        { enableThinking: false, emptyThink: _chatEmptyThink, addGenerationPrompt: false },
+        { enableThinking: false, emptyThink: _chatEmptyThink, addGenerationPrompt: false,
+          prefillChunk: NPC_PREFILL_CHUNK },
       );
+      _warmHandle = handle;
       await handle.result;
     } catch { /* warm is best-effort */ } finally {
+      _warmHandle = null;
+      release();
+    }
+  })();
+}
+
+/**
+ * Cut a warm prefill short because the player has actually said something.
+ *
+ * The warm is a ~9 s prefill of the whole system prompt, and turns queue behind
+ * it — so a player who read the greeting quickly used to wait out the tail of a
+ * prefill that existed to save them time. Aborting is now strictly a win: the
+ * engine keeps the chunks it already forwarded (generate.ts, prefill-abort
+ * path), so the real turn extends that partial cache rather than restarting.
+ * Nothing to undo if no warm is running.
+ */
+export function cancelNpcWarm(): void {
+  _warmHandle?.abort();
+  _warmHandle = null;
+}
+
+/** Last NPC warmed on approach — so walking past one does not re-warm it. */
+let _warmedNpcId: string | null = null;
+
+/**
+ * Warm the prompt for an NPC the player is walking TOWARD, before they press E.
+ *
+ * The panel already warms on open, but a player who reads the greeting quickly
+ * still overtakes a ~1,500-token prefill; approaching starts it several seconds
+ * earlier, which is exactly the window that was missing. Call it from the game
+ * loop with whatever is cheaply to hand — it deliberately takes loose facts
+ * rather than a built NpcPersona, because assembling the real one has side
+ * effects (it advances the village gossip) that must not fire just because
+ * somebody walked past.
+ *
+ * A partial persona prefills a genuine PREFIX of the real prompt: the sections
+ * are ordered so the universal rules, the character card and the role contract
+ * all come before anything this cannot know, and the engine keeps the common
+ * prefix. Passing `disposition` and `following` when they are known pushes the
+ * match further down, through the follow/hospitality/romance rules.
+ *
+ * Idempotent per NPC, and cheap to be wrong about: an unused warm costs GPU
+ * time the player was not waiting on, and the next real turn aborts it.
+ */
+export function warmNpcApproach(npc: {
+  id: string;
+  name: string;
+  role: NpcRole;
+  settlement: string;
+  playerBounty?: number;
+  disposition?: number;
+  following?: boolean;
+}): void {
+  if (_chatCtx === null || _warmedNpcId === npc.id) return;
+  _warmedNpcId = npc.id;
+  cancelNpcWarm();
+  warmNpcChat({
+    role: npc.role,
+    name: npc.name,
+    settlement: npc.settlement,
+    playerBounty: npc.playerBounty ?? 0,
+    gender: npcGenderFor(npc.name),
+    quirk: npcQuirkFor(npc.id),
+    disposition: npc.disposition,
+    following: npc.following,
+  });
+}
+
+
+/**
+ * Prefill the block of the system prompt that every NPC in the game shares
+ * (npc-prompt.ts UNIVERSAL_PREAMBLE — world, conversation rules, consequences),
+ * as soon as the model is resident.
+ *
+ * It is ~450 of the ~1,500 tokens of a loaded villager's prompt and it is the
+ * same tokens for all of them, so paying for it once at load turns the first
+ * conversation of a session — the only one with nothing at all in the cache —
+ * from a cold prefill into a warm one. Measured: that first turn was the last
+ * remaining multi-second wait after everything else here landed.
+ *
+ * The cached run ends in `<|im_end|>` where the real prompt continues into the
+ * character card, so this is not a strict prefix; it relies on the engine
+ * keeping the common prefix and re-prefilling from the divergence (generate.ts
+ * KV rewind) rather than on an exact match.
+ */
+function warmNpcPreamble(ctx: ForkedChatContext): void {
+  const prior = _genChain;
+  let release!: () => void;
+  _genChain = new Promise<void>((r) => { release = r; });
+  void (async () => {
+    try {
+      await prior.catch(() => { /* prior failures don't block the warm */ });
+      const handle = ctx.chat(
+        [{ role: 'system', content: UNIVERSAL_PREAMBLE }],
+        { temperature: 0, topP: 1, repetitionPenalty: 1.0, maxNewTokens: 1 },
+        undefined,
+        { enableThinking: false, emptyThink: _chatEmptyThink, addGenerationPrompt: false,
+          prefillChunk: NPC_PREFILL_CHUNK },
+      );
+      _warmHandle = handle;
+      await handle.result;
+    } catch { /* best-effort */ } finally {
+      _warmHandle = null;
       release();
     }
   })();

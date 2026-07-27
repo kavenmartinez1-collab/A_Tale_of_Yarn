@@ -40,9 +40,20 @@
  *     different filenames.
  *  4. **The subject is proved to be there and still.** Position is sampled
  *     every frame; a subject that wandered off or despawned is reported.
- *  5. **Hot reloads are detected and the strip is re-shot.** Vite reloads the
- *     page whenever anything under `src/` is written, which wipes every
- *     `window` global and leaves a strip of empty grass.
+ *  5. **The subject is proved to be VISIBLE, not merely present.** Position
+ *     and the box-diffs below both assume the frame actually shows the
+ *     animal; neither notices a camera aimed into a tree canopy, because the
+ *     subject is still alive at the right (x, y, z) — it just is not what is
+ *     on screen. Every "signal 0" this harness used to report traces back to
+ *     a camera-angle bug that pointed every species at the same arbitrary
+ *     world-space direction (see `CAMERA_YAW` below); one species' distance
+ *     happened to put that ray inside foliage. Copied from
+ *     `boss-portraits.mjs`'s coverage check: collapse the subject to a point
+ *     and confirm a large fraction of ITS OWN framing box actually changes.
+ *  6. **Hot reloads are prevented, not just detected.** Vite's HMR socket is
+ *     stubbed before the page ever loads, so another agent saving a file
+ *     mid-strip does not push a reload that wipes every `window` global. The
+ *     retry loop below stays as a fallback for whatever that does not catch.
  *
  * Requires `npm run dev` (port 5173).
  */
@@ -86,6 +97,17 @@ const SUBJECTS = [
   { sp: 'goblin_archer', size: 1.2 },
   { sp: 'skeleton', size: 1.9 },
   { sp: 'dread_king', size: 2.7 },
+  // The castle-fight bosses. They were absent from this list while their five
+  // attack moves were being authored, which is why nobody had ever seen one of
+  // them swing: the King's whole fight is 1.15–1.30 s of greatsword and the
+  // only harness that can hold a playhead still did not know he existed.
+  //
+  // `size` is camera framing, not shoulder height. The King STANDS 3.24 m, so
+  // 3.4 keeps the crown in shot; the dragon is framed off its 19 m span rather
+  // than its 4.4 m shoulder, or the wings leave the frame on the contact frame
+  // of every move it has.
+  { sp: 'evil_king', size: 3.4 },
+  { sp: 'black_dragon', size: 6.5 },
 ];
 
 fs.mkdirSync(outDir, { recursive: true });
@@ -169,24 +191,62 @@ const SUBJ_BOX = [0.37, 0.24, 0.68, 0.70];
 const CTRL_BOX = [0.02, 0.02, 0.22, 0.16];
 
 /**
- * Facing, in radians, that puts the subject in three-quarter profile.
- *
- * Calibrated, not assumed. With the orbit camera at yaw pi/2 a subject at yaw 0
- * is filmed FROM BEHIND — which is what the first run of this harness produced,
- * and it is the third time a capture script in this repo has shot the back of
- * something and reported a front. Straight profile (pi) reads the body rise and
- * the head pitch best; backing off by 0.5 rad keeps the head YAW sweep — the
- * only thing that says "claw" rather than "bite" in the current channel set —
- * from being hidden by foreshortening.
+ * Floor for `subjectCoverage()` below: the fraction of `SUBJ_BOX` that must
+ * change when the subject collapses to a point. The box is deliberately tight
+ * around a properly framed subject (see above), so a real capture changes a
+ * large share of it; a camera aimed at the wrong thing changes none of it.
+ * Set low enough to tolerate a small or distant-reading subject (a rabbit, a
+ * bird) and still fail hard on the ~0% a tree trunk or an empty patch of sky
+ * produces.
  */
-const SUBJECT_YAW = Math.PI - 0.5;
-const CAMERA_YAW = Math.PI / 2;
+const MIN_SUBJ_COVER = 0.03;
+
+/**
+ * Subject-relative camera azimuth, degrees (0 = head-on, 90 = pure profile),
+ * and the conversion to the game's absolute orbit yaw.
+ *
+ * THIS IS THE PART THAT WAS WRONG. The previous version spun the SUBJECT to
+ * `Math.PI - 0.5` and held the CAMERA at a bare `Math.PI / 2`, on the belief
+ * that "orbit yaw pi/2" meant something fixed relative to the subject's face.
+ * It does not — `OrbitCamera.forward()` (`src/game/camera.ts`) never reads the
+ * subject's yaw at all, it is one absolute world angle — so that pairing
+ * filmed every species from the same arbitrary direction in WORLD space
+ * (works out to a rear three-quarter view, not the front three-quarter one
+ * the comment thought it was building), and for one species that direction
+ * ran the camera straight into a tree canopy at that species' particular
+ * distance. Every "signal 0" this harness was reported to produce traces back
+ * to this: the measurement box was full of grass or foliage, because the
+ * subject was never where the box assumed.
+ *
+ * `boss-portraits.mjs` already solved this correctly: pin the SUBJECT's yaw to
+ * 0 (done below via `Object.defineProperty` on the spawned entity — a per-rAF
+ * write loses a race with the game loop, a redefined getter cannot), then
+ * drive the camera through `orbitOf`, copied verbatim from that file because
+ * re-deriving it by hand is exactly how the sign got lost the first time.
+ *
+ * 62 degrees, not 90: pure profile reads an overhead arc's full pendulum and
+ * the body rise best, but hides HEAD YAW completely — a wolf's bite turns its
+ * head toward the camera and a profile view foreshortens that turn to nothing.
+ * Backing off 28 degrees toward head-on keeps the arc legible while the head
+ * sweep still reads — the same trade-off the old constants were reaching for;
+ * only the geometry under them was wrong.
+ */
+const REL_DEG = 62;
+const orbitOf = (rel) => ((180 - rel) * Math.PI) / 180;
+const CAMERA_YAW = orbitOf(REL_DEG);
 
 const browser = await chromium.launch({
   channel: 'chrome', headless: true,
   args: ['--enable-unsafe-webgpu', '--use-angle=d3d11'],
 });
 const page = await browser.newPage({ viewport: { width: 900, height: 620 } });
+// Cut vite's HMR socket before anything loads. Other agents edit this repo
+// while harnesses run, and every file they save pushes a full-page reload —
+// wiping every `window` global mid-strip, which is what the MAX_TRIES retry
+// loop below exists to survive. Stubbing the socket means most of those
+// reloads never happen at all; the retry loop stays as the fallback for
+// whatever this does not catch (a build error, a manual refresh).
+await page.routeWebSocket(/:5173\//, () => { /* swallow HMR */ });
 const pageErrors = [];
 page.on('pageerror', (e) => {
   pageErrors.push(e.message.slice(0, 200));
@@ -274,6 +334,20 @@ async function shootSpecies(subj) {
     // SEA_LEVEL is 0. Land subjects want the flattest ground well above it;
     // an aquatic subject wants open water, deep enough that the sea bed is
     // nowhere near the surface it will be floating on.
+    //
+    // Flat is not the same as clear. The single flattest cell in this whole
+    // search box turned out to be a grassy shoulder overlooking a lake, and
+    // the animated water surface moved MORE between two supposedly-identical
+    // rest-pose shots than a king's cleave moved his sword — burying a real
+    // swing's signal under its own background rather than under anything
+    // wrong with the swing. `WATER_RING` rejects any land site with open
+    // water in the likely camera background; `black_dragon`'s 18 m boom is
+    // the longest lens this file uses, and 35 m comfortably covers what
+    // actually lands in frame at every distance used below.
+    const WATER_RING = [
+      [35, 0], [-35, 0], [0, 35], [0, -35],
+      [25, 25], [25, -25], [-25, 25], [-25, -25],
+    ];
     let best = null;
     for (let gx = -10; gx <= 10; gx++) {
       for (let gz = -10; gz <= 10; gz++) {
@@ -294,6 +368,7 @@ async function shootSpecies(subj) {
           if (best === null || deepest < best.dev) best = { x, z, dev: deepest };
         } else {
           if (hgt < 1.0) continue;
+          if (WATER_RING.some(([ox, oz]) => g.heightAt(x + ox, z + oz) < 1.0)) continue;
           if (best === null || dev < best.dev) best = { x, z, dev };
         }
       }
@@ -308,6 +383,15 @@ async function shootSpecies(subj) {
     if (sp === null) return null;
     g.setPortraitSubject(sp.id);
 
+    // Pin facing by REDEFINING the property, not by reassigning it every
+    // frame. A per-rAF write loses a race with the game loop — see
+    // `boss-portraits.mjs`, which hit exactly that (the King's rider caught
+    // mid-turn between the pin and the render). A redefined getter cannot
+    // lose that race: nothing that runs after this line can make `sp.yaw`
+    // read back as anything but 0, which is what makes `CAMERA_YAW` above a
+    // subject-relative angle rather than a guess about world space.
+    Object.defineProperty(sp, 'yaw', { get: () => 0, set: () => {}, configurable: true });
+
     const dbg = window.__animDebug;
     dbg.enabled = true;
     dbg.hold = null;
@@ -320,7 +404,6 @@ async function shootSpecies(subj) {
       // animals that had wandered out of frame.
       sp.mode = 'idle';
       sp.stateTimer = 600;
-      sp.yaw = cfg.yaw;
       // Slightly above the horizontal: a level camera at ground height looks
       // straight through the grass and, on anything but perfectly flat terrain,
       // through the lip of the next rise. Both put a green wall over the
@@ -336,7 +419,7 @@ async function shootSpecies(subj) {
     }));
     return { id: sp.id, x: sp.x, y: sp.y, z: sp.z, dev: best.dev, moves };
   }, {
-    sp: subj.sp, dist, yaw: SUBJECT_YAW, camYaw: CAMERA_YAW,
+    sp: subj.sp, dist, camYaw: CAMERA_YAW,
     water: subj.water === true,
   });
 
@@ -368,12 +451,74 @@ async function shootSpecies(subj) {
   }
   await page.waitForTimeout(600);
 
+  // Prove the camera can actually see the subject before spending any beats
+  // on it. The camera setup here (`cfg.camYaw`/`cfg.dist`) is identical for
+  // every move of this species, so occlusion is a property of this one spot
+  // and checking once, before the per-move loop, is enough.
+  const cover = await subjectCoverage(placed.id);
+  if (cover < MIN_SUBJ_COVER) {
+    console.log(`${subj.sp.padEnd(13)} WARNING: camera cannot see the subject `
+      + `(only ${(cover * 100).toFixed(2)}% of its box changed when it was `
+      + 'collapsed — occluded by scenery, or aimed at the wrong spot)');
+    log.push({
+      species: subj.sp, ok: false, reason: 'subject not visible from camera', cover,
+    });
+    await page.evaluate(() => { window.__atkStop = true; });
+    return [];
+  }
+
   const strips = [];
   for (const mv of placed.moves) {
     strips.push(await shootMove(subj, mv, placed, session));
   }
   await page.evaluate(() => { window.__atkStop = true; });
   return strips;
+}
+
+/**
+ * Fraction of `SUBJ_BOX` that changes when entity `id` is collapsed to a
+ * point — copied from `boss-portraits.mjs`'s `coverage()`/`subScale()` pair,
+ * adapted to this file's Node-side PNG decoding instead of an in-page canvas.
+ *
+ * Near 0 means the box was never showing the subject: background (grass, sky,
+ * a tree trunk 8 cm from the lens) does not move when an unrelated entity
+ * shrinks to nothing. A properly framed subject fills enough of its own
+ * (deliberately tight) box that collapsing it changes most of the pixels in it.
+ */
+async function subjectCoverage(id) {
+  const before = decodePng(await page.screenshot());
+  await page.evaluate((sid) => {
+    const e = window.__gameDebug.entities().find((x) => x.id === sid);
+    if (e !== undefined) e.scaleOverride = 0.0004;
+  }, id);
+  await page.waitForTimeout(220);
+  const after = decodePng(await page.screenshot());
+  // Never leave it collapsed — a failed species would otherwise leave a
+  // pinhead on screen for whatever runs next against the same page.
+  await page.evaluate((sid) => {
+    const e = window.__gameDebug.entities().find((x) => x.id === sid);
+    if (e !== undefined) e.scaleOverride = 1;
+  }, id);
+  await page.waitForTimeout(160);
+  return changedFraction(before, after, ...SUBJ_BOX);
+}
+
+/** Fraction of pixels in a normalised box that differ by a visible amount. */
+function changedFraction(a, b, x0, y0, x1, y1) {
+  const { w, h, ch, px } = a;
+  const X0 = Math.floor(x0 * w); const X1 = Math.ceil(x1 * w);
+  const Y0 = Math.floor(y0 * h); const Y1 = Math.ceil(y1 * h);
+  let changed = 0; let n = 0;
+  for (let y = Y0; y < Y1; y++) {
+    for (let x = X0; x < X1; x++) {
+      const i = y * w * ch + x * ch;
+      const d = Math.abs(px[i] - b.px[i]) + Math.abs(px[i + 1] - b.px[i + 1])
+        + Math.abs(px[i + 2] - b.px[i + 2]);
+      if (d > 42) changed++;
+      n++;
+    }
+  }
+  return n > 0 ? changed / n : 0;
 }
 
 async function shootMove(subj, mv, placed, session) {
@@ -522,7 +667,11 @@ const bad = log.filter(l => !l.ok);
 console.log(`\n${log.length} attack strips -> ${outDir}`);
 if (pageErrors.length) console.log(`${pageErrors.length} page error(s)`);
 if (bad.length) {
+  // The coverage-check failure (added above `shootMove`) logs one record per
+  // species with no `.move` — a whole species that could not be filmed at
+  // all, not one bad strip within an otherwise-good species.
   console.log(`${bad.length} strip(s) failed: `
-    + bad.map(b => `${b.species}/${b.move}`).join(', '));
+    + bad.map(b => b.move ? `${b.species}/${b.move}` : `${b.species} (${b.reason})`)
+      .join(', '));
   process.exitCode = 1;
 }

@@ -390,7 +390,7 @@ export function buildInventoryPanel(
   const hint = document.createElement('div');
   hint.className = 'hint';
   hint.textContent = 'Click to pick up, click again to place · '
-    + 'right-click a slot to drop one (Shift = whole stack) · Q drops held · Tab to close';
+    + 'right-click a slot to drop one (Shift = whole stack) · P drops held · Tab to close';
   el.appendChild(hint);
 
   refresh();

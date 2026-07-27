@@ -11,11 +11,15 @@ import {
   reachableFloorCells,
   BUILDING_KINDS,
   MAX_INTERIOR_LIGHTS,
+  WINDOW_INSET,
+  WINDOW_DEPTH,
+  WINDOW_HALF_H,
   type BuildingInteriorSpec,
   type BuildingInterior,
   type AABB,
   type BuildingKind,
 } from '../src/game/building/building-interior';
+import { cellLineOfSight } from '../src/game/interior-los';
 import {
   buildBuildingInteriorMesh,
   buildFurnitureMeshes,
@@ -25,6 +29,9 @@ import {
 } from '../src/game/building/building-interior-mesh';
 
 const ALL_KINDS = BUILDING_KINDS as readonly BuildingKind[];
+
+/** `cells` encoding, mirrored from building-interior.ts (not exported there). */
+const CELL_SOLID_T = 0;
 
 let passed = 0;
 let failed = 0;
@@ -571,6 +578,242 @@ for (const kind of ALL_KINDS) {
   check(`build time under 25 ms/interior (worst ${worst.kind} ${worst.ms.toFixed(1)} ms)`,
     worst.ms < 25, `${worst.ms.toFixed(2)} ms`);
   console.log(`  slowest interior build: ${worst.kind} ${worst.ms.toFixed(2)} ms`);
+}
+
+// ---- 21. Placement: measured in metres, over the whole option space --------
+
+// Everything below was a fault reported from play, and every one of them was
+// invisible to a count. "The interior has 34 decor props" is equally true of a
+// room with a window looking into the next room, a bunch of herbs floating
+// 20 cm under the ceiling and a pair of boots inside a wall.
+//
+// The sweep is the whole size range x three seeds x every kind, not one
+// hand-picked fixture: the partition windows only appear when the RNG puts the
+// guest room on the near side, the barn's window only misbehaves under a low
+// hay loft, and the boots only land in a wall in a narrow house. One fixture
+// finds none of them.
+{
+  const faults = new Map<string, string>();   // fault -> first example
+  const fault = (what: string, where: string): void => {
+    if (!faults.has(what)) faults.set(what, where);
+  };
+  let interiors = 0;
+  let windows = 0;
+  let hanging = 0;
+
+  const HANGS: readonly string[] =
+    ['lantern', 'chandelier', 'censer', 'herbs', 'sausages', 'hangpot'];
+
+  for (const kind of ALL_KINDS) {
+    for (let w = 5; w <= 14; w++) {
+      for (let d = 5; d <= 14; d++) {
+        for (let seed = 0; seed < 3; seed++) {
+          const it = generateBuildingInterior(
+            { settlementName: 'T', buildingIndex: seed, kind, width: w, depth: d },
+            1000 + seed * 7);
+          interiors++;
+          const tag = `${kind} ${w}x${d}#${seed}`;
+          const cellAt = (x: number, z: number): number => {
+            const cx = Math.floor(x); const cz = Math.floor(z);
+            if (cx < 0 || cz < 0 || cx >= it.gridW || cz >= it.gridD) return CELL_SOLID_T;
+            return it.cells[cz * it.gridW + cx];
+          };
+          const ceilAt = (x: number, z: number): number => {
+            const cx = Math.floor(x); const cz = Math.floor(z);
+            if (cx < 0 || cz < 0 || cx >= it.gridW || cz >= it.gridD) return 0;
+            return it.ceilY[cz * it.gridW + cx];
+          };
+          // What is DRAWN overhead. Under a gable the flat `ceilY` plane is
+          // never emitted -- two slopes are -- so a prop nailed to `ceilY` in a
+          // longhouse hangs in the air below the roof it is supposed to be on.
+          const soffitAt = (x: number, z: number): number => {
+            const gb = it.gable;
+            const c = ceilAt(x, z);
+            if (gb === null || x < gb.x0 || x >= gb.x1 || z < gb.z0 || z >= gb.z1) return c;
+            const span = gb.axis === 'z' ? (gb.x1 - gb.x0) / 2 : (gb.z1 - gb.z0) / 2;
+            if (span <= 1e-6) return c;
+            const mid = gb.axis === 'z' ? (gb.x0 + gb.x1) / 2 : (gb.z0 + gb.z1) / 2;
+            const u = Math.min(1, Math.abs((gb.axis === 'z' ? x : z) - mid) / span);
+            return gb.eaves + (gb.ridge - gb.eaves) * (1 - u);
+          };
+
+          for (const dec of it.decor) {
+            if (dec.type === 'window') {
+              windows++;
+              // The wall plane is WINDOW_INSET behind the anchor along the
+              // prop's own -Z. The interior is carved at (1,1) inside a
+              // one-cell solid border, so the only planes with daylight behind
+              // them are 1 and size-1; every other solid cell is a partition
+              // with another room, a bed alcove or a guest room on the far side.
+              const nx = -Math.sin(dec.yaw); const nz = Math.cos(dec.yaw);
+              const alongX = Math.abs(nx) > Math.abs(nz);
+              const plane = alongX ? dec.x - nx * WINDOW_INSET : dec.z - nz * WINDOW_INSET;
+              const size = alongX ? it.gridW : it.gridD;
+              const outside = Math.abs(plane - 1) < 0.06 || Math.abs(plane - (size - 1)) < 0.06;
+              if (!outside) {
+                fault('window on an interior partition',
+                  `${tag}: ${alongX ? 'x' : 'z'}=${plane.toFixed(2)}, `
+                  + `outside walls are 1 and ${size - 1}`);
+              }
+              const hh = WINDOW_HALF_H * dec.scale;
+              const c = ceilAt(dec.x, dec.z);
+              if (c > 0 && dec.y + hh > c - 0.02) {
+                fault('window head through its own ceiling',
+                  `${tag}: head ${(dec.y + hh).toFixed(2)} vs ceiling ${c.toFixed(2)}`);
+              }
+              if (dec.y - hh < 0.4) {
+                fault('window sill on the floor', `${tag}: sill ${(dec.y - hh).toFixed(2)}`);
+              }
+            }
+            if (HANGS.includes(dec.type)) {
+              hanging++;
+              const c = soffitAt(dec.x, dec.z);
+              // Every hanging template starts its chain at local y = 0 and runs
+              // downward, so the anchor IS the surface it is nailed to.
+              // Anchoring below the soffit leaves a bare cord end in mid-air.
+              if (c > 0 && dec.y < c - 0.02) {
+                fault(`${dec.type} hangs off nothing`,
+                  `${tag}: y ${dec.y.toFixed(2)}, soffit ${c.toFixed(2)}`);
+              }
+            }
+            if (dec.type !== 'window' && cellAt(dec.x, dec.z) === CELL_SOLID_T) {
+              fault(`${dec.type} anchored inside a wall`,
+                `${tag}: (${dec.x.toFixed(2)}, ${dec.z.toFixed(2)})`);
+            }
+          }
+
+          for (const L of it.lights) {
+            if (cellAt(L.x, L.z) === CELL_SOLID_T) {
+              fault('light inside a wall',
+                `${tag}: ${L.kind} (${L.x.toFixed(2)}, ${L.z.toFixed(2)})`);
+            }
+            const c = soffitAt(L.x, L.z);
+            if (c > 0 && L.y > c) {
+              fault('light above the ceiling',
+                `${tag}: ${L.kind} y ${L.y.toFixed(2)} vs ${c.toFixed(2)}`);
+            }
+          }
+
+          // Furniture may STAND ON other furniture (a throne on a dais): a
+          // contained footprint with its base at or above the other's top. Any
+          // other overlap is two solid props sharing one volume.
+          for (let i = 0; i < it.furniture.length; i++) {
+            for (let j = i + 1; j < it.furniture.length; j++) {
+              const a = it.furniture[i].aabb; const b = it.furniture[j].aabb;
+              const ox = Math.min(a.maxX, b.maxX) - Math.max(a.minX, b.minX);
+              const oz = Math.min(a.maxZ, b.maxZ) - Math.max(a.minZ, b.minZ);
+              const oy = Math.min(a.maxY, b.maxY) - Math.max(a.minY, b.minY);
+              if (ox <= 0.02 || oz <= 0.02 || oy <= 0.02) continue;
+              const on = (q: AABB, r: AABB): boolean =>
+                q.minY >= r.maxY - 0.4 && q.minX >= r.minX - 0.02 && q.maxX <= r.maxX + 0.02
+                && q.minZ >= r.minZ - 0.02 && q.maxZ <= r.maxZ + 0.02;
+              if (on(a, b) || on(b, a)) continue;
+              fault('furniture inside furniture',
+                `${tag}: ${it.furniture[i].type}/${it.furniture[j].type} `
+                + `${(ox * oz).toFixed(2)} m2 of shared footprint`);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  console.log(`  placement sweep: ${interiors} interiors, ${windows} windows, `
+    + `${hanging} hanging props`);
+  for (const [what, where] of faults) console.error(`    ${what} -- ${where}`);
+  check(`placement sweep clean over ${interiors} interiors`, faults.size === 0,
+    `${faults.size} distinct faults`);
+  // A window drawn behind its own wall is a property of the two constants, not
+  // of any one interior: the shell emits an unbroken quad for every wall face
+  // and has no notion of an aperture, so anything past the plane is painted
+  // over -- which is how the church's great east window came to have no glass.
+  check('every part of a window is in front of its wall',
+    WINDOW_DEPTH + 0.01 < WINDOW_INSET, `depth ${WINDOW_DEPTH} vs inset ${WINDOW_INSET}`);
+}
+
+// ---- 22. E-key reach stops at walls, and only at walls --------------------
+
+// `findInsideInteraction` used to be pure XZ distance with a 3 m radius, and a
+// partition is one 1 m cell -- so "Press E to open the chest" appeared, and
+// worked, from the next room. Two things have to hold at once:
+//
+//   a) nothing interactable becomes unreachable. This is the dangerous half:
+//      an over-strict sight test locks the player out of the tavern bed they
+//      paid for. Every bed, every chest candidate and the exit must be usable
+//      from at least one cell the player can actually stand on.
+//   b) the test does something. A sight check that always returns true passes
+//      (a) perfectly, so this also proves that in the partitioned kinds there
+//      IS a standing cell where the old distance-only rule would have fired
+//      and the new one does not.
+{
+  const REACH = 3;   // INTERACT_DIST in building-manager.ts
+  let unreachable = 0;
+  let firstUnreachable = '';
+  let blockedCases = 0;
+  let kindsWithBlocking = 0;
+
+  for (const kind of ALL_KINDS) {
+    let blockingHere = 0;
+    for (let w = 6; w <= 13; w++) {
+      for (let seed = 0; seed < 2; seed++) {
+        const it = generateBuildingInterior(
+          { settlementName: 'T', buildingIndex: seed, kind, width: w, depth: w }, 500 + seed);
+        const stand = reachableFloorCells(it).map(([x, z]) => [x + 0.5, z + 0.5] as const);
+        if (stand.length === 0) continue;
+
+        const targets: { name: string; x: number; z: number }[] = [];
+        for (const f of it.furniture) {
+          if (f.type !== 'bed' && f.type !== 'bunk' && f.type !== 'sleepbench'
+            && f.tag !== 'keeper' && f.type !== 'strongbox') continue;
+          targets.push({
+            name: f.type,
+            x: (f.aabb.minX + f.aabb.maxX) / 2,
+            z: (f.aabb.minZ + f.aabb.maxZ) / 2,
+          });
+        }
+        // Chests land on any reachable floor cell, so sample a few of those too.
+        for (let i = 0; i < stand.length; i += Math.max(1, Math.floor(stand.length / 5))) {
+          targets.push({ name: 'chest cell', x: stand[i][0], z: stand[i][1] });
+        }
+        targets.push({
+          name: 'exit',
+          x: (it.exitZone.minX + it.exitZone.maxX) / 2,
+          z: (it.exitZone.minZ + it.exitZone.maxZ) / 2,
+        });
+
+        for (const t of targets) {
+          let usable = false;
+          for (const [sx, sz] of stand) {
+            const d = Math.hypot(sx - t.x, sz - t.z);
+            if (d > REACH) continue;
+            if (!cellLineOfSight(it.cells, it.gridW, it.gridD, sx, sz, t.x, t.z)) {
+              blockingHere++;
+              continue;
+            }
+            usable = true;
+          }
+          if (!usable) {
+            unreachable++;
+            if (firstUnreachable === '') {
+              firstUnreachable = `${kind} ${w}x${w}#${seed}: ${t.name} `
+                + `at (${t.x.toFixed(1)}, ${t.z.toFixed(1)})`;
+            }
+          }
+        }
+      }
+    }
+    blockedCases += blockingHere;
+    if (blockingHere > 0) kindsWithBlocking++;
+  }
+
+  console.log(`  E-key reach: ${blockedCases} through-wall prompts suppressed across `
+    + `${kindsWithBlocking}/${ALL_KINDS.length} kinds`);
+  check('every interactable is still usable from somewhere standable',
+    unreachable === 0, `${unreachable} unreachable; first: ${firstUnreachable}`);
+  // The partitioned kinds are house (bed alcove), tavern (guest room) and keep
+  // (guard room). If none of them blocks anything the sight test is inert.
+  check('the sight test actually blocks through-wall prompts',
+    kindsWithBlocking >= 3, `${kindsWithBlocking} kinds`);
 }
 
 // ---------------------------------------------------------------------------

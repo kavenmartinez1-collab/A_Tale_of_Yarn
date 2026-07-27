@@ -65,7 +65,7 @@ function fnv1a(str: string): number {
 // 1. NPC_PROMPT_VERSION
 // ---------------------------------------------------------------------------
 
-check('NPC_PROMPT_VERSION === 13', NPC_PROMPT_VERSION === 13);
+check('NPC_PROMPT_VERSION === 14', NPC_PROMPT_VERSION === 14);
 
 // ---------------------------------------------------------------------------
 // 2. TRADE_CATALOG — all ids valid, prices and stock positive
@@ -501,7 +501,12 @@ const TRAILING_OFFER = CLEAN_OFFER + '\nHave a safe journey!';
 // "Nils would know more about that" true rather than a pleasant fabrication.
 // Concerns carry a completable task, so the same store that gives consistency
 // also gives the game its quests.
-const GOLDEN_NPC_HASH: number | null = 0xeb856807; // v13: village facts
+// v14 reordered the sections most-stable-first so the engine's KV cache can
+// keep a prefix across turns and across NPCs (a passing cloud used to cost the
+// whole prompt). Nothing was cut: the word multiset is unchanged apart from the
+// name and settlement being dropped OUT of the universal rules, which is what
+// makes those rules shared by every NPC in the game.
+const GOLDEN_NPC_HASH: number | null = 0x4d5b5432; // v14: stable-first ordering
 
 const goldenPersona: NpcPersona = {
   role: 'merchant',

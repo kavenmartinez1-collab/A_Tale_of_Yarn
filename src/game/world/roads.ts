@@ -299,6 +299,36 @@ interface RCell {
 
 const EMPTY_CELL: RCell = { segs: new Float32Array(0), count: 0 };
 
+/**
+ * One road network per seed, shared by everybody who asks.
+ *
+ * A `RoadNetwork` is a pure function of (seed, base field) wrapped around three
+ * caches, and the expensive part — a Dijkstra sweep per castle over a
+ * ~120x120 grid of `heightAt` samples — is paid on first touch. Two instances
+ * of the same seed therefore produce identical answers and pay for them twice,
+ * which is exactly what happened when road travellers needed the graph: the
+ * chunk manager already had a network built and warm, and the only reason to
+ * build a second one was that nothing exposed the first.
+ *
+ * Keyed on the seed alone. The base field is only consulted when there is
+ * nothing cached, so whichever caller arrives first supplies it; any two base
+ * fields for the same seed are equivalent by construction (`createHeightField`
+ * is pure), so the answer does not depend on who won that race.
+ *
+ * Never hand this a *carved* field. See `carveRoads` for why the definition
+ * would become circular.
+ */
+const sharedNetworks = new Map<number, RoadNetwork>();
+
+export function sharedRoadNetwork(seed: number, base: HeightField): RoadNetwork {
+  let net = sharedNetworks.get(seed);
+  if (net === undefined) {
+    net = createRoadNetwork(seed, base);
+    sharedNetworks.set(seed, net);
+  }
+  return net;
+}
+
 export function createRoadNetwork(
   seed: number,
   base: HeightField,

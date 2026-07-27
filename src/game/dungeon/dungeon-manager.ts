@@ -21,12 +21,13 @@
 
 import type { GroundQuery } from '../collision';
 import type { Vec3 } from '../math';
+import { cellLineOfSight } from '../interior-los';
 import type { HeightField } from '../noise';
 import type { OrbitCamera } from '../camera';
 import type { PlayerController } from '../controller';
 import { LIGHTS_BUFFER_SIZE, STRIDE_PROP, type DungeonDraw, type Renderer } from '../renderer';
 import { DUNGEON_FIXTURES } from './dungeon-fixtures';
-import { layoutDungeon, mix32, type DungeonLayout } from './dungeon-layout';
+import { layoutDungeon, mix32, CELL_SOLID, type DungeonLayout } from './dungeon-layout';
 import { buildInteriorMesh } from './dungeon-mesh';
 import {
   buildChestMesh, buildEntranceGlowMesh, buildEntranceStoneMesh,
@@ -37,15 +38,16 @@ import { DCELL, entranceSiteAt } from './entrance-site';
 import { SPECIES_DEFS } from '../entities/entity-types';
 import type { EntityState } from '../entities/entity-manager';
 import {
-  CombatIndex, stepAnimal, onEntityDamaged,
-  type DamageSource, type RangedShot,
+  onEntityDamaged, type DamageSource, type RangedShot,
 } from '../entities/animal-ai';
 import { rollDrops } from '../entities/animal-drops';
-import type { GameItemId } from '../items';
-import type { DungeonSpec, ItemId } from './dungeon-spec';
+import { itemDef, type GameItemId } from '../items';
+import type { DungeonSpec } from './dungeon-spec';
 import {
   spawnDungeonEnemies, type DungeonEnemy,
 } from './dungeon-enemies';
+import { DungeonCombat } from './dungeon-combat';
+import { rollBossTintreach, saltChestLoot } from './dungeon-loot';
 
 // Re-exported so `main.ts` (and anything else holding a manager) can keep
 // importing the type from here. The spawner itself moved to `dungeon-enemies`
@@ -53,6 +55,7 @@ import {
 // imports the renderer and cannot.
 export type { DungeonEnemy };
 import { mulberry32 } from '../mesh-utils';
+import { writeTorchLightSlot } from '../torch';
 
 const INTERACT_DIST = 3;    // E-key reach (m, XZ)
 const EXIT_OFFSET = 1.5;    // how far outside the entrance you reappear (m)
@@ -64,6 +67,8 @@ const ENTRANCE_DRAW_DIST = 360;
 const NOTICE_MS = 4_000;    // "Found: …" HUD notice lifetime
 const TORCH_COLOR: [number, number, number] = [1.0, 0.72, 0.4];
 const TORCH_RADIUS = 7;     // point-light falloff radius (m)
+/** Slots in the group-2 lights uniform (renderer.ts LIGHTS_BUFFER_SIZE). */
+const MAX_INTERIOR_LIGHTS = (LIGHTS_BUFFER_SIZE - 16) / 32;
 
 /**
  * Sync seam through which the AI Director supplies specs. Everything here
@@ -94,7 +99,14 @@ export interface Entrance {
 
 interface ResidentChest {
   cell: [number, number];
-  items: ItemId[];
+  /**
+   * Widened from `ItemId` to `GameItemId`: `ItemId` is the small hand-curated
+   * set an AI Director may name in a spec, and `dungeon-loot.ts` adds things a
+   * Director is deliberately not allowed to name — healing, and the Tintreach
+   * arrows. `ItemId[]` is assignable to `GameItemId[]`, so the spec's own loot
+   * still drops in unchanged.
+   */
+  items: GameItemId[];
   /** Object uniform buffer — w rewritten wood → stone when looted. */
   objectBuffer: GPUBuffer;
   opened: boolean;
@@ -118,6 +130,19 @@ interface Resident {
    * in a dungeon renders as a pure black silhouette.
    */
   torchLights: WorldLight[];
+  /**
+   * The group-2 lights uniform and its CPU mirror, kept so a HELD torch can be
+   * written into the spare slot every frame. Dungeon surfaces read only this
+   * buffer — the world-light set lights characters underground but not the
+   * walls — so without a live handle on it a carried torch lights the goblin
+   * and leaves the corridor black. See torch.ts `writeTorchLightSlot`.
+   */
+  lightsBuffer: GPUBuffer;
+  lightsData: Float32Array<ArrayBuffer>;
+  /** Wall torches baked in on entry; the player's slot goes after these. */
+  fixedLightCount: number;
+  /** Whether the spare slot currently holds a light, so still frames skip. */
+  playerTorchOn: boolean;
 }
 
 /** A point light in world space, shared with the renderer's world-light set. */
@@ -171,10 +196,26 @@ export class DungeonManager {
    */
   onEnemyShot: ((e: EntityState, shot: RangedShot) => void) | null = null;
 
-  /** Shared per-tick combat index for the resident dungeon's enemies. */
-  private readonly combat = new CombatIndex();
-  /** Last sim time seen, so mob-vs-mob kills can stamp a corpse timer. */
+  /**
+   * Line-of-sight gating, the player's damage grace window and the shared
+   * mob-vs-mob index for the resident dungeon. See `dungeon-combat.ts`.
+   */
+  private readonly combat = new DungeonCombat();
+  /**
+   * Last sim time seen, so mob-vs-mob kills can stamp a corpse timer.
+   *
+   * Written by `tickEnemies` every frame the player is inside. It used to be
+   * written ONLY by `attackDungeonEnemy` and `notifyPlayerKill` — both player
+   * paths — so in a delve where the player had not yet killed anything it was
+   * still 0. Every mob-vs-mob corpse was therefore stamped `deadAtS = 0`,
+   * which the renderer's `simTime - deadAtS > DEAD_SHOW_S` test reads as
+   * "died twenty seconds ago", and the body vanished on the frame it fell.
+   * Two goblins fighting each other in front of the player produced a corpse
+   * that was never once drawn.
+   */
   private lastSimTime = 0;
+  /** Corpses already paid out, so a kill cannot be banked twice. */
+  private readonly paidKills = new Set<string>();
 
   constructor(
     private readonly renderer: Renderer,
@@ -196,6 +237,19 @@ export class DungeonManager {
     return this.resident?.torchLights ?? [];
   }
 
+  /**
+   * Put the player's held torch into the interior's spare light slot (or clear
+   * it). Called every frame while inside; a no-op when outside.
+   */
+  setPlayerTorch(light: { pos: Vec3; radius: number } | null): void {
+    const r = this.resident;
+    if (r === undefined || r === null) return;
+    if (light === null && !r.playerTorchOn) return;
+    writeTorchLightSlot(this.renderer.device, r.lightsBuffer, r.lightsData,
+      r.fixedLightCount, MAX_INTERIOR_LIGHTS, light);
+    r.playerTorchOn = light !== null;
+  }
+
   get interactPrompt(): string | null {
     return this.prompt?.label ?? null;
   }
@@ -205,92 +259,170 @@ export class DungeonManager {
     return this.resident?.enemies ?? [];
   }
 
+  // -------------------------------------------------------------------------
+  // Geometry queries for the PLAYER'S attacks
+  //
+  // `dungeon-combat.ts` gates every blow an ENEMY throws on `cellLineOfSight`,
+  // and it has done since the wall-hitting bug was found. Nothing gated the
+  // blows going the other way: the player's 3.2 m melee swing was a distance
+  // and a facing dot with no geometry test at all, and arrows were integrated
+  // against a heightfield that reads -1e9 underground, so they flew through
+  // walls, floors and ceilings alike and only ever stopped in a body.
+  //
+  // These three expose the resident dungeon's cells to `main.ts`, which owns
+  // both of those call sites. They deliberately do NOT re-implement the sight
+  // march — `seesFrom` is the same `cellLineOfSight` the enemy side uses, so
+  // the two directions cannot drift apart. There is no third implementation.
+  // -------------------------------------------------------------------------
+
+  /** Floor plane of the resident dungeon, or null when outside. */
+  get floorY(): number | null {
+    return this.resident === null ? null : this.resident.origin[1];
+  }
+
+  /**
+   * The sim time a mob-vs-mob corpse would be stamped with right now.
+   *
+   * Exposed because the defect it pins is otherwise invisible from outside.
+   * `_hurtEnemy` stamps `deadAtS = lastSimTime`, and `lastSimTime` used to be
+   * written ONLY by the player's own damage paths — so in a delve where the
+   * player had not yet killed anything it was still 0, every mob-vs-mob corpse
+   * was stamped "died at the start of the game", and the renderer's
+   * `simTime - deadAtS > DEAD_SHOW_S` test culled the body on the frame it
+   * fell. Staging a real mob-vs-mob kill needs two factions in one room, which
+   * most generated dungeons do not have; this is the same fact, directly.
+   */
+  get corpseStampTime(): number {
+    return this.lastSimTime;
+  }
+
+  /**
+   * The resident cell grid, for harnesses. Null when outside.
+   *
+   * A probe that wants to prove "a swing through a wall does nothing, the same
+   * swing through a doorway lands" has to be able to FIND a wall, and guessing
+   * from screenshots is how a test ends up asserting the thing it happened to
+   * hit rather than the thing it meant.
+   */
+  debugGrid(): { w: number; h: number; origin: Vec3; cells: Uint8Array } | null {
+    const res = this.resident;
+    return res === null ? null : {
+      w: res.layout.w, h: res.layout.h,
+      origin: res.origin, cells: res.layout.cells,
+    };
+  }
+
+  /**
+   * True when nothing solid stands between two WORLD-space XZ points.
+   *
+   * Returns true when there is no resident dungeon: outdoors there are no
+   * cells to block anything, and a caller that forgot to check `isInside`
+   * should get "no wall in the way", not "everything is walled off".
+   */
+  seesFrom(x0: number, z0: number, x1: number, z1: number): boolean {
+    const res = this.resident;
+    if (res === null) return true;
+    const o = res.origin;
+    return cellLineOfSight(
+      res.layout.cells, res.layout.w, res.layout.h,
+      x0 - o[0], z0 - o[2], x1 - o[0], z1 - o[2]);
+  }
+
+  /**
+   * True when a world point is inside dungeon masonry — a wall cell, or above
+   * this cell's ceiling.
+   *
+   * The FLOOR is deliberately not tested here. Projectiles already plant on the
+   * ground through `heightAt`, which main.ts feeds `floorY` underground, and
+   * having two mechanisms answer "you hit the floor" is how they end up
+   * disagreeing about where the floor is.
+   */
+  solidAt(x: number, y: number, z: number): boolean {
+    const res = this.resident;
+    if (res === null) return false;
+    const { layout, origin } = res;
+    const cx = Math.floor(x - origin[0]);
+    const cz = Math.floor(z - origin[2]);
+    if (cx < 0 || cz < 0 || cx >= layout.w || cz >= layout.h) return true;
+    if (layout.cells[cz * layout.w + cx] === CELL_SOLID) return true;
+    return y > origin[1] + layout.ceilY[cz * layout.w + cx];
+  }
+
+  /**
+   * Distance along a ray to the first masonry surface, or `maxDist`.
+   *
+   * The aim ray needs this for the same reason the arrow does: `resolveAim`
+   * marches to 160 m and picks the first creature it passes, and underground
+   * that let the crosshair name — and the Tintreach hitscan then hit — a
+   * skeleton three rooms away through solid rock. Clamping the ray's own
+   * `maxDist` to the wall is enough to fix both, because every candidate test
+   * inside `resolveAim` is bounded by it.
+   *
+   * 0.2 m step, matching `cellLineOfSight`: cells are 1 m, so this cannot step
+   * over one. It runs at the reticle's 15 Hz, not per frame.
+   */
+  rayWallDist(
+    origin: readonly [number, number, number],
+    dir: readonly [number, number, number],
+    maxDist: number,
+  ): number {
+    if (this.resident === null) return maxDist;
+    const STEP = 0.2;
+    const n = Math.ceil(maxDist / STEP);
+    for (let i = 1; i <= n; i++) {
+      const t = Math.min(maxDist, i * STEP);
+      if (this.solidAt(
+        origin[0] + dir[0] * t, origin[1] + dir[1] * t, origin[2] + dir[2] * t)) {
+        // Back off one step so the returned point is in open air, not inside
+        // the wall — the caller converges a shot on it.
+        return Math.max(0, t - STEP);
+      }
+    }
+    return maxDist;
+  }
+
   /**
    * Advance all dungeon enemy AIs by dtS seconds.
    * Call from main.ts when dungeonManager.isInside.
    * Enemies are clamped to their room bounds so they can't escape through walls.
+   *
+   * `simTime` is not used by the tick itself — it is here so `lastSimTime` is
+   * always current when a mob-vs-mob kill needs to stamp a corpse. See
+   * `_hurtEnemy`.
    */
   tickEnemies(
     dtS: number,
     playerX: number,
     playerZ: number,
+    simTime: number,
     onAttackPlayer: (damage: number) => void,
   ): void {
     const res = this.resident;
     if (res === null) return;
-    const enemies = res.enemies;
-
-    // Combat index for mob-vs-mob. Rebuilt once for the whole room, not once
-    // per enemy — see `combat-targeting.ts` for why that distinction is the
-    // difference between O(n) and O(n²) here.
-    //
-    // In practice a dungeon warband is all one faction and will not fight
-    // itself, so this mostly matters for what it enables: a wild animal that
-    // followed you in, and (once the caller supplies it) anything else that
-    // ends up down here. It costs one pass over at most 18 entities.
-    this.combat.rebuild(enemies, null, playerX, playerZ);
-
-    for (const e of enemies) {
-      if (e.mode === 'dead') continue;
-      // Per-enemy, NOT hoisted. It used to be `SPECIES_DEFS['wolf']` fetched
-      // once outside the loop and handed to every enemy, so the instant this
-      // dungeon held two different species they would all have moved at the
-      // wolf's speed, taken the wolf's damage and used the wolf's size for
-      // collision. That was invisible while there was only ever one species.
-      const def = SPECIES_DEFS[e.species];
-      const playerDist = Math.hypot(e.x - playerX, e.z - playerZ);
-      const rng = mulberry32(((e.walkPhase * 1000) | 0) ^ e.id.charCodeAt(8));
-
-      // moveXZ clamps movement to the enemy's room rect in world coords.
-      const roomX0 = e.roomX + 0.5;
-      const roomZ0 = e.roomZ + 0.5;
-      const roomX1 = e.roomX + e.roomW - 0.5;
-      const roomZ1 = e.roomZ + e.roomD - 0.5;
-      const moveXZ = (ex: number, ez: number, dx: number, dz: number, _r: number): [number, number] => {
-        const nx = Math.max(roomX0, Math.min(roomX1, ex + dx));
-        const nz = Math.max(roomZ0, Math.min(roomZ1, ez + dz));
-        return [nx, nz];
-      };
-
-      // Flat dungeon floor: heightAt always returns the dungeon y-origin.
-      const floorY = res.origin[1];
-      const heightAt = (_x: number, _z: number) => floorY;
-
-      stepAnimal(e, dtS, {
-        playerX,
-        playerZ,
-        playerDist,
-        rng,
-        heightAt,
-        moveXZ,
-        speciesDef: def,
-        onAttackPlayer,
-        combat: this.combat,
-        onAttackEntity: (targetId, damage) => {
-          const t = res.enemies.find((en) => en.id === targetId);
-          if (t === undefined || t.mode === 'dead') return;
-          this._hurtEnemy(t, damage, { id: e.id, kind: 'entity', x: e.x, z: e.z });
-        },
-        // Ranged attackers (the goblin archer) route through here. When the
-        // caller has not wired a projectile renderer, `onRangedAttack` is
-        // absent and `animal-ai` falls back to `onAttackPlayer` — so the
-        // archer is a working enemy before a single arrow is drawn.
-        onRangedAttack: this.onEnemyShot === null ? undefined : (src, shot) => {
-          this.onEnemyShot?.(src, shot);
-          if (shot.kind === 'player') onAttackPlayer(shot.damage);
-          else if (shot.kind === 'entity' && shot.id !== undefined) {
-            const t = res.enemies.find((en) => en.id === shot.id);
-            if (t !== undefined && t.mode !== 'dead') {
-              this._hurtEnemy(t, shot.damage,
-                { id: src.id, kind: 'entity', x: src.x, z: src.z });
-            }
-          }
-        },
-      });
-
-      // Clamp y to floor (stepAnimal may set it via heightAt, but belt+suspenders).
-      e.y = floorY;
-    }
+    this.lastSimTime = simTime;
+    // The loop itself lives in `dungeon-combat.ts` because this file imports
+    // the renderer and therefore cannot be unit-tested in Node — and the loop
+    // that decides when the player takes damage is the last thing that should
+    // be untestable. Everything below is adapter: turning the pure module's
+    // callbacks back into this class's own damage bookkeeping.
+    this.combat.tick(res.enemies, dtS, playerX, playerZ, {
+      layout: res.layout,
+      origin: res.origin,
+      onAttackPlayer,
+      onAttackEntity: (src, targetId, damage) => {
+        const t = res.enemies.find((en) => en.id === targetId);
+        if (t === undefined || t.mode === 'dead') return;
+        this._hurtEnemy(t, damage,
+          { id: src.id, kind: 'entity', x: src.x, z: src.z });
+      },
+      // Ranged attackers (the goblin archer) route through here. When the
+      // caller has not wired a projectile renderer, `onRangedAttack` is absent
+      // and `animal-ai` falls back to `onAttackPlayer` — so the archer is a
+      // working enemy before a single arrow is drawn.
+      onRangedAttack: this.onEnemyShot === null ? undefined : (src, shot) => {
+        this.onEnemyShot?.(src, shot);
+      },
+    });
   }
 
   /** Apply damage to a dungeon enemy from another creature (never the player). */
@@ -300,10 +432,11 @@ export class DungeonManager {
     e.hp = Math.max(0, e.hp - damage);
     if (e.hp <= 0) {
       e.mode = 'dead';
-      // No `deadAtS` and no drops: a mob-vs-mob kill is not the player's, so
-      // it must not pay them. The corpse still renders through the normal
-      // dead path once `deadAtS` is set by a player kill; here it simply
-      // stops.
+      // A corpse timer but NO drops: a mob-vs-mob kill is not the player's, so
+      // it must not pay them — but it must still leave a body that lies there
+      // for the loot window like any other. `lastSimTime` is now written every
+      // tick rather than only by the player's own damage paths; see its
+      // declaration for what that was costing.
       e.deadAtS = this.lastSimTime;
       return;
     }
@@ -324,6 +457,7 @@ export class DungeonManager {
     if (e.hp <= 0) {
       e.mode = 'dead';
       e.deadAtS = simTime;
+      this.paidKills.add(e.id);
       this._onEnemyKilled(e);
     } else {
       // No `from` — this is the player's blow, so the reaction is the original
@@ -331,6 +465,38 @@ export class DungeonManager {
       onEntityDamaged(e);
     }
     return true;
+  }
+
+  /**
+   * The player killed a dungeon enemy somewhere other than through
+   * `attackDungeonEnemy`. Pay it out.
+   *
+   * WHY THIS EXISTS: `attackDungeonEnemy` is the only path that pays a kill,
+   * and in real gameplay NOTHING CALLS IT. Its one call site is inside
+   * `window.__gameDebug`. The player's actual melee and the player's actual
+   * arrows both find the enemy in `dungeonManager.dungeonEnemies()` and
+   * decrement `e.hp` in place, so `_onEnemyKilled` never ran during play:
+   * dungeon corpses paid nothing, the "cleared" notice never appeared, and
+   * neither did the boss's Tintreach arrows. Every drop table pointing at a
+   * dungeon species was dead weight.
+   *
+   * Fixing it properly means routing those two call sites through the manager,
+   * which lives in `main.ts`. This is the seam that lets that be a one-line
+   * change at each site rather than a restructure.
+   *
+   * Idempotent: calling it twice for the same corpse pays once. Two call sites
+   * that both fire on an overkill frame is exactly the kind of thing that
+   * silently doubles loot.
+   */
+  notifyPlayerKill(id: string, simTime: number): void {
+    const res = this.resident;
+    if (res === null) return;
+    if (this.paidKills.has(id)) return;
+    const e = res.enemies.find((en) => en.id === id);
+    if (e === undefined || e.mode !== 'dead') return;
+    this.paidKills.add(id);
+    this.lastSimTime = simTime;
+    this._onEnemyKilled(e);
   }
 
   /**
@@ -358,6 +524,11 @@ export class DungeonManager {
     for (const d of drops) {
       for (let i = 0; i < d.count; i++) items.push(d.id);
     }
+    // The Tintreach arrows. Rolled here rather than in `animal-drops.ts`
+    // because the table there keys off SPECIES, and what earns these is not
+    // "was a dread_king" but "was the thing at the bottom of a dungeon" — see
+    // `dungeon-loot.ts` for the rate and the reasoning behind it.
+    if (e.boss === true) items.push(...rollBossTintreach(e.id));
     if (items.length > 0) this.onLoot?.(items);
 
     const name = SPECIES_DEFS[e.species].name;
@@ -536,19 +707,28 @@ export class DungeonManager {
       // Nearest of: exit portal + unopened chests, within reach.
       let best: { label: string; act: () => void } | null = null;
       let bestD = INTERACT_DIST;
-      const wx = origin[0] + layout.exitPortalCell[0] + 0.5;
-      const wz = origin[2] + layout.exitPortalCell[1] + 0.5;
-      const portalD = Math.hypot(pos[0] - wx, pos[2] - wz);
-      if (portalD <= bestD) {
+      // Reach is XZ distance AND line of sight. Cells are 1 m and a wall is one
+      // cell, so a 3 m radius reaches straight through two of them: a chest one
+      // room over prompted, and opening it worked, because neither the prompt
+      // nor the action ever looked at the layout.
+      const lx = pos[0] - origin[0];
+      const lz = pos[2] - origin[2];
+      const sees = (tx: number, tz: number): boolean =>
+        cellLineOfSight(layout.cells, layout.w, layout.h, lx, lz, tx, tz);
+
+      const px = layout.exitPortalCell[0] + 0.5;
+      const pz = layout.exitPortalCell[1] + 0.5;
+      const portalD = Math.hypot(lx - px, lz - pz);
+      if (portalD <= bestD && sees(px, pz)) {
         bestD = portalD;
         best = { label: 'Press E to leave the dungeon', act: () => this.exit() };
       }
       for (const chest of chests) {
         if (chest.opened) continue;
-        const cx = origin[0] + chest.cell[0] + 0.5;
-        const cz = origin[2] + chest.cell[1] + 0.5;
-        const d = Math.hypot(pos[0] - cx, pos[2] - cz);
-        if (d <= bestD) {
+        const cx = chest.cell[0] + 0.5;
+        const cz = chest.cell[1] + 0.5;
+        const d = Math.hypot(lx - cx, lz - cz);
+        if (d <= bestD && sees(cx, cz)) {
           bestD = d;
           best = { label: 'Press E to open the chest', act: () => this.openChest(chest) };
         }
@@ -596,7 +776,14 @@ export class DungeonManager {
     const o = this.resident.origin;
     this.renderer.device.queue.writeBuffer(chest.objectBuffer, 0,
       new Float32Array([o[0] + x + 0.5, o[1], o[2] + z + 0.5, 0]));
-    const found = chest.items.map((id) => id.replace(/_/g, ' ')).join(', ');
+    // Display names, not ids. `chest.items` now carries things whose id reads
+    // badly raw — "arrow" for a quiver of Tintreach bolts, in particular — and
+    // repeats are collapsed to a count so a boss cache does not print the same
+    // word nine times.
+    const tally = new Map<GameItemId, number>();
+    for (const id of chest.items) tally.set(id, (tally.get(id) ?? 0) + 1);
+    const found = [...tally].map(([id, n]) =>
+      n > 1 ? `${itemDef(id).name} x${n}` : itemDef(id).name).join(', ');
     this.notice = { text: `Found: ${found}`, until: performance.now() + NOTICE_MS };
     this.onLoot?.(chest.items);
   }
@@ -694,6 +881,9 @@ export class DungeonManager {
     const chestVerts = buildChestMesh();
     const chestBuffer = layout.chests.length > 0
       ? makeVerts('dungeon-chest', chestVerts) : null;
+    // Healing, and the Tintreach cache. Deterministic in (seed, dcx, dcz), so
+    // re-entering a dungeon finds the same chest holding the same thing.
+    const salt = saltChestLoot(layout, spec, this.seed, e.dcx, e.dcz);
     const chests: ResidentChest[] = layout.chests.map((c, i) => {
       const opened = this.openedChests.get(dkey)?.has(i) ?? false;
       const { bindGroup, buffer, shadowBindGroup } = makeObject(
@@ -709,7 +899,12 @@ export class DungeonManager {
         },
         lightsBindGroup,
       });
-      return { cell: c.cell, items: c.items, objectBuffer: buffer, opened };
+      return {
+        cell: c.cell,
+        items: [...c.items, ...(salt[i] ?? [])],
+        objectBuffer: buffer,
+        opened,
+      };
     });
 
     const collider = new DungeonCollider(layout, origin);
@@ -717,6 +912,9 @@ export class DungeonManager {
     this.resident = {
       entrance: e, layout, collider, origin, draws, chests, buffers, enemies,
       torchLights,
+      lightsBuffer, lightsData,
+      fixedLightCount: torches.lights.length,
+      playerTorchOn: false,
     };
 
     this.controller.world = collider;
@@ -729,11 +927,26 @@ export class DungeonManager {
     this.camera.interior = collider;
   }
 
+  /**
+   * Tear down the interior and put the player back on the surface, whether or
+   * not they walked out. Death used to skip this: `doRespawn` moved the player
+   * to the spawn point but left `resident` set, so the renderer stayed in
+   * dungeon mode, `controller.world` stayed bound to dungeon collision and the
+   * camera stayed in interior mode — you respawned into an empty void with no
+   * terrain and no sky. The caller may override the position afterwards.
+   */
+  forceExit(): void {
+    this.exit();
+  }
+
   private exit(): void {
     if (this.resident === null) return;
     const e = this.resident.entrance;
-    // Clear enemy state on exit — re-entry will respawn fresh enemies.
+    // Clear enemy state on exit — re-entry will respawn fresh enemies, so the
+    // paid-kill ledger has to go with them or the same ids would be refused a
+    // payout on the next delve.
     this.resident.enemies = [];
+    this.paidKills.clear();
     for (const b of this.resident.buffers) b.destroy();
     this.resident = null;
 

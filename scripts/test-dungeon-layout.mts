@@ -12,8 +12,10 @@ import { validateSpec, FALLBACK_SPEC } from '../src/game/dungeon/dungeon-spec';
 import type { DungeonSpec } from '../src/game/dungeon/dungeon-spec';
 import {
   layoutDungeon, serpentineLayout, mix32,
-  CELL_SOLID,
+  CELL_SOLID, CELL_DOOR,
 } from '../src/game/dungeon/dungeon-layout';
+import { buildTorchProps } from '../src/game/dungeon/dungeon-props';
+import { POSN_FLOATS } from '../src/game/mesh-utils';
 import type { DungeonLayout } from '../src/game/dungeon/dungeon-layout';
 import { DUNGEON_FIXTURES } from '../src/game/dungeon/dungeon-fixtures';
 
@@ -200,6 +202,169 @@ for (const spec of DUNGEON_FIXTURES) {
 check('mix32 deterministic', mix32(1337, 4, 2) === mix32(1337, 4, 2));
 check('mix32 varies by args',
   mix32(1337, 4, 2) !== mix32(1337, 4, 3) && mix32(1337, 4, 2) !== mix32(1337, 5, 2));
+
+// --- 8. prop placement, swept over every fixture x 40 seeds ----------------
+
+// Layout-level: nothing decorative may sit in a wall, in a doorway, on the
+// spawn, on top of another prop, or promise loot it has nowhere to put.
+{
+  const faults = new Map<string, string>();
+  const fault = (what: string, where: string): void => {
+    if (!faults.has(what)) faults.set(what, where);
+  };
+  let dungeons = 0;
+  let torchCount = 0;
+  let chestCount = 0;
+
+  for (const spec of [...DUNGEON_FIXTURES, FALLBACK_SPEC]) {
+    for (let seed = 0; seed < 40; seed++) {
+      const L = layoutDungeon(spec, 1000 + seed);
+      dungeons++;
+      const tag = `${spec.name}#${seed}`;
+      const cell = (x: number, z: number): number =>
+        x < 0 || z < 0 || x >= L.w || z >= L.h ? CELL_SOLID : L.cells[z * L.w + x];
+      const nbOf = (x: number, z: number, dir: number): [number, number] =>
+        dir === 0 ? [x, z - 1] : dir === 1 ? [x + 1, z] : dir === 2 ? [x, z + 1] : [x - 1, z];
+
+      // A room whose spec carries loot must end up with somewhere to put it,
+      // or the Director's promise silently evaporates.
+      for (const rs of spec.rooms) {
+        const loot = rs.loot ?? [];
+        if (loot.length === 0) continue;
+        const room = L.rooms.find((r) => r.id === rs.id);
+        if (room === undefined) { fault('room in the spec has no rect', `${tag} ${rs.id}`); continue; }
+        const here = L.chests.filter((c) =>
+          c.cell[0] >= room.x && c.cell[0] < room.x + room.w
+          && c.cell[1] >= room.z && c.cell[1] < room.z + room.d);
+        if (here.length === 0) {
+          fault('room with loot got no chest', `${tag} ${rs.id} (${loot.join(',')})`);
+        } else {
+          const got = new Set(here.flatMap((c) => c.items));
+          for (const item of loot) {
+            if (!got.has(item)) fault('loot item vanished', `${tag} ${rs.id} ${item}`);
+          }
+        }
+      }
+
+      const occupied = new Set<string>();
+      for (const t of L.torches) {
+        torchCount++;
+        const [x, z] = t.cell;
+        // A torch is drawn hugging the wall in `wallDir`. If that neighbour is
+        // not solid the whole fitting hangs off the middle of the room.
+        const [nbx, nbz] = nbOf(x, z, t.wallDir);
+        if (cell(nbx, nbz) !== CELL_SOLID) {
+          fault('torch wall direction has no wall', `${tag} cell ${x},${z} dir ${t.wallDir}`);
+        }
+        if (cell(x, z) === CELL_SOLID) fault('torch inside a wall', `${tag} ${x},${z}`);
+        const k = `${x},${z}`;
+        if (occupied.has(k)) fault('two props in one cell', `${tag} ${k}`);
+        occupied.add(k);
+      }
+      for (const c of L.chests) {
+        chestCount++;
+        const [x, z] = c.cell;
+        if (cell(x, z) === CELL_SOLID) fault('chest inside a wall', `${tag} ${x},${z}`);
+        if (cell(x, z) === CELL_DOOR) fault('chest in a doorway', `${tag} ${x},${z}`);
+        if (x === L.spawnCell[0] && z === L.spawnCell[1]) fault('chest on the spawn cell', tag);
+        const k = `${x},${z}`;
+        if (occupied.has(k)) fault('two props in one cell', `${tag} ${k}`);
+        occupied.add(k);
+      }
+      {
+        const [x, z] = L.exitPortalCell;
+        const [nbx, nbz] = nbOf(x, z, L.exitWallDir);
+        if (cell(nbx, nbz) !== CELL_SOLID) {
+          fault('exit portal has no wall behind it', `${tag} ${x},${z} dir ${L.exitWallDir}`);
+        }
+        if (cell(x, z) === CELL_SOLID) fault('exit portal inside a wall', `${tag} ${x},${z}`);
+      }
+      if (cell(L.spawnCell[0], L.spawnCell[1]) === CELL_SOLID) fault('spawn cell is solid', tag);
+    }
+  }
+
+  console.log(`  prop sweep: ${dungeons} dungeons, ${torchCount} torches, ${chestCount} chests`);
+  for (const [what, where] of faults) console.error(`    ${what} -- ${where}`);
+  check(`prop placement clean over ${dungeons} dungeons`, faults.size === 0,
+    `${faults.size} distinct faults`);
+}
+
+// --- 9. torch GEOMETRY reaches the wall it is bracketed to -----------------
+
+// Not "the torch is at the right cell" -- that was already true while the prop
+// was a 8 x 8 cm stick floating in mid-air with an 8 cm gap behind it and
+// nothing underneath, which is what "floating torches" meant when it came back
+// from play. This measures the emitted vertices against the wall plane: some
+// geometry must come within 3 cm of the plane (so it is fixed to the wall),
+// none may cross it (so nothing is buried in the masonry), and the wood must
+// be continuous from the plane out to the flame with no gap wider than 4 cm.
+{
+  const worst = { gapToWall: 0, behind: 0, biggestHole: 0, verts: 0, where: '' };
+  for (const spec of DUNGEON_FIXTURES) {
+    for (let seed = 0; seed < 10; seed++) {
+      const L = layoutDungeon(spec, 2000 + seed);
+      const props = buildTorchProps(L);
+      worst.verts = Math.max(worst.verts, props.wood.length / POSN_FLOATS);
+      for (const t of L.torches) {
+        const [x, z] = t.cell;
+        // Wall plane and the inward normal, in dungeon-local metres.
+        const dir = t.wallDir;
+        const plane = dir === 0 ? z : dir === 1 ? x + 1 : dir === 2 ? z + 1 : x;
+        const alongX = dir === 1 || dir === 3;
+        const n = dir === 0 || dir === 1 ? (dir === 0 ? 1 : -1) : (dir === 2 ? -1 : 1);
+        // Depth intervals, ONE PER TRIANGLE. A vertex list only tells you where
+        // the corners are — a solid box 7 cm deep has no vertices in the middle
+        // of it, so measuring the spacing between sorted vertex depths reports
+        // a 7 cm hole through solid wood. Triangles carry the spans.
+        const spans: [number, number][] = [];
+        const depthOf = (i: number): number =>
+          ((alongX ? props.wood[i] : props.wood[i + 2]) - plane) * n;
+        for (let i = 0; i < props.wood.length; i += POSN_FLOATS * 3) {
+          const vx = props.wood[i];
+          const vz = props.wood[i + 2];
+          // Only triangles in this torch's own cell.
+          if (vx < x - 0.05 || vx > x + 1.05 || vz < z - 0.05 || vz > z + 1.05) continue;
+          const a = depthOf(i);
+          const b = depthOf(i + POSN_FLOATS);
+          const c = depthOf(i + POSN_FLOATS * 2);
+          spans.push([Math.min(a, b, c), Math.max(a, b, c)]);
+        }
+        if (spans.length === 0) { worst.where = `no wood at ${x},${z}`; worst.gapToWall = 99; continue; }
+        spans.sort((p, q) => p[0] - q[0]);
+        const nearest = spans[0][0];
+        if (nearest < -1e-6 && -nearest > worst.behind) {
+          worst.behind = -nearest;
+          worst.where = `${spec.name}#${seed} cell ${x},${z}`;
+        }
+        if (nearest > worst.gapToWall) {
+          worst.gapToWall = nearest;
+          worst.where = `${spec.name}#${seed} cell ${x},${z}`;
+        }
+        // Merge the spans and take the biggest hole in the union: that is a
+        // real stretch of air between the wall and the flame.
+        let hole = 0;
+        let reach = spans[0][1];
+        for (const [lo, hi] of spans) {
+          if (lo > reach && lo - reach > hole) hole = lo - reach;
+          if (hi > reach) reach = hi;
+        }
+        if (hole > worst.biggestHole) worst.biggestHole = hole;
+      }
+    }
+  }
+  console.log(`  torch fitting: nearest vertex ${worst.gapToWall.toFixed(3)} m off the wall, `
+    + `${worst.behind.toFixed(3)} m behind it, biggest gap ${worst.biggestHole.toFixed(3)} m, `
+    + `${worst.verts} wood verts`);
+  check('torch geometry touches its wall', worst.gapToWall <= 0.03, `${worst.gapToWall} m ${worst.where}`);
+  check('torch geometry is not buried in the wall', worst.behind <= 1e-6,
+    `${worst.behind} m ${worst.where}`);
+  check('torch fitting has no gap in it', worst.biggestHole <= 0.04, `${worst.biggestHole} m`);
+  // The bracket took a torch from 36 verts to 144. 32 is MAX_TORCHES, so this
+  // caps the whole prop buffer at ~5k verts, which is nothing next to the
+  // interior shell -- but it is the number that grows if somebody reaches for
+  // a capsule, and a 6-segment capsule per part put it at 540.
+  check('torch props stay under 8k verts', worst.verts < 8000, `${worst.verts}`);
+}
 
 // ---------------------------------------------------------------------------
 

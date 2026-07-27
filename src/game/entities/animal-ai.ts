@@ -26,6 +26,7 @@ import {
   SPECIES_DEFS, dispositionOf, type Species, type SpeciesDef,
 } from './entity-types';
 import { animalStride } from './animal-mesh';
+import { meleeReachHeight } from '../attack-routing';
 import type { EntityState } from './entity-manager';
 import {
   CombatIndex, HUNT_SIGHT, RETARGET_S, courageOf, factionOf,
@@ -221,6 +222,22 @@ export interface AnimalAICtx {
   playerX: number;
   playerZ: number;
   playerDist: number;   // pre-computed Math.hypot distance
+  /**
+   * The player's feet, when the caller knows them.
+   *
+   * Optional, and absent means "no vertical gate" — exactly the behaviour every
+   * caller had before this field existed, which is why adding it broke nothing.
+   *
+   * With it, melee stops being a purely horizontal question. `playerDist` is
+   * measured in the XZ plane, so a creature standing under a keep floor or at
+   * the foot of a parapet is "0 m away" and swings straight up through the
+   * masonry. That is not a castle bug and not new — every aggro animal in the
+   * game does it from the bottom of a cliff — but it only became visible when
+   * the Evil King started fighting: he is the one enemy with 4.9 m of reach and
+   * a tower to stand under, and `scripts/king-melee-check.mjs` measured him
+   * taking 8.8 hp off a player two storeys above him through 16 m of keep.
+   */
+  playerY?: number;
   rng: () => number;
   heightAt: (x: number, z: number) => number;
   /**
@@ -494,6 +511,14 @@ function engage(
   isWater: boolean,
   collide: MoveXZ | undefined,
   radius: number,
+  /**
+   * How far above (or below) this creature's own footing the target stands, or
+   * null when the caller cannot say. Null reproduces the old horizontal-only
+   * behaviour exactly, which is what every mob-vs-mob call still passes: a
+   * `CombatTarget` carries x and z and no y, and inventing one for it would be
+   * a guess dressed as a measurement.
+   */
+  rise: number | null,
 ): void {
   const c = e as CombatState;
   const reach = attackReach(def);
@@ -542,12 +567,34 @@ function engage(
     return;
   }
 
-  if (dist <= reach) {
+  // A blow has to cross the gap in Y as well as in XZ. `meleeReachHeight` is
+  // the same vertical reach `attack-routing.ts` already applies to a MOUNTED
+  // player — "how far from its own footing can this thing put a weapon" — and
+  // applying it on foot too is the rule that was always meant, minus the
+  // assumption that a player standing on their own feet is level with whatever
+  // is swinging at them.
+  const grounded = rise === null || Math.abs(rise) <= meleeReachHeight(def.size);
+
+  if (dist <= reach && grounded) {
     e.stateTimer -= dtS;
     if (e.stateTimer <= 0) {
       onHit();
       e.stateTimer = attackCadence(def);
     }
+    if (dist > 0.001) e.yaw = Math.atan2(dx / dist, -(dz / dist));
+    e.y = isWater ? -0.5 : ctx.heightAt(e.x, e.z);
+  } else if (dist <= reach) {
+    // Underneath them, or above them, and no way to close it: face them and
+    // wait. Walking is pointless here — `moveToward` would only push at the
+    // wall it is already against.
+    //
+    // Holding the swing clock at a full cadence is NOT cosmetic. `creature-
+    // anim.ts` starts the windup when `stateTimer` counts down to the move's
+    // `contactT`, and `stepAnimal` enters 'aggro' with that timer at zero — so
+    // a blocked creature whose clock never moved would satisfy that test on
+    // every single frame and stand under the parapet swinging at the ceiling
+    // for as long as the player cared to watch.
+    e.stateTimer = attackCadence(def);
     if (dist > 0.001) e.yaw = Math.atan2(dx / dist, -(dz / dist));
     e.y = isWater ? -0.5 : ctx.heightAt(e.x, e.z);
   } else {
@@ -576,6 +623,7 @@ export function stepAnimal(
   // Collision radius scales with the animal; water species skip solids entirely.
   const radius  = Math.max(0.3, speciesDef.size * 0.45);
   const collide = isWater ? undefined : moveXZ;
+
 
   // ---- Owned stay/sit (right-click toggle) ---------------------------------
   // sit eases 0<->1 over ~0.4 s; while staying the entity holds position and
@@ -820,7 +868,8 @@ export function stepAnimal(
         onAttackPlayer(ranged > 0
           ? (speciesDef.rangedDmg ?? aggroDamage(e.species))
           : aggroDamage(e.species));
-      }, isWater, collide, radius);
+      }, isWater, collide, radius,
+      ctx.playerY === undefined ? null : ctx.playerY - e.y);
       break;
     }
 
@@ -889,7 +938,9 @@ export function stepAnimal(
         }
         if (target.kind === 'npc') ctx.onAttackNpc?.(target.id, dmg);
         else ctx.onAttackEntity?.(target.id, dmg);
-      }, isWater, collide, radius);
+        // `null`: a CombatTarget has no y. Mob-vs-mob keeps the horizontal-only
+        // test it has always had rather than getting a fabricated one.
+      }, isWater, collide, radius, null);
       break;
     }
 

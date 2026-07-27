@@ -2,13 +2,25 @@
  * Ranged combat e2e tests — thrown stones and bows.
  * Always boots with ?director=off for determinism.
  *
+ * TWO QUIVERS. The bow fires either `flint_arrow` — the common, craftable,
+ * BALLISTIC ammunition — or `arrow`, the rare Tintreach bolt, which is
+ * HITSCAN and hits far harder. Which one leaves the bow is the player's
+ * choice (X in game, `setAmmo` here), and the rule that matters commercially
+ * is that the choice is never made FOR them in the expensive direction: an
+ * empty flint quiver does not silently spend a boss drop.
+ *
+ * These tests used to assert a world with one ammunition type, in which
+ * 'arrow' meant 'the only thing a bow can shoot'. That was true for exactly as
+ * long as making Tintreach rare made the bow itself unusable.
+ *
  * Tests:
  *  1. Thrown stone damages a spawned entity by 2 hp (via injectProjectile)
- *  2. hunter_bow with arrows: arrow consumption + damage 6 (injectProjectile
- *     for hit-test, simulateLeftClick for consumption path)
- *  3. composite_bow: damage 9 + arrow consumption
- *  4. Bow with no arrows shows "No arrows" notice, consumes nothing
- *  5. __gameError stays null
+ *  2. hunter_bow with flint arrows: consumption + damage 6
+ *  3. composite_bow: damage 9 + flint consumption
+ *  4. Tintreach is spent only when Tintreach is selected
+ *  5. Flint selected and empty does NOT fall back to Tintreach
+ *  6. Bow with NEITHER shows "No arrows" and consumes nothing
+ *  7. __gameError stays null
  *
  * Strategy: projectile trajectory in headless is hard to aim reliably (camera
  * yaw unknown, gravity arc). We use two complementary approaches:
@@ -60,6 +72,8 @@ declare global {
       injectProjectile(x: number, y: number, z: number, kind: 'stone' | 'arrow', damage: number): number;
       projectileCount(): number;
       freezeAttackT(t: number | null): void;
+      setAmmo(kind: string): boolean;
+      countItem(id: string): number;
     };
   }
 }
@@ -147,6 +161,40 @@ async function simulateLeftClick(page: import('@playwright/test').Page): Promise
 }
 
 // ---------------------------------------------------------------------------
+// Draw and loose, through the game's own listeners.
+//
+// `simulateLeftClick` above dispatches a mousedown and nothing else, which is
+// the whole gesture for a swing or a throw and only HALF of it for a bow: the
+// press starts the draw and the arrow is spent on RELEASE. It also restores
+// `pointerLockElement` immediately, and `tickBow` cancels any draw the moment
+// the lock is not the canvas — so a bow test built on it drew the string,
+// dropped it, and asserted that no arrow had been consumed.
+//
+// The lock therefore has to stay stubbed for the whole hold.
+// ---------------------------------------------------------------------------
+
+async function simulateBowShot(
+  page: import('@playwright/test').Page, holdMs = 700,
+): Promise<void> {
+  await page.evaluate(() => {
+    const canvas = document.getElementById('game-canvas') as HTMLCanvasElement;
+    (window as unknown as { __origPLE?: PropertyDescriptor }).__origPLE =
+      Object.getOwnPropertyDescriptor(Document.prototype, 'pointerLockElement');
+    Object.defineProperty(document, 'pointerLockElement',
+      { configurable: true, get: () => canvas });
+    window.dispatchEvent(new MouseEvent('mousedown', { button: 0, bubbles: true }));
+  });
+  // BOW_DRAW_S is 0.55 s; hold past it so the shot is at full power.
+  await page.waitForTimeout(holdMs);
+  await page.evaluate(() => {
+    window.dispatchEvent(new MouseEvent('mouseup', { button: 0, bubbles: true }));
+    const d = (window as unknown as { __origPLE?: PropertyDescriptor }).__origPLE;
+    if (d) Object.defineProperty(document, 'pointerLockElement', d);
+  });
+  await page.waitForTimeout(300);
+}
+
+// ---------------------------------------------------------------------------
 // 1. Thrown stone damages entity by 2 hp (hit-test path via injectProjectile)
 // ---------------------------------------------------------------------------
 
@@ -209,7 +257,7 @@ test('left-click with stone held spawns a projectile and consumes 1 stone', asyn
 test('hunter_bow arrow deals 6 damage on entity hit', async ({ page }) => {
   const inv = makeInv([
     { id: 'hunter_bow', count: 1 },
-    { id: 'arrow', count: 10 },
+    { id: 'flint_arrow', count: 10 },
   ], 0);
   await bootWithInventory(page, inv);
 
@@ -239,27 +287,27 @@ test('hunter_bow arrow deals 6 damage on entity hit', async ({ page }) => {
 // 4. hunter_bow left-click with arrows: 1 arrow consumed, projectile spawned
 // ---------------------------------------------------------------------------
 
-test('hunter_bow left-click consumes 1 arrow and spawns a projectile', async ({ page }) => {
+test('hunter_bow left-click consumes 1 flint arrow and spawns a projectile', async ({ page }) => {
   const inv = makeInv([
     { id: 'hunter_bow', count: 1 },
-    { id: 'arrow', count: 10 },
+    { id: 'flint_arrow', count: 10 },
   ], 0);
   await bootWithInventory(page, inv);
 
   // Record projectile count before.
   const countBefore = await page.evaluate(() => window.__gameDebug!.projectileCount());
 
-  await simulateLeftClick(page);
+  await simulateBowShot(page);
   await page.waitForTimeout(100);
 
-  // 1 arrow consumed.
+  // 1 flint arrow consumed.
   const invAfter = await page.evaluate(() => window.__gameDebug!.inventory());
-  expect(countItem(invAfter, 'arrow')).toBe(9);
+  expect(countItem(invAfter, 'flint_arrow')).toBe(9);
 
   // A new projectile was added (may already have been cleaned up if it hit ground).
   // We can't assert projectileCount > before because it may clear within 1 frame,
   // but arrow consumption is the definitive proof the shot fired.
-  expect(countItem(invAfter, 'arrow')).toBeLessThan(10);
+  expect(countItem(invAfter, 'flint_arrow')).toBeLessThan(10);
   void countBefore; // suppress unused variable warning
 
   expect(await page.evaluate(() => window.__gameError)).toBeNull();
@@ -272,7 +320,7 @@ test('hunter_bow left-click consumes 1 arrow and spawns a projectile', async ({ 
 test('composite_bow arrow deals 9 damage on entity hit', async ({ page }) => {
   const inv = makeInv([
     { id: 'composite_bow', count: 1 },
-    { id: 'arrow', count: 5 },
+    { id: 'flint_arrow', count: 5 },
   ], 0);
   await bootWithInventory(page, inv);
 
@@ -301,18 +349,18 @@ test('composite_bow arrow deals 9 damage on entity hit', async ({ page }) => {
 // 6. composite_bow left-click with arrows: 1 arrow consumed
 // ---------------------------------------------------------------------------
 
-test('composite_bow left-click consumes 1 arrow', async ({ page }) => {
+test('composite_bow left-click consumes 1 flint arrow', async ({ page }) => {
   const inv = makeInv([
     { id: 'composite_bow', count: 1 },
-    { id: 'arrow', count: 5 },
+    { id: 'flint_arrow', count: 5 },
   ], 0);
   await bootWithInventory(page, inv);
 
-  await simulateLeftClick(page);
+  await simulateBowShot(page);
   await page.waitForTimeout(100);
 
   const invAfter = await page.evaluate(() => window.__gameDebug!.inventory());
-  expect(countItem(invAfter, 'arrow')).toBe(4);
+  expect(countItem(invAfter, 'flint_arrow')).toBe(4);
 
   expect(await page.evaluate(() => window.__gameError)).toBeNull();
 });
@@ -321,20 +369,95 @@ test('composite_bow left-click consumes 1 arrow', async ({ page }) => {
 // 7. Bow with no arrows shows "No arrows" notice and consumes nothing
 // ---------------------------------------------------------------------------
 
-test('bow with no arrows shows notice and consumes nothing', async ({ page }) => {
+test('bow with no arrows of either kind shows notice and consumes nothing', async ({ page }) => {
   const inv = makeInv([{ id: 'hunter_bow', count: 1 }], 0);
   await bootWithInventory(page, inv);
 
-  await simulateLeftClick(page);
+  await simulateBowShot(page);
 
   // Wait for the HUD notice to be set (500 ms polling gate in tick loop).
   await page.waitForTimeout(700);
 
+  // "No arrows" is reserved for BOTH quivers empty. Carrying Tintreach while
+  // flint is selected is a different mistake and says so — see the next test.
   const notice = await page.evaluate(() => window.__gameStats?.notice ?? null);
   expect(notice).toBe('No arrows');
 
   const invAfter = await page.evaluate(() => window.__gameDebug!.inventory());
   expect(countItem(invAfter, 'arrow')).toBe(0);
+  expect(countItem(invAfter, 'flint_arrow')).toBe(0);
+
+  expect(await page.evaluate(() => window.__gameError)).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// 8b. Tintreach is spent only when Tintreach is selected
+// ---------------------------------------------------------------------------
+
+test('selecting Tintreach spends Tintreach, not flint', async ({ page }) => {
+  const inv = makeInv([
+    { id: 'composite_bow', count: 1 },
+    { id: 'flint_arrow', count: 10 },
+    { id: 'arrow', count: 10 },
+  ], 0);
+  await bootWithInventory(page, inv);
+
+  await page.evaluate(() => window.__gameDebug!.setAmmo('tintreach'));
+  await simulateBowShot(page);
+  await page.waitForTimeout(200);
+
+  const after = await page.evaluate(() => window.__gameDebug!.inventory());
+  expect(countItem(after, 'arrow')).toBe(9);
+  expect(countItem(after, 'flint_arrow')).toBe(10);
+
+  expect(await page.evaluate(() => window.__gameError)).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// 8c. An empty common quiver never reaches for the rare one
+//
+// The commercially important direction. Tintreach is finite boss loot; a
+// player who runs out of flint mid-hunt and silently spends a bolt on a rabbit
+// has been robbed by their own inventory. The reverse IS allowed — running out
+// of Tintreach falls back to flint rather than refusing to fire.
+// ---------------------------------------------------------------------------
+
+test('flint selected and empty does not fall back to Tintreach', async ({ page }) => {
+  const inv = makeInv([
+    { id: 'composite_bow', count: 1 },
+    { id: 'arrow', count: 10 },
+  ], 0);
+  await bootWithInventory(page, inv);
+
+  await page.evaluate(() => window.__gameDebug!.setAmmo('flint'));
+  await simulateBowShot(page);
+  await page.waitForTimeout(700);
+
+  const after = await page.evaluate(() => window.__gameDebug!.inventory());
+  expect(countItem(after, 'arrow')).toBe(10);
+  const notice = await page.evaluate(() => window.__gameStats?.notice ?? null);
+  expect(notice).toBe('No flint arrows — X for Tintreach');
+
+  expect(await page.evaluate(() => window.__gameError)).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// 8d. ...but an empty Tintreach quiver DOES fall back to flint
+// ---------------------------------------------------------------------------
+
+test('Tintreach selected and empty falls back to flint', async ({ page }) => {
+  const inv = makeInv([
+    { id: 'composite_bow', count: 1 },
+    { id: 'flint_arrow', count: 10 },
+  ], 0);
+  await bootWithInventory(page, inv);
+
+  await page.evaluate(() => window.__gameDebug!.setAmmo('tintreach'));
+  await simulateBowShot(page);
+  await page.waitForTimeout(200);
+
+  const after = await page.evaluate(() => window.__gameDebug!.inventory());
+  expect(countItem(after, 'flint_arrow')).toBe(9);
 
   expect(await page.evaluate(() => window.__gameError)).toBeNull();
 });

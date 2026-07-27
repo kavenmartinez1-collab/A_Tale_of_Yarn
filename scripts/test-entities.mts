@@ -79,9 +79,13 @@ const ALL_ITEM_IDS = new Set(Object.keys(ITEM_DEFS));
     'rabbit', 'deer', 'bird', 'horse', 'cow',
     'donkey', 'wolf', 'bear', 'dragon', 'wyvern', 'griffin', 'sea_serpent',
     'goblin', 'goblin_archer', 'skeleton', 'dread_king',
+    // The final boss and his mount. Both are `biomes: []`, `rare: false` and
+    // `mountable: false` — placed by the castle script, never scattered and
+    // never ridden by the player — so the three counts below are unchanged.
+    'evil_king', 'black_dragon',
   ];
   check(
-    'SPECIES_DEFS has exactly 16 species',
+    'SPECIES_DEFS has exactly 18 species',
     ALL_SPECIES.length === expectedAll.length &&
       expectedAll.every((s) => s in SPECIES_DEFS),
     `got ${ALL_SPECIES.length}: ${ALL_SPECIES.join(', ')}`,

@@ -644,8 +644,15 @@ export function generate(
         : `[Spec] speculative decode active (n-gram drafter, specK=${specK})`);
     }
     console.log(`[Generate] Prompt: ${promptTokens} tokens, first 5: [${promptIds.slice(0, 5).join(', ')}]`);
-    // Debug: decode the full prompt to see what the model actually sees
-    console.log(`[Generate] Decoded prompt: "${tokenizer.decode(promptIds)}"`);
+    // Decode the whole prompt to see exactly what the model sees — behind a
+    // flag, because it is not free. It ran unconditionally, and on the game's
+    // ~1,500-token NPC prompts that is a full detokenization plus a 5 KB
+    // console string on the critical path to the first token, on every single
+    // turn. `?promptLog=1` brings it back when you actually need it.
+    if (typeof location !== 'undefined'
+        && new URLSearchParams(location.search).get('promptLog') === '1') {
+      console.log(`[Generate] Decoded prompt: "${tokenizer.decode(promptIds)}"`);
+    }
 
     if (promptTokens === 0) {
       return {
@@ -678,24 +685,67 @@ export function generate(
       sess.capacity = Math.min(Math.max(sess.capacity, promptTokens + config.maxNewTokens), MAX_ATTN_SEQ_LEN);
     }
     const needed = promptTokens + config.maxNewTokens;
+    const kvStart = performance.now();
     if (sess) {
       const prefixLen = commonPrefixLen(sess.cachedTokenIds, promptIds);
-      const pureExtension =
+      /**
+       * Can we roll the cache BACK to the divergence point instead of throwing
+       * it away?
+       *
+       * For a dense attention model `kvCache.position` is the only cursor:
+       * `cacheLen`, the RoPE offset and the causal mask are all recomputed from
+       * it per forward call, and cache rows are addressed at a fixed stride, so
+       * lowering `position` makes the rows above it unreadable and they are
+       * simply overwritten by the re-prefill. The engine already relies on
+       * exactly this — the speculative-decode partial-accept path rewinds with
+       * `kvCache.position = savedPos` and no other fixup.
+       *
+       * It does NOT hold for:
+       *   - hybrid (Gated DeltaNet / Mamba) models, whose SSM recurrence cannot
+       *     be rolled back to an arbitrary point, only to a snapshot;
+       *   - an MTP head, which carries its own `mtpPosition` cursor;
+       *   - image prompts, where pad tokens are textually identical across
+       *     different images so a token-prefix match is unsound (see below).
+       */
+      const canRewind = engine.config.isHybrid !== true
+        && !engine.hasMtpHead
+        && !hasImages;
+      const cacheOk =
         sess.kvCache !== null
-        && !hasImages                  // image pads are textually identical across
-                                       // different images — token prefix match is unsound
+        && !hasImages
         && sess.compressed === config.useCompressedKV
         && sess.kvCache.position === sess.cachedTokenIds.length  // sanity: tracker matches cache
-        && prefixLen === sess.cachedTokenIds.length
-        && prefixLen > 0
-        && promptTokens > prefixLen                              // non-empty delta to prefill
         && needed <= sess.kvCache.maxSeqLen;
-      if (pureExtension) {
+      // How far the cache can be kept. A pure extension keeps all of it; a
+      // rewind keeps the common prefix. Either way we must leave at least one
+      // token of the prompt to prefill, because the first sampled token comes
+      // from the last prefill row's logits — so a prompt that is entirely
+      // contained in the cache rewinds one token further back.
+      //
+      // That last case is not a corner: it is what a KV warm-prefill leaves
+      // behind. Warming renders the system prompt with no generation preamble
+      // precisely so it is a strict prefix of the next real turn — and if a
+      // real turn has already run, the NEXT warm is a strict prefix of the
+      // cache, which the old all-or-nothing rule scored as a miss and paid for
+      // with a full re-prefill of the whole system prompt.
+      const keep = !cacheOk ? 0
+        : prefixLen === sess.cachedTokenIds.length ? prefixLen        // extension
+        : canRewind ? prefixLen                                       // rewind
+        : 0;                                                          // must reset
+      const usable = Math.min(keep, promptTokens - 1);
+      const hadTokens = sess.cachedTokenIds.length;
+      if (usable > 0) {
         kvCache = sess.kvCache!;
-        prefillIds = promptIds.slice(prefixLen);
-        console.log(`[Generate] KV reuse: ${prefixLen} cached tokens, prefilling ${prefillIds.length} new`);
+        if (usable < hadTokens) {
+          kvCache.position = usable;
+          sess.cachedTokenIds.length = usable;
+          console.log(`[Generate] KV rewind: ${hadTokens} cached -> kept ${usable}, `
+            + `prefilling ${promptTokens - usable} new`);
+        } else {
+          console.log(`[Generate] KV reuse: ${usable} cached tokens, prefilling ${promptTokens - usable} new`);
+        }
+        prefillIds = promptIds.slice(usable);
       } else {
-        const hadTokens = sess.cachedTokenIds.length;
         if (sess.kvCache) engine.destroyKVCache(sess.kvCache);
         kvCache = engine.createKVCache(sess.capacity, config.useCompressedKV);
         sess.kvCache = kvCache;
@@ -708,6 +758,7 @@ export function generate(
     } else {
       kvCache = engine.createKVCache(needed, config.useCompressedKV);
     }
+    const kvMs = performance.now() - kvStart;
     if (config.useCompressedKV) {
       console.log(`[Generate] Using TurboQuant compressed KV cache`);
     }
@@ -727,9 +778,20 @@ export function generate(
     // prompt token (slow, but isolates batched-GEMM precision from chunked-prefill
     // semantics). When unset, use the production default.
     const chunkOverride = opts?.prefillChunk ?? (globalThis as any).__DEBUG_PREFILL_CHUNK__;
-    const PREFILL_CHUNK = (typeof chunkOverride === 'number' && chunkOverride > 0)
+    const requestedChunk = (typeof chunkOverride === 'number' && chunkOverride > 0)
       ? Math.floor(chunkOverride)
       : PREFILL_CHUNK_DEFAULT;
+    // Clamp to the width the engine's activation buffers were allocated at.
+    // Overrunning it is not an error and not a crash — it is silently wrong
+    // output, which is the worst failure mode available. Measured: a 1,328-token
+    // prompt through a 2048-row chunk returned an empty string in 112 ms (~100x
+    // "faster" than the correct path) and a 1024-row chunk returned a fluent
+    // reply to a question nobody asked. Both look like a win in a benchmark.
+    const PREFILL_CHUNK = Math.min(requestedChunk, engine.maxPrefillRows);
+    if (PREFILL_CHUNK < requestedChunk) {
+      console.warn(`[Generate] prefillChunk ${requestedChunk} exceeds the engine's `
+        + `${engine.maxPrefillRows}-row activation buffers — clamped (larger would corrupt output)`);
+    }
     if (PREFILL_CHUNK !== PREFILL_CHUNK_DEFAULT) {
       console.log(`[Generate] PREFILL_CHUNK override: ${PREFILL_CHUNK} (default ${PREFILL_CHUNK_DEFAULT})`);
     }
@@ -738,6 +800,9 @@ export function generate(
     if ((globalThis as any).__DEBUG_FORWARD_PASS__ === true) {
       (globalThis as any).__DEBUG_LAST_PREFILL_POS__ = promptTokens - 1;
     }
+    /** `?prefillLog=1` — per-chunk prefill timing (diagnostic, off by default). */
+    const __prefillChunkLog = typeof location !== 'undefined'
+      && new URLSearchParams(location.search).get('prefillLog') === '1';
     let prefillOutput;
     // Divergence probe: if the caller pre-armed __DEBUG_DUMP_STATS__ (any
     // truthy value), use that as the trigger for multi-step dumps. The caller
@@ -785,9 +850,30 @@ export function generate(
     }
 
     const prefillCount = segments.reduce((s, seg) => s + seg.ids.length, 0);
-    for (let s = 0; s < segments.length; s++) {
+    /**
+     * Prefill is abortable between chunks.
+     *
+     * It used not to be, and that quietly defeated every caller that thought it
+     * could yield the GPU: `abort()` was only tested inside the decode loop, so
+     * a background job that was still prefilling ignored it completely and the
+     * foreground request queued behind the whole thing. Measured in-game — the
+     * Dungeon Director pauses and aborts the moment an NPC chat panel opens,
+     * but a ~650-token Director prefill runs for another ~5 s regardless, and
+     * the player's first question spent it in a queue.
+     *
+     * An aborted prefill leaves the cache holding a PARTIAL prompt. That is
+     * safe — `cachedTokenIds` is only written after the loop completes, so the
+     * tracker and the cache would disagree — so the abort path truncates the
+     * cache back to what the tracker says, which the next call then extends or
+     * rewinds from normally.
+     */
+    let prefillAborted = false;
+    /** Tokens of `prefillIds` actually forwarded, so an abort can keep them. */
+    let prefilledSoFar = 0;
+    for (let s = 0; s < segments.length && !prefillAborted; s++) {
       const seg = segments[s];
       for (let i = 0; i < seg.ids.length; i += PREFILL_CHUNK) {
+        if (aborted) { prefillAborted = true; break; }
         const chunkEnd = Math.min(i + PREFILL_CHUNK, seg.ids.length);
         const chunk = new Uint32Array(seg.ids.slice(i, chunkEnd));
         const isLastChunk = s === segments.length - 1 && chunkEnd >= seg.ids.length;
@@ -809,17 +895,72 @@ export function generate(
         // MTP seed: the head needs the trunk hidden of the row that produced the
         // first sampled token, i.e. the LAST prefill row's pre-final-norm hidden.
         if (mtpSpec && isLastChunk) fwdOpts.returnMtpHidden = true;
+        const __tChunk = performance.now();
+        const __posBefore = kvCache.position;
         prefillOutput = await engine.forward(chunk, kvCache, fwdOpts);
+        prefilledSoFar += chunk.length;
+        // Per-chunk timing. Prefill wall-clock is dominated by chunks that run
+        // against a NON-EMPTY cache (see the first-chunk note below), and a
+        // single aggregate tok/s hides that completely — the aggregate looked
+        // like "prefill is uniformly slow" when it is in fact one cheap chunk
+        // plus N expensive ones.
+        if (__prefillChunkLog) {
+          const cpuMs = performance.now() - __tChunk;
+          // forward() submits without waiting, so CPU time alone attributes
+          // nothing. Sync here (diagnostic only — the production path must NOT
+          // sync per chunk) to get each chunk's real GPU cost.
+          await device.queue.onSubmittedWorkDone();
+          console.log(`[Generate]   chunk ${chunk.length} tok @pos ${__posBefore} `
+            + `-> cpu ${cpuMs.toFixed(0)}ms gpu ${(performance.now() - __tChunk).toFixed(0)}ms`);
+        }
       }
     }
     await device.queue.onSubmittedWorkDone();
+    if (prefillAborted) {
+      // Bail before sampling — but KEEP what was prefilled. The chunks that did
+      // run are valid cache entries for a genuine prefix of this prompt, so
+      // recording them lets the next call extend from here instead of starting
+      // over. That is what makes an abortable warm-prefill worth having: the
+      // player can interrupt it the instant they hit send and none of the work
+      // it already did is thrown away.
+      //
+      // `cachedTokenIds` must stay exactly in step with `kvCache.position` or
+      // the sanity check on the next call forces a full reset — i.e. aborting
+      // would poison the very cache the abort was meant to leave usable.
+      //
+      // Two cases cannot keep it. A hybrid model's SSM recurrence has advanced
+      // past the tokens we would claim and cannot be wound back to match; and
+      // an image prompt's pad tokens are textually identical across different
+      // images, so keeping them would let a later text prompt false-match KV
+      // that was computed from pixels. Both drop the cache instead.
+      const cachedBefore = promptTokens - prefillIds.length;
+      const keepPartial = sess !== null && !isHybrid && !hasImages;
+      if (sess) {
+        sess.cachedTokenIds = keepPartial
+          ? promptIds.slice(0, cachedBefore + prefilledSoFar)
+          : [];
+        if (sess.kvCache) sess.kvCache.position = sess.cachedTokenIds.length;
+      }
+      console.log(`[Generate] prefill aborted after ${prefilledSoFar}/${prefillIds.length} `
+        + `new tokens — ${keepPartial ? cachedBefore + prefilledSoFar : 0} kept in cache`);
+      return {
+        text: '', tokenIds: [], numTokens: 0, promptTokens,
+        totalMs: performance.now() - startTime, tokensPerSecond: 0,
+        stopReason: 'aborted' as const,
+      };
+    }
     // The cache now holds every prompt token (cached prefix + the delta we just prefilled).
     if (sess) sess.cachedTokenIds = [...promptIds];
 
     const prefillEnd = performance.now();
     const prefillMs = prefillEnd - startTime;
     const chunks = Math.ceil(prefillCount / PREFILL_CHUNK);
-    console.log(`[Generate] Prefill: ${prefillCount} tokens in ${chunks} chunk(s), ${prefillMs.toFixed(0)}ms (${(prefillCount / prefillMs * 1000).toFixed(0)} tok/s)`);
+    // `kv=` is broken out because it is not prefill and it is not small: a cache
+    // reset reallocates the whole KV arena (capacity x layers x 2), and folding
+    // that into the tok/s figure made an allocation stall read as slow prefill.
+    console.log(`[Generate] Prefill: ${prefillCount} tokens in ${chunks} chunk(s), `
+      + `${prefillMs.toFixed(0)}ms (${(prefillCount / prefillMs * 1000).toFixed(0)} tok/s) `
+      + `[kv=${kvMs.toFixed(0)}ms]`);
 
     // ── Step 4: Sample first token from prefill logits ───────────────
     const generatedIds: number[] = [];

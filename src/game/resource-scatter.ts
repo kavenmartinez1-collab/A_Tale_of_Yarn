@@ -26,6 +26,7 @@ import { mulberry32 } from './mesh-utils';
 import { mix32 } from './dungeon/dungeon-layout';
 import { DCELL, entranceSiteAt } from './dungeon/entrance-site';
 import { settlementSiteAt } from './settlement/settlement-scatter';
+import { onCastleGrounds } from './castle/castle-site';
 import { CHUNK_SIZE } from './terrain/chunk-mesh';
 import type { Biome } from './biome';
 import type { HeightField } from './noise';
@@ -146,6 +147,8 @@ export function resourcesForChunk(
     if (dh > MAX_SLOPE_DH) return null;
     if (entrance !== null
         && Math.hypot(x - entrance.x, z - entrance.z) < CLEARING_R) return null;
+    // Nothing grows or outcrops on the castle's motte (see tree-scatter).
+    if (onCastleGrounds(x, z, 4)) return null;
     if (settlement !== null
         && Math.hypot(x - settlement.x, z - settlement.z)
            < settlement.radius + 2) return null;
@@ -239,6 +242,7 @@ export function resourcesForChunk(
       if (heightField.riverFactor(x, z) < RIVER_NODE_FACTOR) continue;
       if (entrance !== null
           && Math.hypot(x - entrance.x, z - entrance.z) < CLEARING_R) continue;
+          if (onCastleGrounds(x, z, 4)) continue;
       if (settlement !== null
           && Math.hypot(x - settlement.x, z - settlement.z)
              < settlement.radius + 2) continue;
@@ -270,6 +274,7 @@ export function resourcesForChunk(
       if (!hasWaterAdjacent) continue;
       if (entrance !== null
           && Math.hypot(x - entrance.x, z - entrance.z) < CLEARING_R) continue;
+          if (onCastleGrounds(x, z, 4)) continue;
       if (settlement !== null
           && Math.hypot(x - settlement.x, z - settlement.z)
              < settlement.radius + 2) continue;

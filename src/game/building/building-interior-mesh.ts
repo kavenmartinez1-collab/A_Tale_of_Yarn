@@ -30,6 +30,7 @@
 import type {
   BuildingInterior, AABB, Furniture, Decor, GableSpec,
 } from './building-interior';
+import { WINDOW_DEPTH, WINDOW_HALF_H } from './building-interior';
 import {
   bevelBox, box, capsule, cone, cylinder, quad, sphere, taperedCapsule, tri,
   POSN_FLOATS, type P3,
@@ -1639,18 +1640,6 @@ function tplCenser(): Tpl {
   });
 }
 
-function tplHangpot(): Tpl {
-  return tpl('hangpot', (b) => {
-    const i = b.p(PAL_IRON);
-    capsule(i, 0, 0, 0, 0, -0.34, 0, 0.009, 4);
-    capsule(i, -0.11, -0.34, 0, 0.11, -0.34, 0, 0.008, 4);
-    sphere(i, 0, -0.52, 0, 0.16, 10, 5, 0.85, 1);
-    cylinder(i, 0, -0.41, 0, 0.115, 0.125, 0.05, 10, false, false);
-    capsule(i, -0.12, -0.42, 0, 0, -0.33, 0, 0.008, 4);
-    capsule(i, 0, -0.33, 0, 0.12, -0.42, 0, 0.008, 4);
-  });
-}
-
 function tplWindowGlow(): Tpl {
   // Only the pane; the recess and frame are parametric (they need the span).
   return tpl('windowglow', (b) => {
@@ -1669,7 +1658,6 @@ const DECOR_TPL: Record<string, () => Tpl> = {
   stump: tplStump, produce: tplProduce, cloak: tplCloak, shield: tplShield,
   pelt: tplPelt, icon: tplIcon, antlers: tplAntlers, herbs: tplHerbs,
   sausages: tplSausages, lantern: tplLantern, censer: tplCenser,
-  hangpot: tplHangpot,
 };
 
 // ---- parametric decor (needs a span, so no template) -----------------------
@@ -1739,32 +1727,72 @@ function buildSpanDecor(out: MeshOut, d: Decor): void {
       });
       break;
     }
+    case 'hangpot': {
+      // A cauldron on a chain. `len` is the CHAIN DROP, because the pot hangs
+      // over a hearth at cooking height while the hook is in the ceiling three
+      // metres up — as a fixed template its 34 cm chain started wherever the
+      // anchor was and ended in mid-air over the fire, which is what a floating
+      // pot is. Anchor at the ceiling, drop to the pot.
+      const drop = Math.max(0.34, len);
+      out.emit(PAL_IRON, (a) => {
+        const c0 = P(0, 0, 0);
+        const c1 = P(0, -drop, 0);
+        capsule(a, c0[0], c0[1], c0[2], c1[0], c1[1], c1[2], 0.009 * s, 4);
+        const yb = -drop;
+        const bar0 = P(-0.11 * s, yb, 0); const bar1 = P(0.11 * s, yb, 0);
+        capsule(a, bar0[0], bar0[1], bar0[2], bar1[0], bar1[1], bar1[2], 0.008 * s, 4);
+        const body = P(0, yb - 0.18 * s, 0);
+        sphere(a, body[0], body[1], body[2], 0.16 * s, 10, 5, 0.85, 1);
+        const rim = P(0, yb - 0.07 * s, 0);
+        cylinder(a, rim[0], rim[1], rim[2], 0.115 * s, 0.125 * s, 0.05 * s, 10, false, false);
+        // Bail: two links from the rim up to the bar, so the pot hangs off
+        // something rather than being threaded on the chain.
+        const l0 = P(-0.12 * s, yb - 0.08 * s, 0); const l1 = P(0, yb + 0.01 * s, 0);
+        const l2 = P(0.12 * s, yb - 0.08 * s, 0);
+        capsule(a, l0[0], l0[1], l0[2], l1[0], l1[1], l1[2], 0.008 * s, 4);
+        capsule(a, l1[0], l1[1], l1[2], l2[0], l2[1], l2[2], 0.008 * s, 4);
+      });
+      break;
+    }
     case 'window': {
-      // A splayed reveal in the wall with a bright pane at the back of it.
-      const hw = len / 2, hh = 0.55 * s;
+      // A splayed reveal with a bright pane at the back of it, all of it in
+      // FRONT of the wall plane.
+      //
+      // The reveal used to run 17 cm back from an anchor sitting 8 cm off the
+      // wall, so the emissive pane and the inner half of the splay were 9 cm
+      // inside the solid cell. `buildBuildingInteriorMesh` emits an unbroken
+      // quad for every wall face and knows nothing about apertures, so it drew
+      // over them: what the player got was a pale plaster ring with no glass in
+      // it, on the church's great east window as much as on a cottage.
+      //
+      // `WINDOW_INSET` and `WINDOW_DEPTH` are exported by the generator, which
+      // is what places the anchor, so the two cannot drift apart again.
+      const hw = len / 2, hh = WINDOW_HALF_H * s;
+      const inner = WINDOW_DEPTH;
+      const A = P(-hw, -hh, 0), B = P(hw, -hh, 0), C = P(hw, hh, 0), D = P(-hw, hh, 0);
+      const A2 = P(-hw * 0.72, -hh * 0.78, -inner), B2 = P(hw * 0.72, -hh * 0.78, -inner);
+      const C2 = P(hw * 0.72, hh * 0.78, -inner), D2 = P(-hw * 0.72, hh * 0.78, -inner);
       out.emit(PAL_PLASTER, (a) => {
         // Reveal: four splayed faces from the room side back to the pane.
-        const inner = 0.16;
-        const A = P(-hw, -hh, 0), B = P(hw, -hh, 0), C = P(hw, hh, 0), D = P(-hw, hh, 0);
-        const A2 = P(-hw * 0.72, -hh * 0.78, -inner), B2 = P(hw * 0.72, -hh * 0.78, -inner);
-        const C2 = P(hw * 0.72, hh * 0.78, -inner), D2 = P(-hw * 0.72, hh * 0.78, -inner);
         quad(a, A, B, B2, A2);
         quad(a, B, C, C2, B2);
         quad(a, C, D, D2, C2);
         quad(a, D, A, A2, D2);
       });
       out.emit(PAL_WINDOW, (a) => {
-        const inner = 0.17;
-        const A2 = P(-hw * 0.72, -hh * 0.78, -inner), B2 = P(hw * 0.72, -hh * 0.78, -inner);
-        const C2 = P(hw * 0.72, hh * 0.78, -inner), D2 = P(-hw * 0.72, hh * 0.78, -inner);
-        quad(a, A2, B2, C2, D2);
+        // 1 cm behind the throat of the reveal, not coplanar with it: the two
+        // share an outline and a shared plane between two palettes is the tie
+        // this repo keeps re-learning about.
+        const g = inner + 0.01;
+        quad(a, P(-hw * 0.72, -hh * 0.78, -g), P(hw * 0.72, -hh * 0.78, -g),
+          P(hw * 0.72, hh * 0.78, -g), P(-hw * 0.72, hh * 0.78, -g));
       });
       out.emit(PAL_WOOD, (a) => {
         // Mullion + transom, and a sill.
-        boxBetween(a, P(0, -hh * 0.78, -0.16), P(0, hh * 0.78, -0.16), 0.022, 0.022);
+        boxBetween(a, P(0, -hh * 0.78, -inner), P(0, hh * 0.78, -inner), 0.022, 0.022);
         if (v === 1) {
-          boxBetween(a, P(-hw * 0.72, hh * 0.1, -0.16), P(hw * 0.72, hh * 0.1, -0.16), 0.022, 0.022);
-          boxBetween(a, P(-hw * 0.72, -hh * 0.34, -0.16), P(hw * 0.72, -hh * 0.34, -0.16), 0.022, 0.022);
+          boxBetween(a, P(-hw * 0.72, hh * 0.1, -inner), P(hw * 0.72, hh * 0.1, -inner), 0.022, 0.022);
+          boxBetween(a, P(-hw * 0.72, -hh * 0.34, -inner), P(hw * 0.72, -hh * 0.34, -inner), 0.022, 0.022);
         }
         boxBetween(a, P(-hw - 0.05, -hh - 0.02, 0.02), P(hw + 0.05, -hh - 0.02, 0.02), 0.05, 0.08);
       });

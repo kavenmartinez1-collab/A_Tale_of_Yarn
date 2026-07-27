@@ -6,7 +6,7 @@
 import { ITEM_DEFS, type GameItemId } from '../items';
 
 /** Bump when the NPC prompt/trade logic changes materially. */
-export const NPC_PROMPT_VERSION = 13; // v13: + shared village facts and concerns
+export const NPC_PROMPT_VERSION = 14; // v14: sections reordered stable-first (KV prefix reuse)
 
 export type NpcRole = 'farmer' | 'villager' | 'merchant' | 'guard';
 
@@ -45,7 +45,13 @@ export const TRADE_CATALOG: Record<NpcRole, CatalogEntry[]> = {
     { id: 'bow_string',     price: 15, stock: 2 },
   ],
   guard: [
-    { id: 'arrow',    price: 2,  stock: 20 },
+    // Flint arrows, yes; Tintreach, never. A guard used to sell `arrow` at 2
+    // gold with a stock that regenerated forever, which is an unbounded faucet
+    // for rare boss loot (tintreach.ts) — that stays shut. `flint_arrow` is the
+    // common, craftable ammunition, and a garrison quartermaster is exactly who
+    // would have a barrel of them.
+    { id: 'flint_arrow', price: 2, stock: 20 },
+    { id: 'arrow_shaft', price: 3, stock: 12 },
     { id: 'spear',    price: 35, stock: 1  },
     { id: 'iron_helm',price: 60, stock: 1  },
   ],
