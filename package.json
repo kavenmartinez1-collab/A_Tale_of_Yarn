@@ -14,6 +14,11 @@
     "test:world": "tsx scripts/test-roads.mts",
     "test:castle": "tsx scripts/test-castle-layout.mts && tsx scripts/test-castle-zfight.mts",
     "test:pause": "tsx scripts/test-sim-clock.mts && tsx scripts/test-map.mts && tsx scripts/test-save-slots.mts",
+    "test:input": "tsx scripts/test-gamepad.mts",
+    "weights": "tsx scripts/fetch-weights.mts",
+    "pack:steam": "node scripts/pack-steam.mjs",
+    "check:steam": "node scripts/steam-pack-check.mjs",
+    "check:steam:control": "node scripts/steam-pack-check.mjs --control",
     "play:castle": "node scripts/castle-escape.mjs",
     "play:pause": "node scripts/pause-check.mjs",
     "play:map": "node scripts/map-discovery-check.mjs && node scripts/map-look.mjs",
@@ -28,9 +33,11 @@
     "@huggingface/transformers": "^3.8.1",
     "cors": "^2.8.5",
     "express": "^4.21.0",
+    "steamworks.js": "github:ceifa/steamworks.js",
     "ws": "^8.20.0"
   },
   "devDependencies": {
+    "@electron/packager": "^20.0.4",
     "@playwright/test": "^1.60.0",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",

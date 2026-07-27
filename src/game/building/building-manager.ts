@@ -10,6 +10,7 @@
  * versa — both systems check each other's `isInside`.
  */
 
+import { debugParams } from '../release-flags';
 import type { GroundQuery } from '../collision';
 import type { Vec3 } from '../math';
 import type { HeightField } from '../noise';
@@ -103,7 +104,7 @@ function interiorKindOverride(): BuildingKind | null {
   overrideCache = null;
   const loc = (globalThis as { location?: { search?: string } }).location;
   if (loc?.search) {
-    const v = new URLSearchParams(loc.search).get('interior');
+    const v = debugParams().get('interior');
     if (v !== null && (BUILDING_KINDS as readonly string[]).includes(v)) {
       overrideCache = v as BuildingKind;
     }

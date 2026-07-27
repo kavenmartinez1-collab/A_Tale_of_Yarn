@@ -1,0 +1,13 @@
+{
+  "name": "a-tale-of-yarn",
+  "productName": "A Tale of Yarn",
+  "version": "0.1.0",
+  "description": "A Tale of Yarn — open-world survival RPG with local LLM NPCs",
+  "main": "main.cjs",
+  "author": "Artifex",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
+  "dependencies": {
+    "steamworks.js": "github:ceifa/steamworks.js"
+  }
+}

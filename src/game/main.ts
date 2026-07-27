@@ -13,6 +13,8 @@
 
 import { initWebGPU } from '../engine/gpu-device';
 import { reportError } from '../utils/metrics';
+import { STEAM_RELEASE, debugParams } from './release-flags';
+import { GamepadInput } from './input/gamepad';
 import {
   Renderer, LIGHTS_BUFFER_SIZE, DEFAULT_POST, STRIDE_CREATURE, STRIDE_PROP,
   MAX_WORLD_LIGHTS,
@@ -733,7 +735,7 @@ async function boot() {
   // prefs) before any system loads. Model weights in the Cache API are kept —
   // they're machine cache, not game data. The param is stripped afterwards so
   // a plain reload doesn't wipe again.
-  if (new URLSearchParams(location.search).get('wipe') !== null) {
+  if (debugParams().get('wipe') !== null) {
     const doomed: string[] = [];
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
@@ -2112,14 +2114,14 @@ async function boot() {
   resourceManager.onTreesChanged = (cx, cz) => chunkManager.refreshTrees(cx, cz);
 
   // ?tod=0.5 freezes the day-night cycle (screenshots, deterministic e2e).
-  const todParam = new URLSearchParams(location.search).get('tod');
+  const todParam = debugParams().get('tod');
   const todFreeze =
     todParam !== null && Number.isFinite(Number(todParam))
       ? Number(todParam)
       : null;
 
   // ?weather=clear|overcast|rain pins the weather (same purpose as ?tod=).
-  const weatherParam = new URLSearchParams(location.search).get('weather');
+  const weatherParam = debugParams().get('weather');
   const weatherPin: Weather | null =
     weatherParam !== null && weatherParam in WEATHER_PRESETS
       ? WEATHER_PRESETS[weatherParam as WeatherKind]
@@ -2127,7 +2129,7 @@ async function boot() {
 
   // AI Director: ON by default (proven in M0/M4) — opt out with ?director=off.
   // Shares the game's GPU device; failures degrade to fixtures, never __gameError.
-  const directorOff = new URLSearchParams(location.search).get('director') === 'off';
+  const directorOff = debugParams().get('director') === 'off';
 
   // NPC dialogue model: defaults to STOCK Qwen3-1.7B Q4_K_M (Apache-2.0), the
   // same model the Dungeon Director runs — one download, one set of resident
@@ -2135,7 +2137,9 @@ async function boot() {
   // 20s watchdog — expect canned replies); ?npcllm=abliterated is for
   // comparison only and must not become the default. See NPC_MODELS in
   // npc-chat-panel.ts and docs/AI_GUARDRAILS.md.
-  const npcLlmParam = new URLSearchParams(location.search).get('npcllm');
+  // In a Steam release build debugParams() is empty, so this is always null and
+  // the model is always NPC_MODELS.fast — the abliterated path is unreachable.
+  const npcLlmParam = debugParams().get('npcllm');
   const npcModelKey: import('./ui/npc-chat-panel').NpcModelKey =
     npcLlmParam !== null && isNpcModelKey(npcLlmParam) ? npcLlmParam : 'fast';
   if (npcLlmParam !== null && !isNpcModelKey(npcLlmParam)) {
@@ -5669,7 +5673,12 @@ async function boot() {
   /** Monotonic id source for `__gameDebug.placeEntity`. See the note there. */
   let probeEntitySeq = 0;
 
-  window.__gameDebug = {
+  // Built as a local first, published to `window` only outside a Steam release
+  // build (see the assignment after the closing brace). The explicit type
+  // annotation is load-bearing: it restores the contextual typing the direct
+  // `window.__gameDebug = {…}` assignment used to provide, so the 157 methods'
+  // parameters stay inferred instead of becoming implicit `any`.
+  const gameDebug: NonNullable<Window['__gameDebug']> = {
     enterNearestDungeon: () => dungeonManager.debugEnterNearest(),
     /**
      * The resident dungeon's cell grid, in grid-local metres. Null when
@@ -6812,6 +6821,15 @@ async function boot() {
     },
   };
 
+  // The whole debug surface, published or withheld in one place. Roughly a
+  // third of the methods above are outright cheats reachable from a devtools
+  // console (`giveItem`, `teleport`, `setVitals`, `castleDamageBoss`, …), so a
+  // shipped build must not carry them. In the default build STEAM_RELEASE is
+  // false and every harness keeps working unchanged; in a release build the
+  // object is still constructed but never published, so `window.__gameDebug`
+  // is undefined and there is no console route to any of it.
+  if (!STEAM_RELEASE) window.__gameDebug = gameDebug;
+
   /**
    * `?spawn=<species>[&count=N]` — put creatures in front of the player.
    *
@@ -6828,7 +6846,7 @@ async function boot() {
    * touches the HUD has to wait until the HUD exists.
    */
   function debugSpawnFromUrl(): void {
-    const params = new URLSearchParams(location.search);
+    const params = debugParams();
     const want = params.get('spawn');
     if (want === null) return;
     if (!(want in SPECIES_DEFS)) {
@@ -6859,8 +6877,7 @@ async function boot() {
   // --- ?dungeon=preview: fly around fixture 0's interior (M2 debug) --------
   // No collision/portals yet — fly cam only, dark fog, bright-ambient shader
   // fallback (zeroed lights buffer → count 0).
-  const dungeonPreview =
-    new URLSearchParams(location.search).get('dungeon') === 'preview';
+  const dungeonPreview = debugParams().get('dungeon') === 'preview';
   let dungeonDraws: DungeonDraw[] = [];
   if (dungeonPreview) {
     const layout = layoutDungeon(DUNGEON_FIXTURES[0], WORLD_SEED);
@@ -9253,6 +9270,28 @@ async function boot() {
   const SLOPE_SAMPLE = 0.5;
 
 
+  /**
+   * Controller support (src/game/input/gamepad.ts). Auto-detects — Steam Deck
+   * Verified requires that "players must not need to adjust any in-game
+   * settings in order to enable controller support" (PORTING §3.2), so the
+   * only switch is an opt-OUT, and it is a dev one. A real settings toggle is
+   * the follow-up; a release build has no URL bar to reach this with.
+   *
+   * With no pad connected `poll()` reads one array and returns.
+   */
+  const gamepad = new GamepadInput();
+  gamepad.enabled = debugParams().get('gamepad') !== 'off';
+  const gamepadHooks = {
+    onLook: (dx: number, dy: number) => {
+      // The same sink as a pointer-locked mousemove (see the listener above),
+      // minus the pointer-lock gate: a pad player may never have clicked to
+      // grab the mouse, and their camera still has to work.
+      if (panels.isOpen) return;
+      if (flyMode) flyCam.onMouseMove(dx, dy);
+      else orbitCam.onMouseMove(dx, dy);
+    },
+  };
+
   function tick(now: number) {
     // The clock, not the stepping, is what pause stops — see sim-clock.ts for
     // why banking wall time behind a pause is a catch-up burst waiting to
@@ -9260,6 +9299,10 @@ async function boot() {
     let steps = simClock.advance(now);
     const paused = simClock.paused;
     lastFrameSteps = steps;
+    // Polled on the WALL clock, not sim steps: the camera has to keep moving
+    // while the sim is paused, and a pad held down through a pause must not
+    // bank input. Clamped so an alt-tab does not fling the camera on return.
+    gamepad.poll(Math.min(0.1, Math.max(0, (now - last) / 1000)), gamepadHooks);
     last = now;
     // Crash-recovery autosave: position + sim clock every 5 s while playing
     // outdoors on solid ground (interiors use arena coordinates; mid-flight

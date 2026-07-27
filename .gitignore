@@ -80,3 +80,7 @@ scripts/shots/
 # question during a session.
 scripts/_*.mjs
 scripts/_*.mts
+
+# Steam depot output — regenerate with `node scripts/pack-steam.mjs`
+dist-steam/
+dist-steam-tmp/
