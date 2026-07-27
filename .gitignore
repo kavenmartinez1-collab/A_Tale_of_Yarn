@@ -84,3 +84,4 @@ scripts/_*.mts
 # Steam depot output — regenerate with `node scripts/pack-steam.mjs`
 dist-steam/
 dist-steam-tmp/
+*.tgz
