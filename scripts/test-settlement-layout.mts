@@ -21,8 +21,22 @@ import { mulberry32 } from '../src/game/mesh-utils';
 // smithy/mill/townhouse/granary + carts, crops, hedges, graves, washing…),
 // street-and-square composition per kind, a castle town outside the gate,
 // and a per-pad variant index `v`.
-// Previous hashes: 0x28e82e84 (visual pass v3), 0xc20a725b (phase L1).
-const GOLDEN_HASH: number | null = 0x9421c8db;
+//
+// Rebaked 2026-07-26 for intra-settlement circulation (settlement-paths.ts).
+// The PADS are untouched — every position, yaw, extent and variant in this
+// sweep is identical. What moved is the mesh half of the hash: a settlement now
+// also emits its streets, junction landings, step flights, doorstep stoops and
+// retaining kerbs, and those land in the PAL_STONE and PAL_TIMBER buckets this
+// file hashes per palette. The castle used for the vertex-budget check grew
+// 71,763 -> 76,959 verts on flat test ground, still well inside the 110k
+// ceiling that exists because settlement geometry is rasterized four times a
+// frame (three shadow cascades plus the opaque pass).
+//
+// Nothing here needs to change if paths are later made optional per kind — the
+// pad assertions above are independent of them, which is deliberate.
+// Previous hashes: 0x9421c8db (community pass), 0x28e82e84 (visual pass v3),
+// 0xc20a725b (phase L1).
+const GOLDEN_HASH: number | null = 0x625a8117;
 
 let passed = 0;
 let failed = 0;

@@ -6,6 +6,8 @@
  * quiet while a panel is up. Injects its stylesheet once.
  */
 
+import { releasePointerLock } from './pointer-lock';
+
 const PANEL_CSS = `
 .game-panel {
   position: fixed;
@@ -78,8 +80,17 @@ export class PanelManager {
     return this.openId !== null;
   }
 
-  /** Open the panel (closing any other), or close it if already open. */
-  toggle(id: string, build: () => HTMLElement): void {
+  /**
+   * Open the panel (closing any other), or close it if already open.
+   *
+   * `forceRelock` is for the panel the browser opens on our behalf: the first
+   * Escape out of pointer lock never reaches the page, so by the time the
+   * pause screen goes up the lock is already gone and the usual "did I take
+   * the lock?" test says no. Closing would then dump the player onto the
+   * click-to-play overlay after every pause. The caller who KNOWS the player
+   * was locked a moment ago passes true.
+   */
+  toggle(id: string, build: () => HTMLElement, forceRelock = false): void {
     if (this.openId === id) {
       this.close();
       return;
@@ -90,19 +101,35 @@ export class PanelManager {
     document.body.appendChild(el);
     this.openEl = el;
     this.openId = id;
-    this.relock = document.pointerLockElement === this.canvas;
-    if (this.relock) document.exitPointerLock();
+    const held = document.pointerLockElement === this.canvas;
+    this.relock = held || forceRelock;
+    // Via the helper so main's pointerlockchange handler knows this release was
+    // deliberate and does not read it as the player pressing Escape.
+    if (held) releasePointerLock();
     this.onToggle?.(true);
   }
 
   close(): void {
     if (this.openId === null) return;
     this.removeCurrent();
-    if (this.relock) this.canvas.requestPointerLock();
+    if (this.relock) {
+      // Chrome refuses a re-lock for about a second after the user left one
+      // with Escape, and rejects the returned promise. Unhandled, that lands
+      // in the console as an error — which the play harnesses count as a bug.
+      // The overlay reappears on its own in that case, so a refusal is fine.
+      try {
+        const r = this.canvas.requestPointerLock() as unknown;
+        if (r instanceof Promise) r.catch(() => { /* refused; overlay shows */ });
+      } catch { /* refused; overlay shows */ }
+    }
     this.onToggle?.(false);
   }
 
   private removeCurrent(): void {
+    // Panels that bound listeners outside their own subtree (the map takes
+    // arrow keys on `window` in the capture phase) get one event to unbind on.
+    // Without it those listeners outlive the element and keep eating keys.
+    this.openEl?.dispatchEvent(new CustomEvent('panel-close'));
     this.openEl?.remove();
     this.openEl = null;
     this.openId = null;

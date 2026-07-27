@@ -50,6 +50,27 @@ export function faceDir(dx: number, dz: number): number {
   return quantYaw(Math.atan2(dx, -dz));
 }
 
+/**
+ * Rotated half-extents of a yaw-quantized pad (still axis-aligned).
+ *
+ * Lives here rather than in settlement-layout, which is where it used to be
+ * and where it is still re-exported from, because settlement-paths needs it
+ * and settlement-layout needs settlement-paths: leaving it there made the two
+ * modules import each other. The cycle happened to work — `padHalfExtents` is
+ * a hoisted function declaration, so the half-initialised namespace still had
+ * it — but a cycle that survives only because of hoisting is one refactor away
+ * from an undefined-is-not-a-function at settlement build time. This file is
+ * already the home of the pad geometry vocabulary and imports nothing back.
+ */
+export function padHalfExtents(pad: BuildingPad): { hx: number; hz: number } {
+  const c = Math.abs(Math.cos(pad.yaw));
+  const s = Math.abs(Math.sin(pad.yaw));
+  return {
+    hx: (pad.w / 2) * c + (pad.d / 2) * s,
+    hz: (pad.w / 2) * s + (pad.d / 2) * c,
+  };
+}
+
 type Put = (
   type: PadType, x: number, z: number, yaw: number,
   w: number, d: number, h: number, v?: number,

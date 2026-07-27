@@ -72,6 +72,21 @@ export interface AnimalPose {
   /** 0 = mouth closed, 1 = jaw fully dropped (dragon fire breath). */
   jawOpen?: number;
   /**
+   * Astride a mount, 0 = standing, 1 = seated.
+   *
+   * The mirror of `Pose.seat` on the character rig, and it exists for the same
+   * reason: a rider that is just the standing mesh translated onto an animal's
+   * back has its legs together and its feet in mid-air. Here it also has to
+   * *switch the legs off the IK* — the planted-foot solver is solving against a
+   * ground plane the rider is nowhere near, so a seated biped whose legs still
+   * run through `solveLeg` pedals the air in time with the mount's gait.
+   *
+   * Only the biped rig reads it. Every quadruped, winged and serpent builder
+   * ignores it, so leaving it undefined reproduces the previous output bit for
+   * bit — which is what keeps the existing golden hashes valid.
+   */
+  seat?: number;
+  /**
    * Metres the body has sunk below its rest height this frame (<= 0), applied
    * to the whole creature by the renderer's object offset.
    *
@@ -508,6 +523,17 @@ export const BASE_COLORS: Record<Species, Color3> = {
   // Blackened iron. Almost value alone: the gold and the emissive eyes are
   // the only chroma on him, and they need somewhere dark to sit.
   dread_king:  [0.20, 0.20, 0.24],
+  // --- the final boss and his mount ---
+  // Darker again than the Dread King, because the Evil King is the *end* of
+  // that line and the two of them share a silhouette family. MAT.IRON carries
+  // a tint weight of only 0.55, so the baked metal texture keeps him from
+  // going flat black; the wool under the plate is MAT.KNIT at tint 1.0 and
+  // does go nearly black, which is the value break between the layers.
+  evil_king:   [0.075, 0.075, 0.085],
+  // Black hide. Not zero: a true black has no normal-map read at all and the
+  // scales disappear, and this animal is 18 m long with nothing else to show
+  // its form. The red is bought back on the membranes and the ridge.
+  black_dragon:[0.085, 0.080, 0.092],
 };
 
 // Secondary color (belly / lighter underside)
@@ -533,6 +559,13 @@ export const BELLY_COLORS: Record<Species, Color3> = {
   goblin_archer:[0.44, 0.50, 0.34],
   skeleton:     [0.10, 0.09, 0.09], // eye sockets — a hole, not a bead
   dread_king:   [0.30, 0.06, 0.10], // deep blood-red cape
+  // --- the final boss and his mount ---
+  evil_king:    [0.34, 0.035, 0.045], // the cape: deeper and less pink than the Dread King's
+  // Charcoal underbelly, a clear step ABOVE the hide rather than below it.
+  // Countershading the usual way round (belly darker) on an already-black
+  // animal loses the whole underside, which is the side you see when it flies
+  // over you — and flying over you is what this one does in the opening shot.
+  black_dragon: [0.155, 0.145, 0.155],
 };
 
 // Accent color (eyes, antler, beak, horns, claws, wing membrane, ridge)
@@ -554,6 +587,19 @@ export const ACCENT_COLORS: Record<Species, Color3> = {
   goblin_archer:[0.14, 0.09, 0.07],
   skeleton:     [0.42, 0.34, 0.26], // rusted iron
   dread_king:   [0.92, 0.74, 0.26], // crown, trim, crossguard
+  // --- the final boss and his mount ---
+  // Red felt, not gold. The Dread King's chroma is gold on black; the Evil
+  // King's is red on black, which is both the brief and the thing that tells
+  // them apart in a corridor. Felt rather than metal because at this scale the
+  // trim is the surface a player is closest to.
+  evil_king:    [0.62, 0.075, 0.085],
+  // Horns, dorsal ridge and talons. Oxblood, NOT the bright red of the
+  // membranes: `accentC` is spent on the two horn pairs, the cheek spikes, the
+  // neck ridge, the back ridge, the tail ridge, the tail fin and twelve
+  // talons, and at full red the head came out of the preview as a firework.
+  // The red accent this species is named for lives on the wing membranes,
+  // which are one surface, enormous, and lit from behind when he passes over.
+  black_dragon: [0.26, 0.055, 0.050],
 };
 
 // ---------------------------------------------------------------------------

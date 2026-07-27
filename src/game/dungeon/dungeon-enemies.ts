@@ -57,6 +57,23 @@ const ROOM_BASE_COUNT: Record<RoomSize, number> = {
 const DUNGEON_ENEMY_CAP = 22;
 
 /**
+ * Ceiling on ONE room, whatever its size and depth.
+ *
+ * The depth term below is unbounded: a large room five doors in asks for 4 + 6
+ * bodies. Ten enemies clamped into one rect with no pathfinding is not a hard
+ * fight, it is a wall — they cannot flank, cannot path and cannot spread, so
+ * they simply stack on the nearest edge and swing together. The shipped
+ * fixtures never exceed 4 and are completely unaffected by this; it exists to
+ * bound what an AI Director can author, which is the only thing that reaches
+ * those depths.
+ *
+ * 5 keeps the escalation legible — a capped room still contains more, and
+ * WORSE, than a shallow one, because the roster tier keeps climbing after the
+ * head-count stops.
+ */
+const ROOM_MAX_COUNT = 5;
+
+/**
  * The warband that lives in each theme, as a list of tiers.
  *
  * Index 0 is what you meet at the door; later entries are unlocked by depth.
@@ -100,8 +117,13 @@ const BOSS_GUARDS = 2;
  * Uses the SPEC rather than the placed geometry on purpose: the spec's edges
  * are what the author (or the Director) actually meant by "deeper in", whereas
  * the placed rooms can end up physically adjacent through pure packing luck.
+ *
+ * Exported because `dungeon-loot.ts` needs the same answer to decide which
+ * treasure rooms are deep enough to be worth stocking. A second BFS over the
+ * same graph would be free to drift from this one, and "deep enough to be
+ * dangerous" and "deep enough to be rewarding" have to be the same statement.
  */
-function roomDepths(spec: DungeonSpec): Map<string, number> {
+export function roomDepths(spec: DungeonSpec): Map<string, number> {
   const adj = new Map<string, string[]>();
   for (const r of spec.rooms) adj.set(r.id, []);
   for (const [a, b] of spec.edges) {
@@ -241,7 +263,8 @@ export function spawnDungeonEnemies(
     // roughly 1.5/room to dominate — which it now does, and a test asserts
     // per-room threat actually rises with depth rather than trusting this
     // comment.
-    const want = ROOM_BASE_COUNT[size] + Math.floor((depth - 1) * 1.5);
+    const want = Math.min(ROOM_MAX_COUNT,
+      ROOM_BASE_COUNT[size] + Math.floor((depth - 1) * 1.5));
     for (let i = 0; i < want; i++) {
       place(room, tier[Math.floor(rng() * tier.length)], false);
     }

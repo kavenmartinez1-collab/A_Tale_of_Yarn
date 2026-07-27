@@ -167,7 +167,11 @@ test('NPC chat: send "buy" message triggers trade offer card from stub', async (
   const npcs = await page.evaluate(() => window.__gameDebug!.npcs());
   const role = npcs[0]?.role ?? 'farmer';
   const BUY_ITEMS: Record<string, string> = {
-    farmer: 'flax', villager: 'torch', merchant: 'leather', guard: 'arrow',
+    farmer: 'flax', villager: 'torch', merchant: 'leather',
+    // Guards no longer stock arrows: Tintreach arrows are a one-per-save
+    // artifact and a regenerating merchant stock was an unbounded faucet
+    // for them (see npc-trade.ts). Buy a shaft instead.
+    guard: 'arrow_shaft',
   };
   const itemToBuy = BUY_ITEMS[role] ?? 'flax';
 
@@ -219,7 +223,11 @@ test('NPC chat: Confirm trade swaps gold and decrements stock (persisted)', asyn
   const npcs = await page.evaluate(() => window.__gameDebug!.npcs());
   const role = npcs[0]?.role ?? 'farmer';
   const BUY_ITEMS: Record<string, string> = {
-    farmer: 'flax', villager: 'torch', merchant: 'leather', guard: 'arrow',
+    farmer: 'flax', villager: 'torch', merchant: 'leather',
+    // Guards no longer stock arrows: Tintreach arrows are a one-per-save
+    // artifact and a regenerating merchant stock was an unbounded faucet
+    // for them (see npc-trade.ts). Buy a shaft instead.
+    guard: 'arrow_shaft',
   };
   const itemToBuy = BUY_ITEMS[role] ?? 'flax';
 
@@ -308,7 +316,11 @@ test('NPC chat: insufficient gold shows notice, offer card stays', async ({ page
   const npcs = await page.evaluate(() => window.__gameDebug!.npcs());
   const role = npcs[0]?.role ?? 'farmer';
   const BUY_ITEMS: Record<string, string> = {
-    farmer: 'flax', villager: 'torch', merchant: 'leather', guard: 'arrow',
+    farmer: 'flax', villager: 'torch', merchant: 'leather',
+    // Guards no longer stock arrows: Tintreach arrows are a one-per-save
+    // artifact and a regenerating merchant stock was an unbounded faucet
+    // for them (see npc-trade.ts). Buy a shaft instead.
+    guard: 'arrow_shaft',
   };
   const input = page.locator('#npc-chat-input');
   await expect(input).toBeVisible({ timeout: 3_000 });
@@ -396,7 +408,11 @@ test('NPC chat: __gameError null throughout a complete buy session', async ({ pa
   const npcs = await page.evaluate(() => window.__gameDebug!.npcs());
   const role = npcs[0]?.role ?? 'farmer';
   const BUY_ITEMS: Record<string, string> = {
-    farmer: 'flax', villager: 'torch', merchant: 'leather', guard: 'arrow',
+    farmer: 'flax', villager: 'torch', merchant: 'leather',
+    // Guards no longer stock arrows: Tintreach arrows are a one-per-save
+    // artifact and a regenerating merchant stock was an unbounded faucet
+    // for them (see npc-trade.ts). Buy a shaft instead.
+    guard: 'arrow_shaft',
   };
   await input.fill(`buy ${BUY_ITEMS[role] ?? 'flax'}`);
   await input.press('Enter');

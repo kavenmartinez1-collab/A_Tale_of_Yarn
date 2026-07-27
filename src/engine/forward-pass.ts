@@ -419,6 +419,19 @@ export interface ForwardPassEngine {
   readonly hasMtpHead: boolean;
 
   /**
+   * Largest `seqLen` forward() can be handed (MAX_PREFILL).
+   *
+   * The reusable activation buffers are allocated at this width, and NOTHING
+   * bounds-checks against it: hand forward() more rows and it writes past them,
+   * which produces plausible-looking but wrong output rather than an error.
+   * Measured on Qwen3-1.7B — a 1,328-token prompt prefilled in one chunk of
+   * 2048 returned an empty string in 112 ms, and a chunk of 1024 returned a
+   * fluent reply that was simply not an answer to the question. Exposed so
+   * generate.ts can clamp its prefill chunk instead of trusting callers.
+   */
+  readonly maxPrefillRows: number;
+
+  /**
    * MTP speculative drafter: predict the token AFTER `tokenId` by running the
    * next-token-prediction head (blk.{block_count}.*) on the trunk's PRE-final-
    * norm hidden `hiddenRow` (one row [H], e.g. ForwardOutput.mtpHidden). When
@@ -4139,5 +4152,5 @@ export function createForwardPassEngine(
     return { logits: logitsBuf };
   }
 
-  return { forward, createKVCache, destroyKVCache, snapshotSSMState, restoreSSMState, hasMtpHead, mtpDraft, config };
+  return { forward, createKVCache, destroyKVCache, snapshotSSMState, restoreSSMState, hasMtpHead, mtpDraft, config, maxPrefillRows: MAX_PREFILL };
 }

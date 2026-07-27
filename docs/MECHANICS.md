@@ -243,6 +243,13 @@ Unstrung bow + Bowstring → Strung bow
 Flax → Spinning wheel → Bowstring
 ```
 
+**As shipped, arrows are not part of this chain.** The only ammunition in the
+game is the **Tintreach** quiver (Irish *tintreach*, lightning): one per save
+file, granted with the character, and impossible to craft, loot, buy or drop a
+second of. It is hitscan — the bolt reaches the crosshair in the frame it is
+loosed — and it never empties. Arrow shafts survive as a trade good and a
+crafting input. See `src/game/tintreach.ts`.
+
 ### Firemaking
 
 ```

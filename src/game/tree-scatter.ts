@@ -19,6 +19,7 @@ import { mulberry32 } from './mesh-utils';
 import { mix32 } from './dungeon/dungeon-layout';
 import { DCELL, entranceSiteAt } from './dungeon/entrance-site';
 import { settlementSiteAt } from './settlement/settlement-scatter';
+import { onCastleGrounds } from './castle/castle-site';
 import { CHUNK_SIZE } from './terrain/chunk-mesh';
 import type { Biome } from './biome';
 
@@ -117,6 +118,10 @@ export function treesForChunk(
     if (settlement !== null
         && Math.hypot(x - settlement.x, z - settlement.z)
            < settlement.radius + 3) continue;
+    // Castle Vhaeron stands on a 35 m motte. A tree rooted on the hillside
+    // grows tall enough to push its canopy up through a courtyard slab, so the
+    // grounds and the breach causeway stay bare.
+    if (onCastleGrounds(x, z, 4)) continue;
 
     // Biome gating: determine kind at the exact candidate position.
     // Reject if biome forbids trees at the site (alpine/ocean edge cases

@@ -139,11 +139,14 @@ check('ANIMAL_MAX_VERTS >= actual max across all species',
   ANIMAL_MAX_VERTS >= actualMax,
   `constant=${ANIMAL_MAX_VERTS} actual=${actualMax}`);
 
-// ANIMAL_MAX_VERTS raised to 9200 for the capsule/sphere/cone rig (the
-// dragon alone now carries ~24 capsule bones) — see ANIMAL_MAX_VERTS's doc
-// comment in animal-mesh.ts for how this was measured.
-check('ANIMAL_MAX_VERTS is 9200 (capsule/sphere/cone dragon budget)',
-  ANIMAL_MAX_VERTS === 9200,
+// ANIMAL_MAX_VERTS raised to 9200 for the capsule/sphere/cone rig (the dragon
+// alone now carries ~24 capsule bones), then to 11400 when the final boss's
+// mount landed — `black_dragon` is `buildDragon` at size 4.4 plus a saddle,
+// girth, stirrups and crest, and measures 9690. See ANIMAL_MAX_VERTS's doc
+// comment in animal-mesh.ts, and `scripts/test-boss-mesh.mts` for the sweep
+// that establishes the new worst case.
+check('ANIMAL_MAX_VERTS is 11400 (boss-mount budget)',
+  ANIMAL_MAX_VERTS === 11400,
   `got ${ANIMAL_MAX_VERTS}`);
 
 // ---------------------------------------------------------------------------

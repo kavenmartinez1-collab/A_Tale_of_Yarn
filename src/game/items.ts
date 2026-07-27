@@ -18,7 +18,7 @@
  */
 
 export type ItemKind = 'weapon' | 'tool' | 'material' | 'consumable' | 'loot' | 'armor' | 'container';
-export type HeldKind = 'sword' | 'axe' | 'pickaxe' | 'bow' | 'staff';
+export type HeldKind = 'sword' | 'axe' | 'pickaxe' | 'bow' | 'staff' | 'torch';
 export type ToolKind = 'axe' | 'pickaxe';
 export type ArmorSlot = 'head' | 'body' | 'legs';
 export type EffectClass = 'heal' | 'warm' | 'cool' | 'stamina';
@@ -139,14 +139,44 @@ export const ITEM_DEFS = {
 
   // --- Fire / shelter (Phase E) ---------------------------------------------
   fire_starter: { name: 'Fire Starter',  kind: 'tool',      color: [0.55, 0.38, 0.22], stack: 20 },
-  torch:        { name: 'Torch',         kind: 'tool',      color: [0.75, 0.55, 0.20], stack: 20, warmth: 0.3, fuel: 60 },
+  // `fuel` here is the campfire meaning shared with logs (seconds of hearth
+  // burn if you feed it to a fire). How long a torch burns IN YOUR HAND is a
+  // different number and lives in torch.ts as TORCH_BURN_S — they were the
+  // same field once and reading 60 as "a torch lasts a minute" is wrong.
+  torch:        { name: 'Torch',         kind: 'tool',      color: [0.75, 0.55, 0.20], stack: 20, warmth: 0.3, fuel: 60, held: 'torch' },
   campfire_kit: { name: 'Campfire Kit',  kind: 'material',  color: [0.45, 0.31, 0.18], stack: 5  },
   fiber_tent:   { name: 'Fiber Tent',    kind: 'material',  color: [0.55, 0.60, 0.40], stack: 1,  warmth: 0.5 },
   wool_tent:    { name: 'Wool Tent',     kind: 'material',  color: [0.75, 0.72, 0.65], stack: 1,  warmth: 0.8 },
   hide_tent:    { name: 'Hide Tent',     kind: 'material',  color: [0.58, 0.42, 0.28], stack: 1,  warmth: 1.1 },
 
   // --- Weapons (Phase E) ----------------------------------------------------
-  arrow:        { name: 'Arrow',         kind: 'weapon',  color: [0.52, 0.38, 0.22], stack: 99 },
+  /**
+   * The rare ammunition — a lightning bolt with fletchings. Boss loot.
+   *
+   * The ID stays `arrow` on purpose. Every ammo check, icon, hit test, reticle
+   * state and consumption site in main.ts already names it, and renaming the id
+   * would touch a dozen files an agent does not own to change nothing the
+   * player can see. What changed is what it IS: see tintreach.ts.
+   *
+   * It is no longer the ONLY ammunition, and that was a real defect rather than
+   * a design: making Tintreach rare made the bow rare, because the bow had
+   * nothing else to shoot. `flint_arrow` below is the everyday quiver; this is
+   * the thing you save for the fight you cannot otherwise win.
+   *
+   * Colour is thread-cream `#f0e6c8` — the reticle's own thread, in linear RGB.
+   */
+  arrow:        { name: 'Tintreach Arrows', kind: 'weapon', color: [0.87, 0.79, 0.57], stack: 99 },
+  /**
+   * The everyday quiver: a knapped flint head, a whittled shaft, a feather.
+   *
+   * Cheap, craftable and stackable — this is what a bow is FOR. Its damage is
+   * the ordinary draw-scaled arrow number (6 hunter / 9 composite), which is
+   * exactly what the bow did before Tintreach existed, so nothing about hunting
+   * or skirmishing has changed; only the rare bolt was added beside it.
+   *
+   * Colour is flint grey over a wood shaft.
+   */
+  flint_arrow:  { name: 'Flint Arrows',     kind: 'weapon', color: [0.46, 0.44, 0.42], stack: 99 },
   bronze_sword: { name: 'Bronze Sword',  kind: 'weapon',  color: [0.72, 0.50, 0.28], stack: 1,  held: 'sword' },
   spear:        { name: 'Spear',         kind: 'weapon',  color: [0.60, 0.45, 0.25], stack: 1,  held: 'staff' },
   composite_bow:{ name: 'Composite Bow', kind: 'weapon',  color: [0.42, 0.30, 0.18], stack: 1,  held: 'bow'  },
@@ -181,6 +211,16 @@ export const ITEM_DEFS = {
 } as const satisfies Record<string, ItemDef>;
 
 export type GameItemId = keyof typeof ITEM_DEFS;
+
+/**
+ * The Tintreach quiver — one per save file, ever.
+ *
+ * Declared here rather than in tintreach.ts because inventory.ts enforces the
+ * uniqueness rule and tintreach.ts describes the weapon; both need the id, and
+ * items.ts is the one module with no imports at all, so it is the only place
+ * the constant can live without creating a cycle.
+ */
+export const TINTREACH_ID = 'arrow' satisfies GameItemId;
 
 export function isGameItemId(x: string): x is GameItemId {
   return Object.prototype.hasOwnProperty.call(ITEM_DEFS, x);

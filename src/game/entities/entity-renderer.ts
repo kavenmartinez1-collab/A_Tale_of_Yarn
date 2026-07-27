@@ -17,6 +17,7 @@ import { STRIDE_CREATURE, type Renderer, type TerrainDraw } from '../renderer';
 import { MATERIALS } from '../render/materials';
 import { CreatureAnimRegistry } from '../anim/creature-anim';
 import type { AnimState } from '../anim/clip-set';
+import type { AnimalPose } from './creature-parts';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -126,13 +127,37 @@ export class EntityRenderer {
   jawOverride: { id: string; jawOpen: number } | null = null;
 
   /**
+   * Per-entity pose patch, applied AFTER the clip system and after
+   * `jawOverride`.
+   *
+   * This exists because some pose channels are not, and should not be,
+   * animation. `AnimalPose.seat` is the case it was written for: the Evil King
+   * astride the black dragon needs `seat: 1` for as long as he is mounted, and
+   * "mounted" is a fact about the world that the clip sampler has no way to
+   * know and no business interpolating. Routing it through a clip channel
+   * would mean a seat that crossfades — a King who half-stands mid-flight
+   * every time his state machine changes clips.
+   *
+   * The callback receives the live pose the mesh is about to be built from and
+   * may write any `AnimalPose` field on it. It runs on every visible entity,
+   * so keep it to a map lookup and a couple of assignments.
+   *
+   * Whoever owns the boss fight sets this; nothing else does.
+   */
+  poseOverride: ((id: string, pose: AnimalPose) => void) | null = null;
+
+  /**
    * Optional per-entity flight state (`flap` / `glide` / `land`), for callers
    * that actually know a creature is airborne. Automatic detection from
    * vertical velocity is deliberately conservative because running over a hill
    * produces the same signal; see `CreatureAnim.setFlight`.
    *
-   * Currently unset — `main.ts`'s dragon flight controller is the intended
-   * caller and belongs to another workstream.
+   * Set by `main.ts`'s `tickCastleBoss` for the king's black dragon, which is
+   * the case it was written for: the dragon flies a steady circuit at constant
+   * altitude, so it has no vertical velocity at all and the automatic detector
+   * reads it as a walking animal — it circled the towers with its wings folded.
+   * Cleared again the moment the fight grounds it, or the clip system keeps it
+   * flapping while it walks.
    */
   flightOverride: { id: string; state: AnimState | null } | null = null;
 
@@ -150,10 +175,33 @@ export class EntityRenderer {
 
   constructor(renderer: Renderer) {
     this.renderer = renderer;
+    // Dev hook. `window.__gameDebug` lives in main.ts and belongs to a
+    // different workstream, but a capture harness has to be able to reach
+    // `poseOverride` and `flightOverride` — a boss photographed with his legs
+    // straight and his wings furled is a photograph of something the game
+    // never shows. One property, no behaviour, and it is the only reference
+    // the module keeps.
+    if (typeof window !== 'undefined') {
+      (window as unknown as { __entityRenderer?: EntityRenderer })
+        .__entityRenderer = this;
+    }
   }
 
   /** Current number of live animators. Diagnostics only. */
   get animatorCount(): number { return this.anim.size; }
+
+  /**
+   * Last frame's rebuild accounting, for perf harnesses.
+   *
+   * The budget is a hard cap and the interesting question is whether a scene
+   * SATURATES it — a crowd that wants 20 rebuilds and gets 8 is animating at a
+   * third rate, which is a deliberate degradation but one worth knowing about.
+   * `wanted` counts everything that asked; `spent` is what the budget allowed;
+   * `forced` is the mandatory rebuilds that bypass it entirely (a pool slot
+   * changing owner), and it is the number to watch, because those are NOT
+   * capped and a churning crowd can drive them arbitrarily high.
+   */
+  readonly lastFrameCost = { drawn: 0, wanted: 0, spent: 0, forced: 0, ms: 0 };
 
   /**
    * Build draw calls for all entities within range and on the live/dead
@@ -232,6 +280,12 @@ export class EntityRenderer {
     // under it in every normal one, where most creatures are outside the near
     // band and not due anyway.
     let rebuildBudget = 8;
+    const cost = this.lastFrameCost;
+    cost.drawn = visible.length;
+    cost.wanted = 0;
+    cost.spent = 0;
+    cost.forced = 0;
+    const costT0 = performance.now();
 
     for (let i = 0; i < visible.length; i++) {
       const { e, dist } = visible[i];
@@ -282,10 +336,14 @@ export class EntityRenderer {
       const wants = interval === 1
         || ((this.frameNo + hashId(e.id)) % interval) === 0;
 
+      if (wants) cost.wanted++;
+      if (mustRebuild) cost.forced++;
+
       let rebuild = mustRebuild;
       if (!rebuild && wants && rebuildBudget > 0) {
         rebuild = true;
         rebuildBudget--;
+        cost.spent++;
       }
 
       // Dead creatures sink into the ground for the loot window. Kept out of
@@ -300,6 +358,8 @@ export class EntityRenderer {
       if (this.jawOverride !== null && this.jawOverride.id === e.id) {
         pose.jawOpen = this.jawOverride.jawOpen;
       }
+      // Non-animation pose facts (the King's `seat`). Last, so it wins.
+      if (this.poseOverride !== null) this.poseOverride(e.id, pose);
 
       let count = entry.count;
       if (rebuild) {
@@ -355,6 +415,7 @@ export class EntityRenderer {
     }
 
     this.anim.endFrame();
+    cost.ms = performance.now() - costT0;
     return draws;
   }
 

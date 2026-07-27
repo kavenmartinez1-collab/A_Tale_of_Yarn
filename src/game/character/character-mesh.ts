@@ -485,6 +485,29 @@ function heldParts(held: HeldItem, rots: Rot[]): Part[] {
           0.36, 1.78, -0.17, 0.45, 1.94, -0.03, MAT.GEM),               // knob (above arm)
       ];
     }
+    case 'torch': {
+      // A short brand held UP, not a staff planted on the ground: the head has
+      // to clear the shoulder or the character carries a fire at chest height
+      // and lights their own chin. Shaft geometry is the staff's, cut to a
+      // third of the length and lifted so the burning end sits at TORCH_HEAD_Y
+      // (torch.ts) — that constant is where the flame billboard and the point
+      // light are anchored, so the two must move together.
+      const sx = (0.375 + 0.435) / 2, sz = (-0.14 + -0.06) / 2;
+      return [
+        haftY(WOOD, sx, 0.86, sz, 0.032, 0.62, MAT.WOOD),               // shaft
+        // Pitch-soaked rag wrap. EMBER is the emissive row, so the head glows
+        // on its own — a torch whose head is lit only by its own point light
+        // reads as a dark stick with a flame floating off the end of it.
+        //
+        // The colour is far darker than it looks like it should be because
+        // EMBER's emissive is 4.5x: a plausible flame orange came out of the
+        // tonemapper as a cream block, since every channel cleared 1.0 and
+        // ACES desaturates what it clips. Keeping green and blue near zero is
+        // what makes it read as burning rag rather than a lit candle.
+        p([0.62, 0.17, 0.03], 0.371, 1.44, sz - 0.048, 0.439, 1.60, sz + 0.048,
+          MAT.EMBER),                                                   // burning head
+      ];
+    }
   }
 }
 

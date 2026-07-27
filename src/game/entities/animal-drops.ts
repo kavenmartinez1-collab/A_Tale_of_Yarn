@@ -92,10 +92,11 @@ export const DROP_TABLE: Record<Species, DropRow[]> = {
   ],
   goblin_archer: [
     { id: 'gold_small', min: 1, max: 3, chance: 0.70 },
-    // Its quiver. The one enemy in the game that pays out ammunition, which
-    // is a real reason to prefer shooting the archers first.
-    { id: 'arrow',      min: 2, max: 5, chance: 0.90 },
-    { id: 'feather',    min: 1, max: 3, chance: 0.60 },
+    // It used to drop its quiver. It cannot any more: the only ammunition in
+    // the game is the Tintreach quiver and there is one per save (tintreach.ts),
+    // so a goblin carrying a second one is a hole in the rule. It keeps the
+    // fletchings, which is what an archer's corpse should be worth anyway.
+    { id: 'feather',    min: 2, max: 5, chance: 0.85 },
   ],
   skeleton: [
     { id: 'bone',       min: 1, max: 3, chance: 1.0  },
@@ -107,6 +108,20 @@ export const DROP_TABLE: Record<Species, DropRow[]> = {
     { id: 'ancient_relic',  min: 1, max: 1, chance: 1.0  },
     { id: 'iron_ingot',     min: 2, max: 4, chance: 1.0  },
     { id: 'healing_potion', min: 1, max: 2, chance: 0.60 },
+  ],
+  // The final boss and his mount. Every row is chance 1.0 on purpose: these
+  // die once per playthrough, so a 60% roll is a coin-flip on the ending's
+  // reward and there is no second attempt to average it out.
+  evil_king: [
+    { id: 'gold_large',     min: 6, max: 10, chance: 1.0 },
+    { id: 'ancient_relic',  min: 2, max: 3,  chance: 1.0 },
+    { id: 'iron_ingot',     min: 4, max: 8,  chance: 1.0 },
+    { id: 'healing_potion', min: 2, max: 3,  chance: 1.0 },
+  ],
+  black_dragon: [
+    { id: 'dragon_scale',   min: 6, max: 10, chance: 1.0 },
+    { id: 'gold_large',     min: 3, max: 6,  chance: 1.0 },
+    { id: 'ancient_relic',  min: 1, max: 1,  chance: 1.0 },
   ],
 };
 

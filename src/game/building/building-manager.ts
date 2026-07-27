@@ -21,6 +21,7 @@ import type { ResolvedSettlement, ResolvedPad } from '../settlement/settlement-l
 import {
   generateBuildingInterior,
   reachableFloorCells,
+  standingSpots,
   BUILDING_KINDS,
   type BuildingInterior,
   type BuildingKind,
@@ -40,8 +41,11 @@ import {
 import { buildChestMesh } from '../dungeon/dungeon-props';
 import { mix32 } from '../dungeon/dungeon-layout';
 import { mulberry32 } from '../mesh-utils';
+import { writeTorchLightSlot } from '../torch';
+import { ENTERABLE_PAD_TYPES, isEnterablePad, variedKind } from './building-pads';
 import type { ItemId } from '../dungeon/dungeon-spec';
 import type { Vitals } from '../vitals';
+import { cellLineOfSight } from '../interior-los';
 
 // ---- constants ------------------------------------------------------------
 
@@ -55,33 +59,6 @@ const ARENA_Y = -300;
 /** What a night in a tavern bed costs, in `gold_small`. */
 export const ROOM_PRICE = 12;
 
-/**
- * Pad types that can be entered and their mapping to BuildingKind.
- *
- * Keyed by plain string rather than `PadType` on purpose: the settlement
- * layout is gaining `church` / `tavern` / `longhouse` / `smithy` pads in a
- * parallel workstream, and this table should not need to land in the same
- * commit as the union that names them.
- */
-const ENTERABLE_PAD_TYPES: ReadonlyMap<string, BuildingKind | 'varied'> = new Map([
-  ['house', 'house'],
-  ['barn', 'varied'],       // barn → shop / tavern / barn, by per-building seed
-  ['stable', 'barn'],
-  ['keep', 'keep'],
-  ['tower', 'guardhouse'],
-  ['gatehouse', 'guardhouse'],
-  ['church', 'church'],
-  ['tavern', 'tavern'],
-  ['longhouse', 'longhouse'],
-  ['smithy', 'smithy'],
-  // jail is explicitly excluded — entering would break the jail/crime flow
-]);
-
-/** Map a 'varied' pad to a concrete kind based on seed determinism. */
-function variedKind(seed: number): BuildingKind {
-  const pick = (seed >>> 3) % 3;
-  return pick === 0 ? 'shop' : pick === 1 ? 'tavern' : 'barn';
-}
 
 /**
  * The shader's "cozy interior" ambient floor (lights.count.y). At 1 the
@@ -343,8 +320,22 @@ interface Resident {
   doorOutDir: [number, number];
   /** Hearth/candle/torch lights in CPU form, for the world-light set. */
   torchLights: WorldLight[];
+  /**
+   * The group-2 lights uniform and its CPU mirror, kept live so a HELD torch
+   * can be written into the spare slot each frame. Interior surfaces read only
+   * this buffer, so a carried torch that is not in here lights the innkeeper
+   * and leaves the room dark. See torch.ts `writeTorchLightSlot`.
+   */
+  lightsBuffer: GPUBuffer;
+  lightsData: Float32Array<ArrayBuffer>;
+  /** Fixtures baked in on entry; the player's slot goes after these. */
+  fixedLightCount: number;
+  /** Whether the spare slot currently holds a light, so still frames skip. */
+  playerTorchOn: boolean;
   /** Build cost, for the perf harness. */
   stats: { buildMs: number; propVerts: number; draws: number };
+  /** Lazily-computed arena-space places for occupants to stand. */
+  standSpots?: [number, number, number][];
 }
 
 // ---- public interface -----------------------------------------------------
@@ -386,6 +377,14 @@ export function padPerimeterDistXZ(pad: ResolvedPad, x: number, z: number): numb
 export class BuildingManager {
   private resident: Resident | null = null;
   private prompt: { label: string; act: () => void } | null = null;
+  /**
+   * Distance to whatever the prompt refers to, so an NPC standing closer can
+   * win the E key. Without this the tavern keeper is unreachable in her own
+   * tavern: the bar has a chest beside it, the chest prompt is chosen purely
+   * because it is a building interaction, and pressing E opens a crate while
+   * standing on top of the person you came to talk to.
+   */
+  private promptD = Infinity;
   private notice: { text: string; until: number } | null = null;
   private readonly openedChests = new Map<string, Set<number>>();
   /** `settlement:pad` keys the player has paid for a bed in, until they sleep. */
@@ -431,6 +430,19 @@ export class BuildingManager {
     return this.resident?.torchLights ?? [];
   }
 
+  /**
+   * Put the player's held torch into the interior's spare light slot (or clear
+   * it). Called every frame while inside; a no-op when outside.
+   */
+  setPlayerTorch(light: { pos: Vec3; radius: number } | null): void {
+    const r = this.resident;
+    if (r === undefined || r === null) return;
+    if (light === null && !r.playerTorchOn) return;
+    writeTorchLightSlot(this.renderer.device, r.lightsBuffer, r.lightsData,
+      r.fixedLightCount, (LIGHTS_BUFFER_SIZE - 16) / 32, light);
+    r.playerTorchOn = light !== null;
+  }
+
   get interactPrompt(): string | null {
     return this.prompt?.label ?? null;
   }
@@ -445,6 +457,48 @@ export class BuildingManager {
   /** Current building kind (for HUD display). */
   get currentKind(): BuildingKind | null {
     return this.resident?.kind ?? null;
+  }
+
+  /**
+   * Which building the player is standing in, by the same (settlement, pad)
+   * identity the NPC spawner assigns homes with. This is the join key that
+   * lets the world put the right person behind the right door.
+   */
+  get occupiedBuilding():
+    { settlementName: string; padIndex: number; kind: BuildingKind } | null {
+    const r = this.resident;
+    if (r === null) return null;
+    return { settlementName: r.settlementName, padIndex: r.padIndex, kind: r.kind };
+  }
+
+  /**
+   * Up to `count` places inside the current interior where a person can
+   * plausibly stand: floor cells clear of furniture, at least MIN_DOOR_GAP from
+   * any doorway (so nobody blocks the exit the player just came through) and
+   * spread apart from each other.
+   *
+   * Returned in ARENA world space — the same space the player's position is in
+   * while indoors — so ordinary distance maths keeps working with no special
+   * cases at the call sites.
+   *
+   * Deterministic: cells are visited in a fixed order and the settlement/pad
+   * seed only chooses the starting offset, so the innkeeper is behind the same
+   * bar every time you walk in.
+   */
+  interiorStandSpots(count: number): [number, number, number][] {
+    const r = this.resident;
+    if (r === null) return [];
+    // Cached per interior. This is asked for every frame the player is indoors,
+    // and standingSpots() flood-fills the cell grid to work out what the player
+    // can reach — cheap once, wasteful sixty times a second. The interior does
+    // not change while you are standing in it, so neither does the answer.
+    if (r.standSpots === undefined || r.standSpots.length < count) {
+      const { origin } = r;
+      r.standSpots = standingSpots(r.interior, Math.max(count, 4), r.padIndex)
+        .map(([lx, lz]): [number, number, number] =>
+          [origin[0] + lx, origin[1], origin[2] + lz]);
+    }
+    return r.standSpots.slice(0, count);
   }
 
   draws(): DungeonDraw[] {
@@ -462,7 +516,18 @@ export class BuildingManager {
    * `dungeonInside` prevents entry while in a dungeon.
    */
   update(pos: Vec3, nearbySettlements: ResolvedSettlement[], dungeonInside: boolean): void {
-    this.prompt = this.findInteraction(pos, nearbySettlements, dungeonInside);
+    const found = this.findInteraction(pos, nearbySettlements, dungeonInside);
+    this.prompt = found;
+    this.promptD = found?.dist ?? Infinity;
+  }
+
+  /**
+   * How far away the current prompt's target is, or Infinity when there is
+   * none. Only meaningful indoors; door prompts leave it Infinity because
+   * outdoors the NPC branch is ordered after them anyway.
+   */
+  get interactDist(): number {
+    return this.promptD;
   }
 
   /** Fire the current prompt's action (bound to KeyE in main.ts). */
@@ -476,7 +541,7 @@ export class BuildingManager {
     pos: Vec3,
     nearbySettlements: ResolvedSettlement[],
     dungeonInside: boolean,
-  ): { label: string; act: () => void } | null {
+  ): { label: string; act: () => void; dist?: number } | null {
     if (this.resident !== null) return this.findInsideInteraction(pos);
     if (dungeonInside) return null;
     return this.findDoorInteraction(pos, nearbySettlements);
@@ -487,7 +552,7 @@ export class BuildingManager {
     return `${r.settlementName}:${r.padIndex}`;
   }
 
-  private findInsideInteraction(pos: Vec3): { label: string; act: () => void } | null {
+  private findInsideInteraction(pos: Vec3): { label: string; act: () => void; dist: number } | null {
     const res = this.resident!;
     const { interior, origin, chests } = res;
     let best: { label: string; act: () => void } | null = null;
@@ -510,13 +575,21 @@ export class BuildingManager {
       }
     }
 
+    // Reach is XZ distance AND line of sight from here on. Cells are 1 m and a
+    // partition is one cell, so a 3 m radius reaches through two of them: the
+    // keep's guard-room chest, the house alcove's bed and the tavern's rentable
+    // bed all prompted from the wrong room, and acting on the prompt worked,
+    // because neither it nor the action ever looked at the grid.
+    const sees = (tx: number, tz: number): boolean =>
+      cellLineOfSight(interior.cells, interior.gridW, interior.gridD, px, pz, tx, tz);
+
     // Chests.
     for (const chest of chests) {
       if (chest.opened) continue;
-      const cx = origin[0] + chest.localCell[0] + 0.5;
-      const cz = origin[2] + chest.localCell[1] + 0.5;
-      const d = Math.hypot(pos[0] - cx, pos[2] - cz);
-      if (d <= bestD) {
+      const cx = chest.localCell[0] + 0.5;
+      const cz = chest.localCell[1] + 0.5;
+      const d = Math.hypot(px - cx, pz - cz);
+      if (d <= bestD && sees(cx, cz)) {
         bestD = d;
         best = { label: 'Press E to open the chest', act: () => this.openChest(chest) };
       }
@@ -527,10 +600,10 @@ export class BuildingManager {
     // The tavern keeper's post: the bar counter. Paying here is paying them.
     for (const f of interior.furniture) {
       if (f.tag !== 'keeper' || res.kind !== 'tavern') continue;
-      const bx = origin[0] + (f.aabb.minX + f.aabb.maxX) / 2;
-      const bz = origin[2] + (f.aabb.minZ + f.aabb.maxZ) / 2;
-      const d = Math.hypot(pos[0] - bx, pos[2] - bz);
-      if (d > bestD) continue;
+      const bx = (f.aabb.minX + f.aabb.maxX) / 2;
+      const bz = (f.aabb.minZ + f.aabb.maxZ) / 2;
+      const d = Math.hypot(px - bx, pz - bz);
+      if (d > bestD || !sees(bx, bz)) continue;
       bestD = d;
       best = rented
         ? {
@@ -546,10 +619,10 @@ export class BuildingManager {
     // Beds. A rentable bed needs paying for; every other bed is free rest.
     for (const f of interior.furniture) {
       if (f.type !== 'bed' && f.type !== 'bunk' && f.type !== 'sleepbench') continue;
-      const bx = origin[0] + (f.aabb.minX + f.aabb.maxX) / 2;
-      const bz = origin[2] + (f.aabb.minZ + f.aabb.maxZ) / 2;
-      const d = Math.hypot(pos[0] - bx, pos[2] - bz);
-      if (d > bestD) continue;
+      const bx = (f.aabb.minX + f.aabb.maxX) / 2;
+      const bz = (f.aabb.minZ + f.aabb.maxZ) / 2;
+      const d = Math.hypot(px - bx, pz - bz);
+      if (d > bestD || !sees(bx, bz)) continue;
       bestD = d;
       if (f.tag === 'rent') {
         best = rented
@@ -563,7 +636,7 @@ export class BuildingManager {
       }
     }
 
-    return best;
+    return best === null ? null : { ...best, dist: bestD };
   }
 
   private findDoorInteraction(
@@ -600,12 +673,25 @@ export class BuildingManager {
   }
 
   /**
-   * Enter an NPC's home (invite-home chat action). Picks a deterministic
-   * house pad for this NPC in its settlement, so the same NPC always lives
-   * in the same building.
+   * Enter an NPC's home (invite-home chat action).
+   *
+   * Prefers the pad the NPC was actually assigned at spawn — the same one they
+   * withdraw into on their own — so "come back to mine" leads to the house they
+   * live in rather than a second, hash-chosen address. The old hash pool
+   * remains as the fallback for NPCs with no home or an unenterable one.
    */
-  enterNpcHome(settlement: ResolvedSettlement, npcId: string): boolean {
+  enterNpcHome(settlement: ResolvedSettlement, npcId: string, homePadIndex = -1): boolean {
     if (this.resident !== null) return false;
+    if (homePadIndex >= 0 && homePadIndex < settlement.pads.length) {
+      const own = settlement.pads[homePadIndex];
+      const entry = ENTERABLE_PAD_TYPES.get(own.type);
+      if (entry !== undefined) {
+        const ownSeed = mix32(settlement.site.seed, homePadIndex);
+        this.enter(settlement, homePadIndex, own,
+          this.resolveKind(entry, ownSeed), ownSeed);
+        return true;
+      }
+    }
     const housePads: number[] = [];
     const fallbackPads: number[] = [];
     for (let i = 0; i < settlement.pads.length; i++) {
@@ -901,6 +987,9 @@ export class BuildingManager {
       doorWorldPos: doorPos,
       doorOutDir: [-Math.sin(pad.yaw), -Math.cos(pad.yaw)],
       torchLights,
+      lightsBuffer, lightsData,
+      fixedLightCount: activeLights.length,
+      playerTorchOn: false,
       stats: { buildMs: performance.now() - t0, propVerts, draws: draws.length },
     };
 
@@ -914,6 +1003,15 @@ export class BuildingManager {
     this.controller.velY = 0;
     this.camera.interior = collider;
     this.publishDebug();
+  }
+
+  /**
+   * Leave the interior regardless of where the player is standing — used on
+   * death, which otherwise leaves the interior resident and the player stranded
+   * in an arena with no world around it. See DungeonManager.forceExit.
+   */
+  forceExit(): void {
+    this.exit();
   }
 
   private exit(): void {
@@ -1017,6 +1115,19 @@ export class BuildingManager {
       /** Stand in the middle of the interior. */
       atCenter: () => this.standNear(res.interior.gridW / 2, res.interior.gridD / 2),
       rentedRooms: () => [...this.rentedRooms],
+      /**
+       * Every decor prop and light, in interior-local coords.
+       *
+       * Capture harnesses need to point a camera AT a specific window or
+       * hanging lamp; the fixed door/centre/focus views photograph whichever
+       * wall the layout happened to compose toward, and a window on the wall
+       * behind the camera reads as "no window fault found".
+       */
+      props: () => ({
+        decor: res.interior.decor.map((d) => ({ ...d })),
+        lights: res.interior.lights.map((l) => ({ ...l })),
+        ceilY: [...res.interior.ceilY],
+      }),
     };
   }
 

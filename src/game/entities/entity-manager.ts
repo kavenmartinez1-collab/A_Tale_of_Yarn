@@ -108,6 +108,25 @@ export interface EntityState {
    */
   npcOwned?: boolean;
   /**
+   * Placed by a script rather than by cell streaming: exempt from the live
+   * cap, and never released by distance.
+   *
+   * `owned` and `npcOwned` were the only two exemptions, and both mean
+   * something else entirely — `owned` is "the player's", which makes
+   * `stepAnimal` refuse to let the creature aggro or attack, and `npcOwned` is
+   * "a villager's property", which turns killing it into a crime. Castle
+   * Vhaeron's garrison is neither: it has to be permanent AND hostile AND free
+   * to kill, and there was no flag that meant only "permanent".
+   *
+   * (The King and his dragon spawn wearing `owned` for this, which was safe
+   * while their AI was bypassed entirely — and stopped being safe when the
+   * fight started handing them to `stepAnimal`, where an owned boss is a pet
+   * that cannot aggro and whose blows the caller discards. `stepAnimal` now
+   * trades their `owned` for this flag on first contact; see the boss-handoff
+   * shed there.)
+   */
+  pinned?: boolean;
+  /**
    * Phase K: scale multiplier for rendering baby animals (0 < scale ≤ 1).
    * Absent or 1 = full adult size.
    */
@@ -359,6 +378,44 @@ export class EntityManager {
   }
 
   /**
+   * Place a scripted entity at an exact position under a caller-chosen id.
+   *
+   * `spawnEntity` cannot be used for anything that has to be reproducible: it
+   * bakes `Date.now()` and `Math.random()` into the id, and it snaps y to the
+   * terrain heightfield — which is 28 m below the floor for anything standing
+   * inside Castle Vhaeron, and wrong by the height of the motte for anything
+   * standing on it. This takes the whole placement from the caller and asks
+   * the world nothing.
+   *
+   * Returns the existing entity untouched if the id is already live, so a
+   * caller can re-assert its roster every frame without resurrecting the dead
+   * or resetting the wounded.
+   */
+  placeEntity(
+    id: string, species: Species,
+    x: number, y: number, z: number,
+    yaw: number, colorVariant: number,
+  ): EntityState {
+    const existing = this.entities.get(id);
+    if (existing !== undefined) return existing;
+    const e: EntityState = {
+      id, species,
+      x, y, z, yaw,
+      hp: SPECIES_DEFS[species].hp,
+      mode: 'idle',
+      walkPhase: 0,
+      colorVariant,
+      homeX: x,
+      homeZ: z,
+      stateTimer: 0,
+      fleeTimer: 0,
+      pinned: true,
+    };
+    this.entities.set(id, e);
+    return e;
+  }
+
+  /**
    * Snapshot for __gameDebug.entities().
    */
   snapshot(): EntityState[] {
@@ -436,9 +493,10 @@ export class EntityManager {
   private _releaseFar(playerX: number, playerZ: number): void {
     const r2 = RELEASE_RADIUS * RELEASE_RADIUS;
     for (const [id, e] of this.entities) {
-      // Owned (babies / tamed) and npcOwned (stable horses) entities are never
-      // streamed out; debug spawns have no spawn record to rebuild them from.
-      if (e.owned || e.npcOwned) continue;
+      // Owned (babies / tamed), npcOwned (stable horses) and pinned (scripted
+      // placements like the castle garrison) entities are never streamed out;
+      // debug spawns have no spawn record to rebuild them from.
+      if (e.owned || e.npcOwned || e.pinned) continue;
       if (!STREAMED_ID.test(id)) continue;
       const dx = e.x - playerX, dz = e.z - playerZ;
       if (dx * dx + dz * dz > r2) this.entities.delete(id);
@@ -503,6 +561,8 @@ export class EntityManager {
       if (e.owned) continue;
       // Phase M: npcOwned entities (stable horses) are never streamed out.
       if (e.npcOwned) continue;
+      // Scripted placements outlive the cell they happen to stand in.
+      if (e.pinned) continue;
       if (id.startsWith(key + ':')) {
         this.entities.delete(id);
       }
@@ -520,6 +580,11 @@ export class EntityManager {
       if (e.owned) continue;
       // Phase M: npcOwned entities (stable horses) are exempt from the live cap.
       if (e.npcOwned) continue;
+      // Scripted placements. Without this the cap culls FARTHEST FIRST, which
+      // in a castle means the throne room and the tower arena — the two rooms
+      // the player has not reached yet — quietly empty themselves while they
+      // are fighting through the courtyard, and the boss floor is deserted.
+      if (e.pinned) continue;
       const dist = Math.hypot(e.x - playerX, e.z - playerZ);
       scored.push([dist, id]);
     }

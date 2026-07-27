@@ -228,6 +228,31 @@ const KIND_SIZE: Record<BuildingKind, KindSize> = {
  */
 export const MAX_INTERIOR_LIGHTS = 5;
 
+/**
+ * How far in FRONT of its wall plane a window's anchor sits, and how far the
+ * splayed reveal cuts back from that anchor. Both are consumed by
+ * `building-interior-mesh.ts`, which is the whole point of exporting them.
+ *
+ * The reveal must be shallower than the inset, or the window is behind its own
+ * wall. It was: the anchor was 8 cm off the plane and the emissive pane 17 cm
+ * behind the anchor, so the glass sat 9 cm INSIDE the solid cell and the shell
+ * builder — which emits an unbroken quad for every wall face and has no notion
+ * of an aperture — drew straight over it. Half the reveal was buried with it.
+ * What the player saw was a pale ghost of a frame with no glass in it, on the
+ * church's great east window as much as on a cottage.
+ *
+ * A window drawn wholly in front of its wall is a surround standing 16 cm into
+ * the room, which is what a splayed reveal in a half-metre wall looks like from
+ * inside anyway. The alternative — cutting a real aperture — needs the hole in
+ * the interior shell AND in the settlement's exterior mesh, which is a
+ * different module and a different pass.
+ */
+export const WINDOW_INSET = 0.16;
+/** Depth of the splay, measured back from the anchor. Must be < WINDOW_INSET. */
+export const WINDOW_DEPTH = 0.13;
+/** Half-height of a window at scale 1. `win()` and the mesh must agree. */
+export const WINDOW_HALF_H = 0.55;
+
 const FIRE: [number, number, number] = [1.00, 0.56, 0.22];
 const FORGE_C: [number, number, number] = [1.00, 0.40, 0.12];
 const CANDLE: [number, number, number] = [1.00, 0.84, 0.52];
@@ -489,6 +514,8 @@ class Furnisher {
     readonly rng: () => number,
     readonly doorCells: readonly [number, number][],
     readonly spawn: readonly [number, number, number],
+    /** The sloped roof, when this kind has one — see `soffitAt`. */
+    readonly gable: GableSpec | null = null,
   ) {}
 
   /** Uniform in [a,b). */
@@ -633,9 +660,152 @@ class Furnisher {
     }
   }
 
-  /** A lantern hanging from `y` (the ceiling), with the light in its glass. */
-  lanternlight(x: number, y: number, z: number, scale = 1, radius = 5.5): void {
-    this.dec('lantern', x, y, z, { scale });
+  /**
+   * The height of the surface actually DRAWN overhead at (x, z).
+   *
+   * `ceilAt` returns the per-cell `ceilY`, which is the flat plane the mesh
+   * emits AND the conservative bound furniture is fitted under. Under a gable
+   * that plane is not emitted at all — `emitGable` draws two slopes rising from
+   * the eaves to the ridge instead — so anything nailed to the ceiling in a
+   * longhouse or a barn has to follow the slope or it hangs in the air below
+   * it. Everywhere else the two are the same number.
+   */
+  soffitAt(x: number, z: number): number {
+    const gb = this.gable;
+    const c = this.ceilAt(x, z);
+    if (gb === null || x < gb.x0 || x >= gb.x1 || z < gb.z0 || z >= gb.z1) return c;
+    const span = gb.axis === 'z' ? (gb.x1 - gb.x0) / 2 : (gb.z1 - gb.z0) / 2;
+    if (span <= 1e-6) return c;
+    const mid = gb.axis === 'z' ? (gb.x0 + gb.x1) / 2 : (gb.z0 + gb.z1) / 2;
+    const u = Math.min(1, Math.abs((gb.axis === 'z' ? x : z) - mid) / span);
+    return gb.eaves + (gb.ridge - gb.eaves) * (1 - u);
+  }
+
+  /**
+   * True when the wall face at `plane` on `axis` has OUTDOORS on the far side.
+   *
+   * Cheap because of how the grid is built: the interior is carved at (1, 1)
+   * inside a one-cell solid border, so the only two wall planes per axis with
+   * nothing behind them are 1 and `size - 1`. Every other solid cell is a
+   * partition with another room, a bed alcove or a guest room behind it.
+   */
+  exteriorWall(axis: 'x' | 'z', plane: number): boolean {
+    const n = axis === 'x' ? this.g.w : this.g.d;
+    return Math.abs(plane - 1) < 1e-6 || Math.abs(plane - (n - 1)) < 1e-6;
+  }
+
+  /**
+   * A window on a wall of `room`, or nothing.
+   *
+   * `side` is -1 for the room's low wall on `axis` and +1 for its high wall;
+   * `along` is the position on the OTHER axis. Every window in the game goes
+   * through here, and it enforces the three things eighteen hand-written
+   * `dec('window', ...)` calls could not:
+   *
+   * 1. THE WALL HAS AN OUTSIDE. A window is a hole to daylight, and half the
+   *    taverns and half the keeps put one on the partition between the common
+   *    room and the guest room — a lit pane looking into the next room, with
+   *    the far side of it invisible inside a solid cell. If the requested side
+   *    is a partition the OPPOSITE wall of the same room is tried (a room in a
+   *    corner has one of each), and if neither is outside no window is placed.
+   * 2. IT FITS UNDER ITS OWN CEILING. The head is pushed down to clear the
+   *    ceiling of the cell it is in — not the tallest ceiling in the building.
+   *    The barn's window sat at 2.9 m under a 2.15 m hayloft, i.e. inside the
+   *    loft floor, and the church's great window went through the chancel
+   *    vault on every small church.
+   * 3. IT IS ALL IN FRONT OF THE WALL. See `WINDOW_INSET`.
+   *
+   * Returns the anchor when one was placed, so a caller can hang a daylight
+   * light off it, or null.
+   */
+  win(
+    room: Room, axis: 'x' | 'z', side: -1 | 1, along: number, y: number,
+    opts: { len?: number; scale?: number; variant?: number } = {},
+  ): [number, number, number] | null {
+    const lo = axis === 'x' ? room.x : room.z;
+    const hi = lo + (axis === 'x' ? room.w : room.d);
+    let plane = side < 0 ? lo : hi;
+    let s: -1 | 1 = side;
+    if (!this.exteriorWall(axis, plane)) {
+      plane = side < 0 ? hi : lo;
+      s = side < 0 ? 1 : -1;
+      if (!this.exteriorWall(axis, plane)) return null;
+    }
+    // Inward normal points away from the wall, into the room.
+    const inward = s < 0 ? 1 : -1;
+    const x = axis === 'x' ? plane + inward * WINDOW_INSET : along;
+    const z = axis === 'x' ? along : plane + inward * WINDOW_INSET;
+    const yaw = axis === 'x'
+      ? (inward > 0 ? -Math.PI / 2 : Math.PI / 2)
+      : (inward > 0 ? 0 : Math.PI);
+
+    const ceil = this.ceilAt(x, z);
+    if (ceil <= 0) return null;
+    // 12 cm of wall above the head so the reveal does not run into the ceiling
+    // joint, and a 0.5 m sill so it is a window and not a cat flap. Between
+    // those two the window SHRINKS to fit rather than vanishing: the barn's
+    // gable window is under a 2.15 m hay loft and asks for 1.65 m of glass, and
+    // dropping it left the only daylight in the building with nothing to come
+    // through. Below 0.55 scale there is no wall worth glazing.
+    const SILL_MIN = 0.5;
+    const HEAD_GAP = 0.12;
+    const band = ceil - HEAD_GAP - SILL_MIN;
+    let scale = opts.scale ?? 1;
+    if (WINDOW_HALF_H * 2 * scale > band) scale = band / (WINDOW_HALF_H * 2);
+    if (scale < 0.55) return null;
+    const hh = WINDOW_HALF_H * scale;
+    const yy = Math.min(y + hh, ceil - HEAD_GAP) - hh;
+    // `variant` is left undefined when the caller does not care, so `dec` draws
+    // it — windows have mullions in one variant and the RNG stream is shared
+    // with every other prop in the building.
+    this.dec('window', x, yy, z, { yaw, scale, len: opts.len ?? 1, variant: opts.variant });
+    return [x, yy, z];
+  }
+
+  /**
+   * Floor clutter, placed only if there is floor under it.
+   *
+   * `dec` takes the anchor on trust, which is right for wall and ceiling props
+   * (they are inset from a surface that exists by construction) and wrong for
+   * anything positioned RELATIVE TO A PIECE OF FURNITURE — "0.8 m to the left
+   * of the bed" is off the end of the room whenever the bed is against the
+   * wall. The boots beside every bed in a narrow house were inside the wall.
+   */
+  floorDec(type: DecorType, x: number, z: number,
+           opts: { yaw?: number; scale?: number; variant?: number; len?: number } = {},
+           y = 0): boolean {
+    const cx = Math.floor(x); const cz = Math.floor(z);
+    if (cx < 0 || cz < 0 || cx >= this.g.w || cz >= this.g.d) return false;
+    if (this.g.cells[cz * this.g.w + cx] === CELL_SOLID) return false;
+    this.dec(type, x, y, z, opts);
+    return true;
+  }
+
+  /**
+   * A prop that hangs, anchored to the surface it hangs FROM.
+   *
+   * Every hanging template — lantern, chandelier, censer, herbs, sausages,
+   * hangpot — is modelled with its chain, cord or hook starting at local y = 0
+   * and running downward, so the anchor IS the ceiling it is nailed to. They
+   * were all written as `ceil - 0.15` or `ceil - 0.2`, which hangs the top of
+   * the chain 15 to 20 cm below the plaster and leaves the prop floating with a
+   * bare cord end pointing at nothing. Reported from play as floating torches.
+   *
+   * Beams count as a surface: a tie beam is what you actually hang a lamp off,
+   * and the beams here are boxes of half-thickness `BEAM_HALF` centred on their
+   * own anchor, so their soffit is `BEAM_HALF` below it.
+   */
+  hang(type: DecorType, x: number, z: number,
+       opts: { scale?: number; yaw?: number; len?: number; variant?: number;
+               from?: number } = {}): number {
+    const y = opts.from ?? this.soffitAt(x, z);
+    this.dec(type, x, y, z, opts);
+    return y;
+  }
+
+  /** A lantern hanging from the ceiling at (x, z), with the light in its glass. */
+  lanternlight(x: number, z: number, scale = 1, radius = 5.5, from?: number): void {
+    const y = this.hang('lantern', x, z, { scale, from });
     this.light('lantern', x, y - 0.28 * scale, z, TORCH, radius);
   }
 
@@ -788,7 +958,9 @@ function furnishHouse(f: Furnisher, main: Room, alcove: Room | null): void {
   if (hearth) {
     f.light('hearth', hx, 0.42, rz + 0.75, FIRE, 7.5);
     // Mantel clutter + a cauldron swung over the fire.
-    f.dec('hangpot', hx, 1.05, rz + 0.85, { scale: 0.9 });
+    // Anchored in the ceiling, `len` metres of chain down to the pot: the
+    // cauldron reads as hung over the fire only if the chain reaches something.
+    f.hang('hangpot', hx, rz + 0.85, { scale: 0.9, len: f.soffitAt(hx, rz + 0.85) - 1.05 });
     f.dec('candlestick', hx - 0.42, 1.35, rz + 0.5, { scale: 0.85 });
     f.dec('crock', hx + 0.45, 1.35, rz + 0.5, { scale: 0.55 });
     f.put('crate', hx + 1.35, rz + 0.6, 0.3, 0.3, 0.45, { variant: 2 });
@@ -832,7 +1004,7 @@ function furnishHouse(f: Furnisher, main: Room, alcove: Room | null): void {
     const bcz = (bed.aabb.minZ + bed.aabb.maxZ) / 2;
     // A rug you step onto when you get out of bed.
     f.put('rug', bcx + (bcx < cx ? 0.95 : -0.95), bcz, 0.48, 0.72, 0.03);
-    f.dec('boots', bcx + (bcx < cx ? 0.8 : -0.8), 0, bcz + 0.55, { yaw: f.r(0, 3), scale: 0.95 });
+    f.floorDec('boots', bcx + (bcx < cx ? 0.8 : -0.8), bcz + 0.55, { yaw: f.r(0, 3), scale: 0.95 });
     const nightstand = f.put('crate', bcx, bcz + (bed.aabb.maxZ - bed.aabb.minZ) / 2 + 0.42,
       0.34, 0.28, 0.5, { variant: 1 });
     if (nightstand) {
@@ -853,14 +1025,14 @@ function furnishHouse(f: Furnisher, main: Room, alcove: Room | null): void {
   // --- entry: boots, a broom, a cloak on the wall by the door
   const [sx, , sz] = f.spawn;
   f.dec('cloak', sx + 1.15, 1.6, rz + rd - 0.12, { yaw: Math.PI, scale: 1 });
-  f.dec('broom', sx - 1.1, 0, rz + rd - 0.35, { yaw: 0.35, scale: 1 });
-  f.dec('boots', sx + 0.75, 0, rz + rd - 0.4, { yaw: 2.4, scale: 0.9 });
+  f.floorDec('broom', sx - 1.1, rz + rd - 0.35, { yaw: 0.35, scale: 1 });
+  f.floorDec('boots', sx + 0.75, rz + rd - 0.4, { yaw: 2.4, scale: 0.9 });
 
   // --- verticality: tie beams, hanging herbs, a loft over the alcove
   const beamZ1 = alcove ? Math.min(rz + rd - 0.05, alcove.z - 0.1) : rz + rd - 0.05;
   f.beams(rx + 0.05, rz + 0.05, rx + rw - 0.05, beamZ1, ceil - 0.16, 2.2);
-  f.dec('herbs', rx + rw * 0.3, ceil - 0.2, rz + rd * 0.35, { scale: 1 });
-  f.dec('herbs', rx + rw * 0.62, ceil - 0.2, rz + rd * 0.3, { scale: 0.85, yaw: 0.7 });
+  f.hang('herbs', rx + rw * 0.3, rz + rd * 0.35, { scale: 1 });
+  f.hang('herbs', rx + rw * 0.62, rz + rd * 0.3, { scale: 0.85, yaw: 0.7 });
   if (alcove) {
     const ac = f.ceilAt(alcove.x + 0.5, alcove.z + 0.5);
     f.dec('loft', alcove.x + alcove.w / 2, ac, alcove.z + alcove.d / 2,
@@ -875,8 +1047,8 @@ function furnishHouse(f: Furnisher, main: Room, alcove: Room | null): void {
   // --- floor life
   f.scatter(['straw', 'straw', 'straw', 'basket', 'crock', 'bucket', 'sack'],
     rx + 0.5, rz + 0.5, rx + rw - 0.5, rz + rd - 0.6, f.ri(7, 10));
-  f.dec('window', rx + rw - 0.08, 1.55, rz + rd * 0.34, { yaw: Math.PI / 2, len: 1.1 });
-  f.dec('window', rx + 0.08, 1.55, rz + rd * 0.52, { yaw: -Math.PI / 2, len: 1.1 });
+  f.win(main, 'x', 1, rz + rd * 0.34, 1.55, { len: 1.1 });
+  f.win(main, 'x', -1, rz + rd * 0.52, 1.55, { len: 1.1 });
 }
 
 /**
@@ -949,16 +1121,16 @@ function furnishShop(f: Furnisher, main: Room, store: Room | null): void {
         { yaw: f.r(-0.25, 0.25) });
       if (stack && f.chance(0.4)) f.dec('sack', bx, stack.aabb.maxY, bz, { scale: 0.9 });
     }
-    f.dec('window', s.x + s.w - 0.08, 1.7, s.z + s.d / 2, { yaw: Math.PI / 2, len: 0.9 });
+    f.win(s, 'x', 1, s.z + s.d / 2, 1.7, { len: 0.9 });
   }
 
   // --- hanging trade goods: the ceiling is stock space in a real shop
   f.beams(rx + 0.05, rz + 0.05, rx + rw - 0.05, rz + rd - 0.05, ceil - 0.16, 2.4);
-  f.dec('herbs', rx + rw * 0.25, ceil - 0.18, counterZ - 0.5, { scale: 1.1 });
-  f.dec('sausages', rx + rw * 0.55, ceil - 0.18, counterZ - 0.4, { scale: 1, len: 1.4 });
-  f.dec('herbs', rx + rw * 0.78, ceil - 0.18, counterZ - 0.6, { scale: 0.9, yaw: 0.8 });
-  f.lanternlight(cx, ceil - 0.15, rz + rd * 0.75, 1, 6);
-  f.dec('window', rx + 0.08, 1.6, rz + rd * 0.78, { yaw: -Math.PI / 2, len: 1.2 });
+  f.hang('herbs', rx + rw * 0.25, counterZ - 0.5, { scale: 1.1 });
+  f.hang('sausages', rx + rw * 0.55, counterZ - 0.4, { scale: 1, len: 1.4 });
+  f.hang('herbs', rx + rw * 0.78, counterZ - 0.6, { scale: 0.9, yaw: 0.8 });
+  f.lanternlight(cx, rz + rd * 0.75, 1, 6);
+  f.win(main, 'x', -1, rz + rd * 0.78, 1.6, { len: 1.2 });
   f.wallRow(['wallshelf'], rx + rw - 0.12, rz + 1.2, rx + rw - 0.12, rz + rd * 0.42, 1.5, 1, Math.PI / 2, 1.2);
   f.scatter(['straw', 'crock', 'bucket'], rx + 0.6, rz + rd * 0.62, rx + rw - 0.6, rz + rd - 0.7, f.ri(3, 5));
 }
@@ -1006,7 +1178,7 @@ function furnishTavern(f: Furnisher, main: Room, guest: Room | null): void {
   const hearth = f.put('hearth', hx, rz + 0.55, 0.85, 0.5, 1.5);
   if (hearth) {
     f.light('hearth', hx, 0.45, rz + 0.78, FIRE, 8.5);
-    f.dec('hangpot', hx, 1.15, rz + 0.85, { scale: 1.05 });
+    f.hang('hangpot', hx, rz + 0.85, { scale: 1.05, len: f.soffitAt(hx, rz + 0.85) - 1.15 });
     f.dec('firewood', hx + 1.25, 0, rz + 0.55, { scale: 1.1 });
     f.put('bench', hx - 1.35, rz + 1.15, 0.24, 0.6, 0.46, { yaw: 0 });
     f.dec('antlers', hx, 2.1, rz + 0.1, { scale: 1.1 });
@@ -1066,25 +1238,25 @@ function furnishTavern(f: Furnisher, main: Room, guest: Room | null): void {
       const bed = f.put('bed', bx, bz, along ? 0.55 : 0.5, along ? 0.98 : 0.55,
         0.62, { yaw: along ? 0 : -Math.PI / 2, tag: 'rent', variant: i });
       if (bed) {
-        f.dec('boots', bx + (along ? 0.85 : 0), 0, bz + (along ? 0.4 : 0.85),
+        f.floorDec('boots', bx + (along ? 0.85 : 0), bz + (along ? 0.4 : 0.85),
           { yaw: f.r(0, 3), scale: 0.9 });
       }
     }
     f.put('cupboard', g.x + g.w - 0.42, g.z + g.d - 0.6, 0.32, 0.36, 0.9,
       { yaw: Math.PI / 2, variant: 2 });
     f.candlelight(g.x + g.w - 0.42, 0.9, g.z + g.d - 0.6, { scale: 0.95, radius: 3.8 });
-    f.dec('window', g.x + g.w - 0.08, 1.6, g.z + g.d * 0.4, { yaw: Math.PI / 2, len: 1 });
+    f.win(g, 'x', 1, g.z + g.d * 0.4, 1.6, { len: 1 });
     f.dec('rafter', g.x + g.w / 2, gc - 0.1, g.z + g.d / 2, { len: g.w, scale: g.d });
     f.scatter(['straw', 'bucket'], g.x + 0.6, g.z + 0.6, g.x + g.w - 0.6, g.z + g.d - 0.6, 2);
   }
 
   // --- overhead: beams, a wheel chandelier, drying stock
   f.beams(rx + 0.05, rz + 0.05, rx + rw - 0.05, rz + rd - 0.05, ceil - 0.18, 2.3);
-  f.dec('chandelier', cx + (left ? 0.6 : -0.6), ceil - 0.15, rz + rd * 0.5, { scale: 1.15 });
-  f.dec('sausages', barX + (left ? 0.9 : -0.9), ceil - 0.2, barZ0 + 0.4, { scale: 1, len: 1.5 });
-  f.dec('herbs', cx, ceil - 0.2, rz + 1.4, { scale: 1 });
-  f.dec('window', rx + rw - 0.08, 1.75, rz + rd - 1.6, { yaw: Math.PI / 2, len: 1.2 });
-  f.dec('window', rx + 0.08, 1.75, rz + rd - 1.6, { yaw: -Math.PI / 2, len: 1.2 });
+  f.hang('chandelier', cx + (left ? 0.6 : -0.6), rz + rd * 0.5, { scale: 1.15 });
+  f.hang('sausages', barX + (left ? 0.9 : -0.9), barZ0 + 0.4, { scale: 1, len: 1.5 });
+  f.hang('herbs', cx, rz + 1.4, { scale: 1 });
+  f.win(main, 'x', 1, rz + rd - 1.6, 1.75, { len: 1.2 });
+  f.win(main, 'x', -1, rz + rd - 1.6, 1.75, { len: 1.2 });
 
   // --- floor: straw, a spilled bucket, a dog's bowl by the fire
   f.scatter(['straw', 'straw', 'straw', 'straw', 'straw', 'sack', 'basket', 'crock', 'mug'],
@@ -1112,7 +1284,10 @@ function furnishLonghouse(f: Furnisher, main: Room): void {
   if (trench) {
     f.light('hearth', cx, 0.32, trenchZ0 + (trenchZ1 - trenchZ0) * 0.28, FIRE, 8.5);
     f.light('hearth', cx, 0.32, trenchZ0 + (trenchZ1 - trenchZ0) * 0.74, FIRE, 8.5);
-    f.dec('hangpot', cx, 1.9, trenchZ0 + (trenchZ1 - trenchZ0) * 0.5, { scale: 1.2 });
+    {
+      const pz = trenchZ0 + (trenchZ1 - trenchZ0) * 0.5;
+      f.hang('hangpot', cx, pz, { scale: 1.2, len: f.soffitAt(cx, pz) - 1.9 });
+    }
     f.dec('firewood', cx + 1.0, 0, trenchZ1 + 0.6, { scale: 1.15, yaw: 0.4 });
   }
 
@@ -1152,11 +1327,17 @@ function furnishLonghouse(f: Furnisher, main: Room): void {
   }
 
   // --- high seat closing the -Z end, on a low dais, flanked by banners
-  f.put('dais', cx, rz + 1.15, rw * 0.32, 0.85, 0.22);
+  // 0.72 deep, not 0.85: the head table stands at rz + 2.3 and a dais reaching
+  // rz + 2.00 put the table's back legs 22 cm inside the step instead of in
+  // front of it. The throne and the pelt both still land on it.
+  f.put('dais', cx, rz + 1.02, rw * 0.32, 0.72, 0.22);
   const seat = f.put('throne', cx, rz + 0.9, 0.62, 0.5, 1.7, { variant: 1 });
   if (seat) {
-    f.put('banner', cx - 1.5, rz + 0.35, 0.16, 0.1, 2.6, { allowNearDoor: true });
-    f.put('banner', cx + 1.5, rz + 0.35, 0.16, 0.1, 2.6, { allowNearDoor: true });
+    // Hard against the -Z wall, NOT at rz + 0.35: the dais in front of them
+    // runs from rz + 0.30, so a banner centred at 0.35 stood with its foot 10 cm
+    // inside the dais slab and its collider crossing the step.
+    f.put('banner', cx - 1.5, rz + 0.12, 0.16, 0.1, 2.6, { allowNearDoor: true });
+    f.put('banner', cx + 1.5, rz + 0.12, 0.16, 0.1, 2.6, { allowNearDoor: true });
     f.dec('pelt', cx, 0.22, rz + 1.6, { scale: 1.3, variant: 1 });
   }
   // The lord's table sits across the hall in front of the seat.
@@ -1178,9 +1359,9 @@ function furnishLonghouse(f: Furnisher, main: Room): void {
   for (let z = rz + 1.4; z < rz + rd - 0.8; z += 1.9) {
     f.dec('rafter', cx, eaves, z, { len: rw - 0.1, scale: 1 });
   }
-  f.dec('sausages', cx - 0.55, eaves + 0.5, trenchZ0 + 1.0, { scale: 1.1, len: 1.6 });
-  f.dec('sausages', cx + 0.55, eaves + 0.5, trenchZ1 - 1.2, { scale: 1.0, len: 1.4 });
-  f.dec('herbs', cx - 0.8, eaves + 0.4, (trenchZ0 + trenchZ1) / 2, { scale: 1.05 });
+  f.hang('sausages', cx - 0.55, trenchZ0 + 1.0, { scale: 1.1, len: 1.6 });
+  f.hang('sausages', cx + 0.55, trenchZ1 - 1.2, { scale: 1.0, len: 1.4 });
+  f.hang('herbs', cx - 0.8, (trenchZ0 + trenchZ1) / 2, { scale: 1.05 });
 
   // --- floor: rushes everywhere, the hall is not swept
   f.scatter(['straw', 'straw', 'straw', 'straw', 'straw', 'straw', 'basket', 'crock', 'bowl', 'sack'],
@@ -1210,8 +1391,12 @@ function furnishChurch(f: Furnisher, nave: Room, chancel: Room): void {
   // The icon sits above the altar; the great window is higher still, so the
   // two do not occupy the same patch of wall.
   f.dec('icon', cx, 1.95, chancel.z + 0.09, { scale: 1.15 });
-  f.dec('window', cx, 3.55, chancel.z + 0.08, { len: 1.4, scale: 1.9, variant: 1 });
-  f.light('daylight', cx, 3.2, chancel.z + 0.7, DAYLIGHT, 9);
+  const great = f.win(chancel, 'z', -1, cx, 3.55, { len: 1.4, scale: 1.9, variant: 1 });
+  // The shaft of light comes off the window that was actually placed, not off
+  // the coordinates it was asked for: `win` pushes the head down to clear a low
+  // chancel vault, and a hand-written light stayed at 3.2 m shining out of a
+  // wall 60 cm below the glass. No window, no daylight.
+  if (great) f.light('daylight', great[0], great[1] - 0.35, great[2] + 0.62, DAYLIGHT, 9);
   f.put('lectern', cx + (f.chance(0.5) ? -1.7 : 1.7), chancel.z + chancel.d - 0.7,
     0.28, 0.28, 1.25);
   f.put('banner', chancel.x + 0.5, chancel.z + 0.4, 0.15, 0.1, 2.8, { allowNearDoor: true });
@@ -1259,14 +1444,14 @@ function furnishChurch(f: Furnisher, nave: Room, chancel: Room): void {
   const winCount = Math.max(2, Math.floor(rd / 4));
   for (let i = 0; i < winCount; i++) {
     const wz = pewZ0 + (i + 0.5) * ((pewZ1 - pewZ0) / winCount);
-    f.dec('window', rx + 0.08, 2.5, wz, { yaw: -Math.PI / 2, len: 0.75, scale: 1.6 });
-    f.dec('window', rx + rw - 0.08, 2.5, wz, { yaw: Math.PI / 2, len: 0.75, scale: 1.6 });
+    f.win(nave, 'x', -1, wz, 2.5, { len: 0.75, scale: 1.6 });
+    f.win(nave, 'x', 1, wz, 2.5, { len: 0.75, scale: 1.6 });
   }
 
   // --- hanging censer over the aisle, a rack of votives by the door
   const ceil = f.ceilAt(cx, nave.z + rd / 2);
-  f.dec('censer', cx, ceil - 0.12, chancel.z + chancel.d + 1.6, { scale: 1.1 });
-  f.dec('chandelier', cx, ceil - 0.12, nave.z + rd * 0.55, { scale: 1.05, variant: 1 });
+  f.hang('censer', cx, chancel.z + chancel.d + 1.6, { scale: 1.1 });
+  f.hang('chandelier', cx, nave.z + rd * 0.55, { scale: 1.05, variant: 1 });
   f.dec('beam', cx, ceil - 0.14, nave.z + rd * 0.3, { len: rw - 0.1 });
   f.dec('beam', cx, ceil - 0.14, nave.z + rd * 0.75, { len: rw - 0.1 });
 
@@ -1330,9 +1515,9 @@ function furnishSmithy(f: Furnisher, main: Room): void {
 
   // --- overhead: the chimney hood is part of the forge mesh; hang stock
   f.beams(rx + 0.05, rz + 1.4, rx + rw - 0.05, rz + rd - 0.05, ceil - 0.16, 2.2);
-  f.dec('lantern', cx, ceil - 0.15, rz + rd * 0.62, { scale: 0.95 }); // unlit: the forge owns the room
-  f.dec('window', rx + 0.08, 1.9, rz + rd * 0.72, { yaw: -Math.PI / 2, len: 0.9 });
-  f.dec('window', rx + rw - 0.08, 1.9, rz + rd * 0.72, { yaw: Math.PI / 2, len: 0.9 });
+  f.hang('lantern', cx, rz + rd * 0.62, { scale: 0.95 }); // unlit: the forge owns the room
+  f.win(main, 'x', -1, rz + rd * 0.72, 1.9, { len: 0.9 });
+  f.win(main, 'x', 1, rz + rd * 0.72, 1.9, { len: 0.9 });
 
   // --- the floor of a working smithy: soot, offcuts, water
   f.scatter(['coalpile', 'ingots', 'horseshoes', 'bucket', 'firewood'],
@@ -1401,9 +1586,12 @@ function furnishBarn(f: Furnisher, main: Room, loft: Room | null): void {
   for (let z = rz + 1.2; z < rz + rd - 0.6; z += 2.0) {
     f.dec('rafter', cx, ceil, z, { len: rw - 0.1, scale: 1 });
   }
-  f.lanternlight(cx, ceil - 0.2, rz + rd * 0.55, 1.05, 7);
-  f.dec('window', cx, 2.9, rz + 0.08, { len: 1.1, scale: 1.5 });
-  f.light('daylight', cx, 2.6, rz + 1.0, DAYLIGHT, 8);
+  f.lanternlight(cx, rz + rd * 0.55, 1.05, 7);
+  // Under the hay loft the ceiling is 2.15 m, so this asks for 2.9 and takes
+  // whatever fits — and if the loft leaves no wall at all, the barn gets no
+  // gable window and no daylight rather than one inside the loft floor.
+  const gable = f.win(main, 'z', -1, cx, 2.9, { len: 1.1, scale: 1.5 });
+  if (gable) f.light('daylight', gable[0], gable[1] - 0.3, gable[2] + 0.92, DAYLIGHT, 8);
   f.wallRow(['pelt', 'wallshelf'], rx + 0.12, rz + rd * 0.3, rx + 0.12, rz + rd * 0.8,
     1.6, 2, -Math.PI / 2);
 
@@ -1432,7 +1620,7 @@ function furnishGuardhouse(f: Furnisher, main: Room): void {
       { yaw: left ? 0 : Math.PI, variant: i & 1 });
     if (bunk) {
       f.dec('bedroll', bx, 0.52, bz + f.r(-0.2, 0.2), { yaw: left ? 0 : Math.PI, scale: 1 });
-      if (f.chance(0.6)) f.dec('boots', bx + (left ? 0.85 : -0.85), 0, bz + 0.5, { yaw: f.r(0, 3), scale: 0.9 });
+      if (f.chance(0.6)) f.floorDec('boots', bx + (left ? 0.85 : -0.85), bz + 0.5, { yaw: f.r(0, 3), scale: 0.9 });
     }
   }
 
@@ -1462,8 +1650,8 @@ function furnishGuardhouse(f: Furnisher, main: Room): void {
   f.wallRow(['shield', 'cloak'], rx + rw - 0.12, rz + 1.4, rx + rw - 0.12, rz + rd - 1.4,
     1.65, 2, Math.PI / 2);
   f.beams(rx + 0.05, rz + 0.05, rx + rw - 0.05, rz + rd - 0.05, ceil - 0.16, 2.0);
-  f.dec('window', rx + 0.08, 1.85, rz + rd * 0.28, { yaw: -Math.PI / 2, len: 0.55, scale: 1.2 });
-  f.dec('window', rx + rw - 0.08, 1.85, rz + rd * 0.28, { yaw: Math.PI / 2, len: 0.55, scale: 1.2 });
+  f.win(main, 'x', -1, rz + rd * 0.28, 1.85, { len: 0.55, scale: 1.2 });
+  f.win(main, 'x', 1, rz + rd * 0.28, 1.85, { len: 0.55, scale: 1.2 });
   f.scatter(['straw', 'bucket', 'sack', 'firewood'],
     rx + 0.7, rz + 1.2, rx + rw - 0.7, rz + rd - 0.9, f.ri(4, 6));
 }
@@ -1522,12 +1710,12 @@ function furnishKeep(f: Furnisher, hall: Room, dais: Room, guard: Room | null): 
     f.put('weaponrack', g.x + g.w - 0.5, g.z + g.d * 0.5, 0.18, 0.6, 1.55, { yaw: Math.PI / 2 });
     f.put('crate', g.x + g.w - 0.8, g.z + 0.7, 0.34, 0.34, 0.6);
     f.put('barrel', g.x + g.w - 0.75, g.z + g.d - 0.8, 0.3, 0.3, 0.9);
-    f.dec('window', g.x + g.w - 0.08, 1.8, g.z + g.d * 0.35, { yaw: Math.PI / 2, len: 0.7 });
+    f.win(g, 'x', 1, g.z + g.d * 0.35, 1.8, { len: 0.7 });
     f.scatter(['straw', 'bucket', 'sack'], g.x + 0.6, g.z + 0.6, g.x + g.w - 0.6, g.z + g.d - 0.6, 3);
   }
 
   // --- height: banners high on the walls, a chandelier over the table
-  f.dec('chandelier', cx, ceil - 0.15, hall.z + hall.d * 0.45, { scale: 1.4, variant: 1 });
+  f.hang('chandelier', cx, hall.z + hall.d * 0.45, { scale: 1.4, variant: 1 });
   f.beams(hall.x + 0.05, hall.z + 0.05, hall.x + hall.w - 0.05, hall.z + hall.d - 0.05,
     ceil - 0.2, 2.6);
   f.wallRow(['shield', 'pelt', 'antlers'], hall.x + 0.12, hall.z + 1.6,
@@ -1536,8 +1724,8 @@ function furnishKeep(f: Furnisher, hall: Room, dais: Room, guard: Room | null): 
     hall.x + hall.w - 0.12, hall.z + hall.d - 1.6, 2.3, 3, Math.PI / 2, 1.15);
   for (let i = 0; i < 3; i++) {
     const wz = hall.z + hall.d * (0.28 + i * 0.24);
-    f.dec('window', hall.x + 0.08, 3.4, wz, { yaw: -Math.PI / 2, len: 0.8, scale: 1.8 });
-    f.dec('window', hall.x + hall.w - 0.08, 3.4, wz, { yaw: Math.PI / 2, len: 0.8, scale: 1.8 });
+    f.win(hall, 'x', -1, wz, 3.4, { len: 0.8, scale: 1.8 });
+    f.win(hall, 'x', 1, wz, 3.4, { len: 0.8, scale: 1.8 });
   }
   f.scatter(['straw', 'firewood', 'basket'],
     hall.x + 0.8, hall.z + hall.d * 0.6, hall.x + hall.w - 0.8, hall.z + hall.d - 0.9, f.ri(3, 6));
@@ -1786,7 +1974,7 @@ export function generateBuildingInterior(
   }
 
   // --- furnish -------------------------------------------------------------
-  const f = new Furnisher(g, rng, door.cells, door.spawn);
+  const f = new Furnisher(g, rng, door.cells, door.spawn, gable);
   furnish(f);
 
   // --- keep the interior walkable ------------------------------------------
@@ -2013,4 +2201,116 @@ function trimLights(lights: LightSource[], spawn: readonly [number, number, numb
     .slice(0, MAX_INTERIOR_LIGHTS)
     .sort((a, b) => a.i - b.i);
   return sorted.map((s) => s.l);
+}
+
+// ---------------------------------------------------------------------------
+// Standing room
+// ---------------------------------------------------------------------------
+
+/** Half a body's width — how far a person keeps off the furniture. */
+const BODY_RADIUS = 0.45;
+/** Keep the doorway walkable: nobody stands within this of a door cell (m). */
+const MIN_DOOR_GAP = 2.5;
+/** People do not stand inside one another (m). */
+const MIN_SPACING = 1.8;
+/**
+ * How close the player must be able to get for the spot to be usable (m).
+ * Slightly under the E-key reach of 3 m, for margin.
+ *
+ * Note this is deliberately NOT "must be walk-reachable". A shopkeeper stands
+ * BEHIND the counter, and the counter is a collider, so their cell is not one
+ * the player can walk onto — and it is exactly where they belong. What matters
+ * is that the player can get within talking distance of them, which also rules
+ * out the failure this replaced: an occupant sealed in a pocket of floor with
+ * furniture across the only way in, visible through the room and impossible to
+ * speak to.
+ */
+const MAX_TALK_REACH = 2.5;
+
+/**
+ * Up to `count` places inside an interior where a person can plausibly stand:
+ * floor cells clear of furniture, away from the doorway, and spread apart.
+ * Returns LOCAL (x, z) at cell centres; callers add the arena origin.
+ *
+ * Deterministic. Cells are visited in a fixed order and `seed` only chooses
+ * where in that order to start, so the keeper is behind the same bar on every
+ * visit, while different buildings do not all put their occupant in the same
+ * corner.
+ */
+export function standingSpots(
+  interior: BuildingInterior, count: number, seed: number,
+): [number, number][] {
+  if (count <= 0) return [];
+
+  const cells: [number, number][] = [];
+  for (let cz = 0; cz < interior.gridD; cz++) {
+    for (let cx = 0; cx < interior.gridW; cx++) {
+      if (interior.cells[cz * interior.gridW + cx] !== CELL_FLOOR) continue;
+      cells.push([cx, cz]);
+    }
+  }
+  if (cells.length === 0) return [];
+
+  // Where the player can actually get to, so we never seat somebody in a
+  // pocket of floor they can be seen in but never spoken to.
+  const reachable = reachableFloorCells(interior);
+
+  // Visit cells NEAREST the entrance first.
+  //
+  // The first version scanned in row-major order from a seeded offset and took
+  // the first cell that fitted, which put the occupant wherever the scan
+  // happened to land — measured in game, the householder stood 8.7 m away in
+  // the far corner of his own house, so walking in felt like finding an empty
+  // room with someone loitering at the back. Ranking by distance from the door
+  // puts them in the part of the room you actually arrive in. The seed still
+  // varies the choice, but only among cells at a similar distance (banded to
+  // 1 m), so buildings differ without anyone ending up in a back corner.
+  const doorX = interior.spawnPoint[0], doorZ = interior.spawnPoint[2];
+  const jitter = (cx: number, cz: number): number => {
+    const h = Math.imul(cx * 73856093 ^ cz * 19349663 ^ seed * 83492791, 0x2545f491);
+    return ((h >>> 8) & 0xffff) / 0xffff;
+  };
+  const ranked = cells
+    .map(([cx, cz]) => {
+      const d = Math.hypot(cx + 0.5 - doorX, cz + 0.5 - doorZ);
+      return { cx, cz, band: Math.floor(d), j: jitter(cx, cz) };
+    })
+    .sort((a, b) => (a.band - b.band) || (a.j - b.j) ||
+      (a.cz - b.cz) || (a.cx - b.cx));
+
+  const spots: [number, number][] = [];
+  for (let n = 0; n < ranked.length && spots.length < count; n++) {
+    const { cx, cz } = ranked[n];
+    const lx = cx + 0.5, lz = cz + 0.5;
+
+    let bad = false;
+    for (const [dx, dz] of interior.doorCells) {
+      if (Math.hypot(lx - (dx + 0.5), lz - (dz + 0.5)) < MIN_DOOR_GAP) { bad = true; break; }
+    }
+    if (bad) continue;
+
+    for (const f of interior.furniture) {
+      const b = f.aabb;
+      if (lx > b.minX - BODY_RADIUS && lx < b.maxX + BODY_RADIUS &&
+          lz > b.minZ - BODY_RADIUS && lz < b.maxZ + BODY_RADIUS) { bad = true; break; }
+    }
+    if (bad) continue;
+
+    for (const s of spots) {
+      if (Math.hypot(lx - s[0], lz - s[1]) < MIN_SPACING) { bad = true; break; }
+    }
+    if (bad) continue;
+
+    let speakable = false;
+    for (const [rx, rz] of reachable) {
+      if (Math.hypot(lx - (rx + 0.5), lz - (rz + 0.5)) <= MAX_TALK_REACH) {
+        speakable = true;
+        break;
+      }
+    }
+    if (!speakable) continue;
+
+    spots.push([lx, lz]);
+  }
+  return spots;
 }

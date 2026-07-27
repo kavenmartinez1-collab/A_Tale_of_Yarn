@@ -2,7 +2,7 @@
 // materials.wgsl — bakes the procedural material atlas at boot.
 //
 // The game ships no texture assets, so every surface is synthesised here into
-// two mipmapped rgba8 texture arrays (16 layers):
+// two mipmapped rgba8 texture arrays (MATERIAL_COUNT layers):
 //   matAlbedo: rgb = base colour, a = roughness
 //   matNormal: rg  = tangent-space normal xy, b = cavity AO, a = spec mask
 //
@@ -515,6 +515,74 @@ fn matHorn(uv: vec2<f32>, lod: f32) -> MatSample {
   return mk(c, mix(0.52, 0.34, rings), h, mix(0.78, 1.0, rings), 0.55);
 }
 
+// 20 — quilted ashlar: blocks of pressed felt whipped together at the joints.
+//
+// Castle Vhaeron is the one building every player sees first and last, and it
+// was the only thing in a world of knitted dolls that read as photographed
+// masonry. This lays down the SAME running bond `matBrick` does — so from the
+// hillside it is still a coursed wall and still a fortress — with the two marks
+// that make a thing hand-made: the joints are seams with a cross-stitch across
+// them instead of mortar, and the block faces are matted fibre with a slub in
+// them instead of pitted rock.
+//
+// The mean luminance is held near `matBrick`'s on purpose. The interior path in
+// dungeon.wgsl scales albedo by `luminance(surf) / 0.33`, so a darker bake here
+// would have quietly halved every torch-lit room in the castle — the exact
+// "getting both would want a separate interior palette" trap. Darkness comes
+// from the palette value, not from the texture.
+fn matQuilt(uv: vec2<f32>, lod: f32) -> MatSample {
+  let rows = 6.0;
+  let cols = 3.0;
+  let ry = uv.y * rows;
+  let row = floor(ry);
+  let fy = fract(ry);
+  let offset = select(0.0, 0.5, fract(row * 0.5) > 0.25);
+  let rx = uv.x * cols + offset;
+  let col = floor(rx);
+  let fx = fract(rx);
+  let id = phash(vec2<f32>(col, row), 64.0);
+
+  // Seam channels. Wider and softer-edged than `matBrick`'s mortar, because a
+  // sewn joint is the valley between two stuffed panels, not a flat band of a
+  // different substance laid between them.
+  let seamY = smoothstep(0.0, 0.090, fy) * smoothstep(1.0, 0.910, fy);
+  let seamX = smoothstep(0.0, 0.052, fx) * smoothstep(1.0, 0.948, fx);
+  let block = seamY * seamX;
+
+  // Cross-stitches over the seams: a dash every 1/sN of the joint, running
+  // across it. Band-limited out of the coarse mips — a hard dash left in a mip
+  // where it is finer than a texel is what turns a seam into crawling static at
+  // distance, which is the same lesson `pfbm` encodes for its octaves.
+  let sN = 13.0;
+  let sBand = smoothstep(lod * 1.5, lod * 4.5, 1.0 / (cols * sN));
+  let dashH = smoothstep(0.34, 0.13, abs(fract(rx * sN) - 0.5))
+    * (1.0 - seamY) * seamX;
+  let dashV = smoothstep(0.34, 0.13, abs(fract(ry * sN * 0.55) - 0.5))
+    * (1.0 - seamX);
+  let stitch = clamp(dashH + dashV, 0.0, 1.0) * sBand;
+
+  // The face of one block: pressed fibre, a slub, and a slight pillow across
+  // the middle. `matte` also drives the per-block tone so no two panels in a
+  // course were cut from the same bolt.
+  let matte = pfbm(uv, 26.0, 4, lod);
+  let fibre = pnoise(vec2<f32>(uv.x * 96.0 + id * 30.0, uv.y * 84.0), 96.0);
+
+  var c = mix(vec3<f32>(0.300, 0.292, 0.286),
+              vec3<f32>(0.530, 0.516, 0.492), id * 0.62 + matte * 0.38);
+  c = c * (0.90 + 0.20 * fibre);
+  let seamCol = vec3<f32>(0.150, 0.144, 0.148) * (0.85 + 0.30 * matte);
+  c = mix(seamCol, c, block);
+  // Thread lies flat across the joint, so it is the one thing here that catches
+  // a highlight — which is what stops the stitches reading as painted marks.
+  c = mix(c, vec3<f32>(0.640, 0.622, 0.586) * (0.86 + 0.24 * fibre),
+          stitch * 0.80);
+
+  let dome = block * (0.55 + 0.28 * matte) * (1.0 - 0.22 * fibre);
+  let h = dome + stitch * 0.40;
+  return mk(c, mix(0.99, 0.90, block) - stitch * 0.10, h,
+            mix(0.44, 1.0, block), 0.03 + stitch * 0.10);
+}
+
 fn evalMaterial(layer: u32, uv: vec2<f32>, lod: f32) -> MatSample {
   switch (layer) {
     case 0u:  { return matGrass(uv, lod); }
@@ -536,7 +604,8 @@ fn evalMaterial(layer: u32, uv: vec2<f32>, lod: f32) -> MatSample {
     case 16u: { return matKnit(uv, lod); }
     case 17u: { return matFelt(uv, lod); }
     case 18u: { return matBone(uv, lod); }
-    default:  { return matHorn(uv, lod); }
+    case 19u: { return matHorn(uv, lod); }
+    default:  { return matQuilt(uv, lod); }
   }
 }
 

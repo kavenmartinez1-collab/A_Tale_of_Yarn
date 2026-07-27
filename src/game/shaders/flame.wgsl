@@ -2,6 +2,14 @@
 // flame.wgsl — every fire surface in the game, drawn as instanced billboards
 // in a single additive draw call. Fed by render/fire-fx.ts.
 //
+// It also carries the one thing in the world that is not a fire: the Tintreach
+// lightning bolt (kind 4, fed by render/bolt-fx.ts). That rides here rather
+// than in a pipeline of its own because it wants exactly the same treatment —
+// axis-stretched additive billboards, HDR, depth-tested, never depth-writing,
+// drawn before post so it feeds bloom, and out of the shadow cascades. See the
+// note at the top of render/bolt-fx.ts for why a second pipeline was the wrong
+// answer. Its own art direction note is there too.
+//
 // ART DIRECTION — the deliberate decision, stated once, here.
 // This world is knitted and felted (see project_art_direction_yarn), so its
 // fire is CUT AND STITCHED, not gaseous. A realistic turbulent plume would be
@@ -42,7 +50,10 @@
 struct FireInstance {
   /** xyz world anchor, w half-height along the tongue axis (metres). */
   a: vec4<f32>,
-  /** x life 0..1 (0 = newborn/hottest, 1 = spent), y seed, z kind, w power. */
+  /**
+   * x life 0..1 (0 = newborn/hottest, 1 = spent), y seed, z kind, w power.
+   * For kind 4 (bolt) x is instead `layer + taper` — read with floor/fract.
+   */
   b: vec4<f32>,
   /** xyz tongue axis (unit length; all-zero means world up), w width/height. */
   c: vec4<f32>,
@@ -82,7 +93,7 @@ fn vs_main(
   var centre = anchor;
   var halfUp = halfH;
 
-  if (kind > 2.5) {
+  if (kind > 2.5 && kind < 3.5) {
     // Coal bed: a disc lying flat in the fire pit, not a billboard at all.
     up = vec3<f32>(0.0, 0.0, 1.0);
     right = vec3<f32>(1.0, 0.0, 0.0);
@@ -306,7 +317,7 @@ fn fs_main(in: VSOut) -> SceneOut {
     alpha = clamp(cover * softFade(in.pos, in.eyeDist, 0.8), 0.0, 1.0);
     rgb = col * alpha;  // premultiplied
 
-  } else {
+  } else if (kind < 3.5) {
     // ---- coal bed: felted charcoal with hot seams -------------------------
     let r = length(in.uv);
     if (r > 1.0) { discard; }
@@ -319,6 +330,72 @@ fn fs_main(in: VSOut) -> SceneOut {
     rgb = yarnFireRamp(0.20 + seam * 0.52) * disc * (0.25 + seam * 1.45)
         * breathe * power * 3.0
         * softFade(in.pos, in.eyeDist, 0.30);
+
+  } else {
+    // ---- Tintreach: a seam of lightning stitched through the air ----------
+    //
+    // Four layers, packed into `parm.x` as `layer + taper` so a bolt segment
+    // costs no more instance data than a flame tongue. See render/bolt-fx.ts
+    // for the art-direction note; the short version is that this is a COUCHED
+    // THREAD, not a plasma arc — running-stitch dashes in thread-cream over a
+    // linen sheath over a woad-indigo wash, knotted at the kinks.
+    //
+    // `power` arrives at up to 48 (core) and 86 (knot). That is deliberate:
+    // the flash pulls the frame's exposure down to ~0.32, and the seam has to
+    // still hard-clip to white after that multiply and after ACES, or the
+    // "blinding" bolt turns grey exactly when the screen goes dark.
+    let lv = floor(in.parm.x);
+    let taper = in.parm.x - lv;
+    let u = in.uv.x;
+    let v = in.uv.y;
+
+    // Thread-cream #f0e6c8 pushed hot; linen; woad indigo.
+    let CREAM = vec3<f32>(1.00, 0.955, 0.80);
+    let LINEN = vec3<f32>(0.72, 0.84, 1.00);
+    let WOAD  = vec3<f32>(0.26, 0.40, 1.00);
+
+    if (lv < 0.5) {
+      // GLOW — the wide soft wash. The only layer that soft-fades against
+      // geometry: it is what pools on the ground where the bolt lands, and
+      // without the fade it cuts a hard rectangle into the dirt. The crisp
+      // layers above deliberately do NOT fade, so the seam still terminates
+      // sharply on the surface it struck.
+      let a = exp(-3.4 * u * u) * pow(max(0.0, 1.0 - v * v), 0.8);
+      rgb = WOAD * a * taper * power * softFade(in.pos, in.eyeDist, 1.2);
+
+    } else if (lv < 1.5) {
+      // HALO — linen sheath with loose fibre striation, woad at the edges.
+      let a = exp(-7.0 * u * u) * pow(max(0.0, 1.0 - v * v), 0.55);
+      let fibre = 0.72 + 0.28 * sin(u * 26.0 + v * 7.0 + seed * 31.0);
+      let col = mix(LINEN, WOAD, clamp(abs(u) * 1.15, 0.0, 1.0));
+      rgb = col * a * fibre * taper * power;
+
+    } else if (lv < 2.5) {
+      // CORE — one dash of the running stitch. The dash BULGES AND PINCHES
+      // three times along its length, which is what plied yarn does and what
+      // stops the seam reading as a drawn vector line. Ends taper to points so
+      // the gaps between dashes look sewn rather than chopped.
+      let s = v * 0.5 + 0.5;
+      let twist = 0.80 + 0.20 * cos(s * TAU * 3.0 + seed * TAU);
+      let w = twist * (1.0 - pow(abs(v), 6.0));
+      let d = abs(u) - w;
+      let cut = smoothstep(px, -px, d);
+      let fibre = exp(-max(d, 0.0) * 6.0);
+      if (cut + fibre < 0.004) { discard; }
+      rgb = mix(CREAM, vec3<f32>(1.0), 0.45) * (cut + fibre * 0.35)
+          * taper * power;
+
+    } else {
+      // KNOT — a French knot with six loose fibres, the reticle's own motif.
+      let r = length(in.uv);
+      if (r > 1.0) { discard; }
+      let ang = atan2(in.uv.y, in.uv.x);
+      let fib = 0.62 + 0.38 * cos(ang * 6.0 + seed * 41.0);
+      let core = smoothstep(0.60, 0.0, r);
+      let halo = exp(-r * 2.6) * fib;
+      rgb = mix(CREAM, vec3<f32>(1.0), 0.6) * (core * 1.9 + halo * 0.8)
+          * taper * power;
+    }
   }
 
   var out: SceneOut;

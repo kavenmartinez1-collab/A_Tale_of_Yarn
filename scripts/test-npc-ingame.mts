@@ -86,6 +86,36 @@ try {
   else ok('NPC model finished loading');
   await page.waitForTimeout(3000); // warm prefill settles
 
+  // ---- get within actual talking range ------------------------------------
+  // teleportToNearestNpc() puts the player at the NPC's street position, and
+  // that position can sit inside a building — where E means "leave the room"
+  // and nearestNpc() returns null, which looks exactly like "there is nobody
+  // here". The settlement layout moved and this test started failing with
+  // `interactPrompt was: "Press E to leave"` while the feature worked fine.
+  //
+  // So: try candidates in turn and gate on the game's OWN interact prompt,
+  // which is built from the same ranked chain the E key runs. If it does not
+  // say "talk to", E will do something else, and pressing it proves nothing.
+  const reached = await page.evaluate(async () => {
+    const d = (window as any).__gameDebug;
+    // A headless page that cannot take pointer lock can end up on the pause
+    // screen, which suppresses the interact prompt entirely.
+    if (d.paused?.() === true) d.setPaused(false);
+    const homes = (d.npcHomes() as
+      { id: string; name: string; x: number; z: number; indoors: boolean; inArena: boolean }[])
+      .filter((h) => !h.indoors || h.inArena);
+    for (const cand of homes) {
+      d.teleport(cand.x + 2.5, cand.z + 2.5);
+      d.teleportToNearestNpc();
+      await new Promise((r) => setTimeout(r, 700));  // interactPrompt ticks at 2 Hz
+      const prompt = (d.interactPrompt() ?? '') as string;
+      if (d.nearestNpc() !== null && /talk to/.test(prompt)) return prompt;
+    }
+    return null;
+  });
+  if (reached === null) fail('could not get within talking range of any NPC');
+  else ok(`in range: ${JSON.stringify(reached)}`);
+
   // ---- open the chat panel with the real interact key ---------------------
   await page.keyboard.press('KeyE');
   const panel = page.locator('#npc-chat-panel');

@@ -12,6 +12,11 @@
 //  12 iron   13 blue wool  14 green wool  15 clay      16 leather
 //  17 brass  18 soot       19 pale timber 20 beeswax   21 felt wall
 //  22 window pane*
+// 23..31 were appended for Castle Vhaeron, same rule:
+//  23 ashlar 24 basalt     25 crimson felt 26 black felt 27 red glass*
+//  28 slate  29 bone       30 voidstone    31 gravestone
+// 30/31 are the castle's EXTERIOR pair: the mass and its dressings. They exist
+// so the outside can be black without dragging the interiors down with it.
 //
 // lights.count.y is a "cozy interior" ambient floor: 0 = dungeon (faint
 // ambient, dark dense fog), 1 = fully lifted. Building interiors pick a value
@@ -79,7 +84,42 @@ fn palette(index: f32) -> vec3<f32> {
   if (index < 21.5) { return vec3<f32>(0.84, 0.78, 0.68); } // limewashed felt wall
   // Emissive, so this value is pre-multiplier: x4 lands near 1.0 and blooms
   // gently, where palette 3 punches a white hole through the wall.
-  return vec3<f32>(0.24, 0.31, 0.40);                      // daylight window pane
+  if (index < 22.5) { return vec3<f32>(0.24, 0.31, 0.40); } // daylight window pane
+  // 23..29: Castle Vhaeron. Appended, never reordered — the CPU mirror in
+  // render/material-table.ts and castle/castle-layout.ts index these by name.
+  // Ashlar is now an INTERIOR value: it faces the halls, the wings and every
+  // floor slab, and none of that is seen through 200 m of haze. It reads a
+  // shade under the old 0.355 only because CRAFTSTONE's tint weight went 0.8 ->
+  // 0.94, which took away the baked layer's contribution to the same total.
+  if (index < 23.5) { return vec3<f32>(0.322, 0.310, 0.344); } // ashlar
+  if (index < 24.5) { return vec3<f32>(0.105, 0.098, 0.118); } // black basalt
+  if (index < 25.5) { return vec3<f32>(0.430, 0.050, 0.068); } // crimson felt
+  if (index < 26.5) { return vec3<f32>(0.072, 0.062, 0.078); } // black felt
+  // Emissive; x1.9 lands a touch over 1.0 so the lancets bloom at dusk.
+  if (index < 27.5) { return vec3<f32>(0.780, 0.135, 0.075); } // red glass
+  // Slate went with the mass. Spires that stayed at 0.190 while the walls under
+  // them dropped to 0.078 read as pale hats on a black keep.
+  if (index < 28.5) { return vec3<f32>(0.108, 0.106, 0.140); } // slate
+  if (index < 29.5) { return vec3<f32>(0.760, 0.730, 0.640); } // bone
+  // 30..31: the castle's EXTERIOR palette, and the reason it exists.
+  //
+  // Every exterior surface used to be ashlar, which is an interior value seen
+  // in daylight through aerial haze — from the hillside that reads as a royal
+  // palace in light grey, not as the fortress of a man in black armour. These
+  // two are only ever used outdoors, so they can be pitched for the far view
+  // without making a single torch-lit room murkier.
+  //
+  // Overshot deliberately. Haze lifts distant geometry toward the sky value, so
+  // a value chosen to look right at the gate is pale again at 260 m; 0.078 is
+  // near-black up close, which is what it takes to still be black from the
+  // hillside. What keeps it from being a silhouette is `gravestone`, three
+  // times its value, on every course, corbel, merlon cap and door surround.
+  if (index < 30.5) { return vec3<f32>(0.078, 0.074, 0.094); } // voidstone
+  // Gravestone is 2.7x voidstone and no more. It was 0.238 and from up on the
+  // keep roof — where the machicolation corbels fill half the frame — that read
+  // as a grey castle with black inserts rather than the other way round. It is
+  // also the open decks (wall-walk aside), and a deck takes the whole sky.
+  return vec3<f32>(0.208, 0.199, 0.230);                       // gravestone
 }
 
 /**
@@ -112,7 +152,18 @@ fn paletteMaterialId(index: f32, surface: bool) -> i32 {
   if (index < 19.5) { return MAT_ID_WOOD; }
   if (index < 20.5) { return MAT_ID_CLOTH; }        // wax reads as matte tallow
   if (index < 21.5) { return MAT_ID_FELT; }         // interior walls are felt
-  return MAT_ID_PORTAL;                             // window pane: soft daylight
+  if (index < 22.5) { return MAT_ID_PORTAL; }       // window pane: soft daylight
+  // 23..31: Castle Vhaeron. Every stone tone it owns samples the one QUILT
+  // layer and differs only in palette value — five stone tones for the price of
+  // one baked layer, which is the whole point of the material table. They are
+  // NOT MASONRY: brick-in-mortar is right for a settlement wall and it was the
+  // only surface in a world of knitted dolls that read as photographed stone.
+  if (index < 24.5) { return MAT_ID_CRAFTSTONE; }   // ashlar / black basalt
+  if (index < 26.5) { return MAT_ID_FELT; }         // crimson / black felt
+  if (index < 27.5) { return MAT_ID_GLASS_HOT; }    // red glass in the lancets
+  if (index < 28.5) { return MAT_ID_CRAFTSLATE; }   // slate roofs and spires
+  if (index < 29.5) { return MAT_ID_BONE; }         // the dragon's feeding yard
+  return MAT_ID_CRAFTSTONE;                         // voidstone / gravestone
 }
 
 /** Torch point lights: inverse-square falloff windowed to a finite radius. */

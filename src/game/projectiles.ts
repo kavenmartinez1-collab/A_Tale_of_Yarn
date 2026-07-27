@@ -83,6 +83,18 @@ export interface Projectile {
   anchorId: string | null;
   /** Offset from the anchor's origin, captured at the moment of impact. */
   ax: number; ay: number; az: number;
+  /**
+   * Where it was fired from, world XZ.
+   *
+   * Kept so a caller can ask "could the shooter see this target" rather than
+   * "can the arrow see it from where it is now". Underground those are
+   * different questions and only the first one is safe: `cellLineOfSight`
+   * ignores solid cells within 0.75 m of either endpoint, so an arrow that has
+   * already crossed most of a 2 m gap is too close to its target for the sight
+   * test to find the wall between them — and the hit radius (2.16 m for a
+   * Dread King) reaches through it anyway.
+   */
+  ox: number; oz: number;
   /** Monotonic spawn counter — oldest-first eviction when the pool is full. */
   seq: number;
 }
@@ -109,6 +121,20 @@ export interface ProjectileHooks {
    * null when nothing was hit.
    */
   resolveHit(p: Projectile): ProjectileHit | null;
+  /**
+   * True when a world point is inside static geometry an arrow cannot pass —
+   * dungeon walls and ceilings.
+   *
+   * Optional, and absent means open world. It exists because `heightAt` cannot
+   * express a dungeon: underground the caller feeds it a flat floor plane, and
+   * a plane says nothing about the metre of rock standing between two rooms.
+   * Without this, every arrow either side of that wall — the player's and the
+   * goblin archer's alike — flew straight through it and hit whatever was on
+   * the other side. That was the exact mirror of the melee bug in
+   * `dungeon-combat.ts`, and it is fixed here rather than at the call site so
+   * BOTH teams' projectiles are covered by one test.
+   */
+  solidAt?(x: number, y: number, z: number): boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +146,7 @@ function blankSlot(): Projectile {
     active: false, kind: 'arrow', team: 'player',
     x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, dx: 0, dy: 0, dz: -1,
     damage: 0, bornS: 0, stuck: false, expireS: 0,
-    anchorId: null, ax: 0, ay: 0, az: 0, seq: 0,
+    anchorId: null, ax: 0, ay: 0, az: 0, ox: 0, oz: 0, seq: 0,
   };
 }
 
@@ -137,6 +163,14 @@ export interface SpawnInit {
   vx: number; vy: number; vz: number;
   damage: number;
   nowS: number;
+  /**
+   * Where the shot came FROM, world XZ, when that is not where it spawns.
+   *
+   * Only a hitscan needs it: a Tintreach bolt spawns AT the mark, so its own
+   * position is useless as an answer to 'could the shooter see this'. Defaults
+   * to the spawn point, which is correct for everything that flies.
+   */
+  ox?: number; oz?: number;
 }
 
 /**
@@ -170,6 +204,7 @@ export function spawnProjectile(pool: ProjectilePool, init: SpawnInit): Projecti
   slot.expireS = 0;
   slot.anchorId = null;
   slot.ax = 0; slot.ay = 0; slot.az = 0;
+  slot.ox = init.ox ?? init.x; slot.oz = init.oz ?? init.z;
   slot.seq = pool.seq++;
   // Reset the heading before orienting: a zero-velocity spawn (the
   // `injectProjectile` debug hook does exactly this) leaves orientToVelocity
@@ -265,11 +300,32 @@ export function stepProjectiles(
       continue;
     }
 
+    const px = p.x, py = p.y, pz = p.z;
     p.vy -= PROJECTILE_GRAVITY * dtS;
     p.x += p.vx * dtS;
     p.y += p.vy * dtS;
     p.z += p.vz * dtS;
     orientToVelocity(p);
+
+    // Masonry BEFORE the creature test, so an arrow cannot pass through a wall
+    // and hit whatever stands 0.8 m behind it. A step is at most v*dt — 0.6 m
+    // at the fastest draw — and a dungeon wall is a full 1 m cell, so nothing
+    // can tunnel one; testing the new position is sufficient.
+    if (hooks.solidAt !== undefined && hooks.solidAt(p.x, p.y, p.z)) {
+      // Back the shaft out to the last open point of THIS step, so it stands
+      // in the wall face rather than buried inside the stone.
+      let lo = 0, hi = 1;
+      for (let i = 0; i < 5; i++) {
+        const m = (lo + hi) * 0.5;
+        if (hooks.solidAt(px + (p.x - px) * m, py + (p.y - py) * m, pz + (p.z - pz) * m)) hi = m;
+        else lo = m;
+      }
+      p.x = px + (p.x - px) * lo;
+      p.y = py + (p.y - py) * lo;
+      p.z = pz + (p.z - pz) * lo;
+      stickProjectile(p, null, nowS);
+      continue;
+    }
 
     const hit = hooks.resolveHit(p);
     if (hit !== null) {

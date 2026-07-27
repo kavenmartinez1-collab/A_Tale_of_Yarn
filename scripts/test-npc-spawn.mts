@@ -24,7 +24,39 @@ import type { SettlementKind } from '../src/game/settlement/settlement-scatter';
 // waypoints are derived from pad positions, and every layout was recomposed
 // onto streets and squares.
 // Previous: 0xe2026ae7
-const GOLDEN_NPC_SPAWN_HASH: number | null = 0x0a2bc963;
+// Rebaked when NPCs gained a home building they can actually be inside.
+// Two deliberate changes moved every settlement's assignment:
+//   1. `homePadIndex` is now recorded on each NPC (the join key the building
+//      manager enters interiors by).
+//   2. Public buildings are STAFFED. Every village, town and castle is laid
+//      out with a tavern, church, smithy and longhouse, and across 120
+//      settlements exactly zero of them had an occupant — you could rent a bed
+//      from a tavern with nobody in it. A small keeper budget (planned/3, at
+//      least 1) now fills them in player-relevance order, so a village staffs
+//      its tavern, a town its tavern and smithy.
+// Previous: 0x0a2bc963
+// Rebaselined by the population pass: the world was measurably empty and the
+// counts here were the cause. Over a 576-cell sweep of seed 1337 the whole
+// world held 307 people — a castle averaged 8.1, a town 7.1, a village 4.1 and
+// a ranch 1.5, and 54% of all settlements had nobody in them at all. The
+// counts read like placeholders because they were: a castle with eight people
+// is not a castle, and world spawn is a forced castle, so every direction the
+// player travelled was emptier than where they started.
+//
+// Three deliberate changes move every settlement's roster:
+//   1. `rolePlanFor` is resized from the HOUSING STOCK the layouts already
+//      build — a village has six houses, a town fifteen dwellings and six
+//      market stalls, a castle twelve dwellings plus four towers, a gatehouse,
+//      a keep and a jail. The buildings were always there; nobody lived in
+//      them. Now ranch 2-4, village 5-9, town 11-16, castle 15-21.
+//   2. Villagers count `townhouse` as a house. Towns are built from ten
+//      townhouses and five houses, and matching only 'house' crowded every
+//      resident into a third of the dwellings.
+//   3. Ruins get squatters about a third of the time. They were 54% of the
+//      world and contained nothing whatsoever.
+// Net over the same sweep: 307 -> 842 people, empty settlements 54% -> 25%.
+// Previous: 0x13dd9131
+const GOLDEN_NPC_SPAWN_HASH: number | null = 0xabfb597a;
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -60,8 +92,33 @@ function fnv1aStr(s: string): number {
 // 1. Basic presence / absence per kind
 // ---------------------------------------------------------------------------
 
-check('ruins produce no NPCs',
-  spawnSettlementNpcs('ruins', 1234, layoutSettlement('ruins', 1234)).length === 0);
+// Ruins are mostly, but no longer always, empty. They are the commonest thing
+// in the world, and "a ruin is deserted" is the right character for one while
+// "over half of everything you find contains nothing" is not. About a third
+// hold squatters, so this is a distribution check rather than a point check —
+// a point check on one seed would pass whatever the rate had drifted to.
+{
+  let occupied = 0;
+  let people = 0;
+  for (let s = 0; s < 200; s++) {
+    const npcs = spawnSettlementNpcs('ruins', s * 1013 + 7,
+      layoutSettlement('ruins', s * 1013 + 7));
+    if (npcs.length > 0) occupied++;
+    people += npcs.length;
+    if (npcs.length > 2) { occupied = -1; break; }
+  }
+  check('ruins hold at most two squatters', occupied >= 0);
+  check('most ruins are deserted', occupied > 0 && occupied < 200 * 0.5,
+    `${occupied}/200 occupied`);
+  check('some ruins are not', occupied > 200 * 0.2, `${occupied}/200 occupied`);
+  // A squatter has no home: nothing in a ruin has a door that opens, and -1 is
+  // what keeps them out of the indoor/arena machinery entirely.
+  const squatters = spawnSettlementNpcs('ruins', 7 * 1013 + 7,
+    layoutSettlement('ruins', 7 * 1013 + 7));
+  check('ruins squatters have no home pad',
+    squatters.every((n) => n.homePadIndex === -1));
+  check('ruins squatters exist somewhere in the sweep', people > 0, `${people}`);
+}
 
 for (const kind of ['ranch', 'village', 'town', 'castle'] as SettlementKind[]) {
   const layout = layoutSettlement(kind, 42);
@@ -74,46 +131,94 @@ for (const kind of ['ranch', 'village', 'town', 'castle'] as SettlementKind[]) {
 // 2. Counts by kind (check min bounds from spec)
 // ---------------------------------------------------------------------------
 
+// Bounds are checked over MANY seeds, not one. A single seed lands somewhere
+// inside the range and cannot tell a changed range from a changed roll, which
+// is how "town: exactly 2 guards" survived the guard count becoming 2-3.
+function spread(kind: SettlementKind): { lo: number; hi: number } {
+  let lo = Infinity;
+  let hi = 0;
+  for (let s = 0; s < 200; s++) {
+    const seed = s * 4099 + 11;
+    const n = spawnSettlementNpcs(kind, seed, layoutSettlement(kind, seed)).length;
+    if (n < lo) lo = n;
+    if (n > hi) hi = n;
+  }
+  return { lo, hi };
+}
+
 {
+  // A farmstead is a household: the farmer has a family, so it is no longer
+  // all farmers.
+  const r = spread('ranch');
+  check('ranch: 2-4 people', r.lo === 2 && r.hi === 4, `got ${r.lo}-${r.hi}`);
   const ranchNpcs = spawnSettlementNpcs('ranch', 99, layoutSettlement('ranch', 99));
-  check('ranch: 1-2 NPCs', ranchNpcs.length >= 1 && ranchNpcs.length <= 2,
-    `got ${ranchNpcs.length}`);
-  check('ranch: all farmers', ranchNpcs.every((n) => n.role === 'farmer'),
+  check('ranch: has a farmer', ranchNpcs.some((n) => n.role === 'farmer'),
     ranchNpcs.map((n) => n.role).join(','));
 }
 
 {
+  const v = spread('village');
+  check('village: 5-9 people', v.lo === 5 && v.hi === 9, `got ${v.lo}-${v.hi}`);
   const vilNpcs = spawnSettlementNpcs('village', 100, layoutSettlement('village', 100));
-  check('village: 3-5 NPCs', vilNpcs.length >= 3 && vilNpcs.length <= 5,
-    `got ${vilNpcs.length}`);
   const roles = vilNpcs.map((n) => n.role);
   check('village: has villager', roles.includes('villager'));
   check('village: has merchant', roles.includes('merchant'));
+  check('village: has farmer', roles.includes('farmer'));
 }
 
 {
+  const t = spread('town');
+  check('town: 11-16 people', t.lo === 11 && t.hi === 16, `got ${t.lo}-${t.hi}`);
   const townNpcs = spawnSettlementNpcs('town', 200, layoutSettlement('town', 200));
-  check('town: 6-8 NPCs', townNpcs.length >= 6 && townNpcs.length <= 8,
-    `got ${townNpcs.length}`);
   const roles = townNpcs.map((n) => n.role);
   check('town: has guard', roles.includes('guard'));
   check('town: has merchant', roles.includes('merchant'));
   check('town: has villager', roles.includes('villager'));
   check('town: has farmer', roles.includes('farmer'));
   const guardCount = roles.filter((r) => r === 'guard').length;
-  check('town: exactly 2 guards', guardCount === 2, `got ${guardCount}`);
+  check('town: 2-3 guards', guardCount >= 2 && guardCount <= 3, `got ${guardCount}`);
+  // Six market stalls justified more than one trader.
+  check('town: more than one merchant',
+    roles.filter((r) => r === 'merchant').length >= 2);
 }
 
 {
+  const c = spread('castle');
+  check('castle: 15-21 people', c.lo === 15 && c.hi === 21, `got ${c.lo}-${c.hi}`);
   const castleNpcs = spawnSettlementNpcs('castle', 300, layoutSettlement('castle', 300));
-  check('castle: 6-9 NPCs', castleNpcs.length >= 6 && castleNpcs.length <= 9,
-    `got ${castleNpcs.length}`);
   const roles = castleNpcs.map((n) => n.role);
   check('castle: has guard', roles.includes('guard'));
   check('castle: has merchant', roles.includes('merchant'));
   const guardCount = roles.filter((r) => r === 'guard').length;
-  check('castle: 4-6 guards', guardCount >= 4 && guardCount <= 6,
+  // Four towers, a gatehouse, a keep and a jail. Four guards left most of the
+  // wall unwatched.
+  check('castle: 6-8 guards', guardCount >= 6 && guardCount <= 8,
     `got ${guardCount}`);
+  check('castle: the garrison is the largest group',
+    guardCount >= roles.filter((r) => r === 'villager').length);
+}
+
+// The gap between the largest and smallest inhabited kind is the whole point:
+// before this it was 8.1 against 1.5, so a castle and a ranch read as the same
+// size of place with different walls.
+{
+  const mean = (kind: SettlementKind): number => {
+    let n = 0;
+    for (let s = 0; s < 120; s++) {
+      const seed = s * 4099 + 11;
+      n += spawnSettlementNpcs(kind, seed, layoutSettlement(kind, seed)).length;
+    }
+    return n / 120;
+  };
+  const r = mean('ranch');
+  const v = mean('village');
+  const t = mean('town');
+  const c = mean('castle');
+  check('the four kinds are four different sizes of community',
+    r < v && v < t && t < c, `ranch ${r.toFixed(1)} village ${v.toFixed(1)} ` +
+    `town ${t.toFixed(1)} castle ${c.toFixed(1)}`);
+  check('a castle is a town-and-a-half, not a big village', c / v >= 2,
+    `castle ${c.toFixed(1)} vs village ${v.toFixed(1)}`);
 }
 
 // ---------------------------------------------------------------------------

@@ -1238,6 +1238,140 @@ function simulate(
 }
 
 // ---------------------------------------------------------------------------
+// The castle-fight bosses: `pinned`, not `owned`, and vertical reach
+//
+// Both of these are regressions with the same signature — the final boss looks
+// completely alive and takes exactly zero hit points off the player — so both
+// assert on damage rather than on mode.
+//
+// The King and his dragon used to spawn `owned = true`, borrowed in main.ts as
+// a streaming/cap exemption. In `stepAnimal` that flag means "the player's
+// pet": it forced 'follow', barred 'aggro', and the caller's own owned-guard
+// discarded every blow — two independent reasons a dismounted King did exactly
+// zero damage. There was a `speciesDef.boss` compensator here that shed the
+// borrowed flag on first contact; main.ts now spawns them `pinned` instead,
+// which means only "permanent, exempt from cap and streaming" and carries no
+// claim about whose side they are on, so the compensator and its flag are
+// gone. These tests assert the honest arrangement rather than the patch.
+// ---------------------------------------------------------------------------
+{
+  const king = makeEntity('evil_king', 4, 0);
+  king.pinned = true;
+  let dmg = 0;
+  for (let i = 0; i < 60 * 8; i++) {
+    stepAnimal(king, 1 / 60, makeCtx({
+      playerX: 0, playerZ: 0, playerDist: Math.hypot(king.x, king.z),
+      speciesDef: SPECIES_DEFS.evil_king,
+      heightAt: () => 0,
+      // The caller's guard, reproduced: main.ts drops the blow when `owned` is
+      // set, so a test that only counted calls would pass while the player
+      // took nothing.
+      onAttackPlayer: (d) => { if (king.owned !== true) dmg += d; },
+    }));
+  }
+  check('a pinned boss is never treated as a pet', king.owned !== true);
+  check('and keeps the streaming exemption', king.pinned === true);
+  check('the dismounted King fights rather than follows', king.mode === 'aggro',
+    `mode=${king.mode}`);
+  check('the dismounted King actually damages the player', dmg > 0, `${dmg} hp`);
+
+  // The old arrangement must not creep back. An `owned` boss is a pet, full
+  // stop — there is no longer a species flag that excuses one.
+  const petKing = makeEntity('evil_king', 4, 0);
+  petKing.owned = true;
+  let petDmg = 0;
+  for (let i = 0; i < 60 * 4; i++) {
+    stepAnimal(petKing, 1 / 60, makeCtx({
+      playerX: 0, playerZ: 0, playerDist: Math.hypot(petKing.x, petKing.z),
+      speciesDef: SPECIES_DEFS.evil_king, heightAt: () => 0,
+      onAttackPlayer: (d) => { petDmg += d; },
+    }));
+  }
+  check('nothing sheds `owned` behind the back of the caller',
+    petKing.owned === true && petKing.mode !== 'aggro', `mode=${petKing.mode}`);
+
+  // An ordinary tamed animal must be untouched by all of that.
+  const pet = makeEntity('wolf', 4, 0);
+  pet.owned = true;
+  stepAnimal(pet, 1 / 60, makeCtx({
+    playerX: 0, playerZ: 0, playerDist: 4, speciesDef: SPECIES_DEFS.wolf,
+    heightAt: () => 0,
+  }));
+  check('a tamed animal keeps its owned flag', pet.owned === true);
+  check('a tamed animal still never aggros the player', pet.mode !== 'aggro',
+    `mode=${pet.mode}`);
+}
+
+{
+  // Vertical reach. `playerDist` is horizontal, so a creature under a floor is
+  // "0 m away": the King took 8.8 hp off a player two storeys up through 16 m
+  // of Castle Vhaeron's keep before this gate existed.
+  const under = makeEntity('evil_king', 0, 0);
+  under.pinned = true;
+  under.y = 0;
+  let throughFloor = 0;
+  for (let i = 0; i < 60 * 8; i++) {
+    stepAnimal(under, 1 / 60, makeCtx({
+      playerX: 0, playerZ: 0, playerDist: 0, playerY: 16,
+      speciesDef: SPECIES_DEFS.evil_king, heightAt: () => 0,
+      onAttackPlayer: (d) => { throughFloor += d; },
+    }));
+  }
+  check('no melee through 16 m of floor', throughFloor === 0, `${throughFloor} hp`);
+  // And the swing clock is parked, so `creature-anim` never starts a windup at
+  // a target the blow cannot reach — a boss swinging at a ceiling forever.
+  check('a blocked boss is not left mid-swing',
+    under.stateTimer > 0, `stateTimer=${under.stateTimer}`);
+
+  // The same King, same horizontal distance, on the same floor: he must still
+  // land. Without this the test above passes by breaking him.
+  const level = makeEntity('evil_king', 3, 0);
+  level.pinned = true;
+  level.y = 0;
+  let onTheLevel = 0;
+  for (let i = 0; i < 60 * 8; i++) {
+    stepAnimal(level, 1 / 60, makeCtx({
+      playerX: 0, playerZ: 0, playerDist: 3, playerY: 0,
+      speciesDef: SPECIES_DEFS.evil_king, heightAt: () => 0,
+      onAttackPlayer: (d) => { onTheLevel += d; },
+    }));
+  }
+  check('the same blow still lands on the level', onTheLevel > 0, `${onTheLevel} hp`);
+
+  // He must still reach a rider in the saddle of his own grounded mount, which
+  // is 4.4 m up and is where the `grounded` phase has him swinging from.
+  const saddle = makeEntity('evil_king', 3, 0);
+  saddle.pinned = true;
+  saddle.y = 0;
+  let fromSaddleHeight = 0;
+  for (let i = 0; i < 60 * 8; i++) {
+    stepAnimal(saddle, 1 / 60, makeCtx({
+      playerX: 0, playerZ: 0, playerDist: 3, playerY: 4.4,
+      speciesDef: SPECIES_DEFS.evil_king, heightAt: () => 0,
+      onAttackPlayer: (d) => { fromSaddleHeight += d; },
+    }));
+  }
+  check('4.4 m — a saddle\'s height — is still inside his reach',
+    fromSaddleHeight > 0, `${fromSaddleHeight} hp`);
+
+  // Omitting `playerY` must reproduce the old behaviour exactly, because every
+  // caller that predates the field does.
+  const legacy = makeEntity('evil_king', 0, 0);
+  legacy.pinned = true;
+  legacy.y = 0;
+  let ungated = 0;
+  for (let i = 0; i < 60 * 4; i++) {
+    stepAnimal(legacy, 1 / 60, makeCtx({
+      playerX: 0, playerZ: 0, playerDist: 0,
+      speciesDef: SPECIES_DEFS.evil_king, heightAt: () => 0,
+      onAttackPlayer: (d) => { ungated += d; },
+    }));
+  }
+  check('no playerY means no gate — old callers are unchanged', ungated > 0,
+    `${ungated} hp`);
+}
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 

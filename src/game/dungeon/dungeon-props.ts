@@ -23,6 +23,25 @@ function torchXZ(cell: [number, number], wallDir: number): [number, number] {
   return [x + 0.12, z + 0.5];
 }
 
+/**
+ * The point on the wall PLANE behind a torch, and the unit normal pointing
+ * from that plane into the room.
+ *
+ * `torchXZ` returns a point 12 cm clear of the wall, which is where the flame
+ * belongs and where the point light has always been. What was missing is
+ * anything joining the two: the torch was a 8 x 8 cm stick from y 1.15 to 1.65
+ * standing in mid-air with a 8 cm gap behind it and nothing under it. Cells are
+ * 1 m, so the wall plane is the cell edge in the wall direction.
+ */
+function torchWall(cell: [number, number], wallDir: number):
+{ wx: number; wz: number; nx: number; nz: number } {
+  const [x, z] = cell;
+  if (wallDir === 0) return { wx: x + 0.5, wz: z, nx: 0, nz: 1 };
+  if (wallDir === 1) return { wx: x + 1, wz: z + 0.5, nx: -1, nz: 0 };
+  if (wallDir === 2) return { wx: x + 0.5, wz: z + 1, nx: 0, nz: -1 };
+  return { wx: x, wz: z + 0.5, nx: 1, nz: 0 };
+}
+
 export interface TorchProps {
   /** Handle geometry (palette 1, wood). */
   wood: Float32Array<ArrayBuffer>;
@@ -43,7 +62,32 @@ export function buildTorchProps(layout: DungeonLayout): TorchProps {
   const lights: [number, number, number][] = [];
   for (const t of layout.torches) {
     const [x, z] = torchXZ(t.cell, t.wallDir);
-    box(wood, x - 0.04, 1.15, z - 0.04, x + 0.04, 1.65, z + 0.04);
+    const { wx, wz, nx, nz } = torchWall(t.cell, t.wallDir);
+    // Along-wall unit vector. Both this and the normal are axis-aligned, so a
+    // wall-relative box is still an axis-aligned box.
+    const ax = -nz;
+    const az = nx;
+    /**
+     * A box in wall coordinates: `u` runs along the wall from the torch's
+     * centre line, `v` out from the wall plane.
+     */
+    const wallBox = (u0: number, v0: number, y0: number,
+      u1: number, v1: number, y1: number): void => {
+      const px0 = wx + ax * u0 + nx * v0; const pz0 = wz + az * u0 + nz * v0;
+      const px1 = wx + ax * u1 + nx * v1; const pz1 = wz + az * u1 + nz * v1;
+      box(wood, Math.min(px0, px1), y0, Math.min(pz0, pz1),
+        Math.max(px0, px1), y1, Math.max(pz0, pz1));
+    };
+    // Back plate, 2 cm proud of the wall rather than flush with it: the shell's
+    // wall quad is in exactly that plane, and two coplanar faces in two
+    // palettes is the depth-test tie this codebase keeps re-learning about.
+    wallBox(-0.09, 0.02, 1.10, 0.09, 0.06, 1.44);
+    // Bracket arm from the plate out under the socket.
+    wallBox(-0.025, 0.05, 1.19, 0.025, 0.15, 1.25);
+    // Socket collar the shaft stands in.
+    wallBox(-0.06, 0.06, 1.15, 0.06, 0.18, 1.31);
+    // Shaft.
+    wallBox(-0.035, 0.085, 1.22, 0.035, 0.155, 1.66);
     box(flame, x - 0.035, 1.65, z - 0.035, x + 0.035, 1.71, z + 0.035);
     lights.push([x, 1.72, z]);
   }

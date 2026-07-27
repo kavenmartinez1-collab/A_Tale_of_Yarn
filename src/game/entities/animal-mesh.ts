@@ -50,6 +50,8 @@ import {
 import { buildDragon } from './dragon-mesh';
 import { buildWyvern } from './wyvern-mesh';
 import { buildHumanoid, humanoidStride, isHumanoid } from './humanoid-mesh';
+import { buildEvilKing } from './king-mesh';
+import { buildBlackDragon } from './black-dragon-mesh';
 
 export { ANIMAL_IDLE_POSE };
 export type { AnimalPose };
@@ -1803,6 +1805,17 @@ export function buildAnimalMesh(
     case 'dread_king':
       parts = buildHumanoid(species, pose, colorVariant);
       break;
+    // The final boss and his mount. Both are the neighbouring body plan with
+    // its own palette and kit — the King is `solveFrame`'s biped, the dragon is
+    // `buildDragon` at a larger `size` — but each is dispatched to its own
+    // module so the boss's geometry can be edited without touching the species
+    // the rest of the game is made of.
+    case 'evil_king':
+      parts = buildEvilKing(pose, colorVariant);
+      break;
+    case 'black_dragon':
+      parts = buildBlackDragon(pose, colorVariant);
+      break;
   }
 
   // Assembles directly into `out` when given one — no intermediate array and
@@ -1825,7 +1838,17 @@ export function buildAnimalMesh(
  * 6852 verts after the RECTIFICATION_PLAN §5.1/§5.3/§7 pass (necks, tapered
  * legs/tails/snouts, double-sided wing membranes, per-species accents on
  * the 7 quadrupeds — dragon itself only gained the +36 verts from its
- * membranes going double-sided); this constant carries ~34% headroom above
- * that measured max, so it was left unchanged.
+ * membranes going double-sided).
+ *
+ * Raised to 11400 when the final boss and his mount landed. That doc comment
+ * was already stale — the dragon measured 8580 by then, not 6852, so the
+ * "~34% headroom" was really 7% — and `black_dragon` is `buildDragon` at a
+ * larger size plus a saddle, a girth, stirrups and a crest. There is NO
+ * truncation guard on this path (unlike `fitCharacterMesh`); `assembleParts`
+ * quietly allocates a fresh array when `dst` is too small, the renderer then
+ * uploads `count * 40` bytes out of its untouched scratch, and you get a
+ * WebGPU validation error plus stale geometry. Measured worst case is now
+ * 9690 (black_dragon, any pose — wing fold moves vertices, never topology);
+ * 11400 is ~18% above it. `scripts/test-boss-mesh.mts` asserts both bounds.
  */
-export const ANIMAL_MAX_VERTS = 9200;
+export const ANIMAL_MAX_VERTS = 11400;

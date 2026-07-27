@@ -38,6 +38,11 @@ import {
   BREATH_HALF_ANGLE, BREATH_RANGE, liveFuelAt,
   type BurningTree, type PlacedFire,
 } from '../fire';
+import { boltLights, makeLightBuffer } from '../tintreach';
+import { emitTintreachBolt } from './bolt-fx';
+
+/** Reused across frames — `boltLights` fills it in place, never allocates. */
+const boltLightBuf = makeLightBuffer();
 
 /**
  * Hard cap on billboards per frame. 4096 x 48 B = 192 KB re-uploaded per
@@ -51,6 +56,8 @@ const K_FLAME = 0;
 const K_EMBER = 1;
 const K_SMOKE = 2;
 const K_COAL = 3;
+/** Not a fire — the Tintreach lightning bolt. See render/bolt-fx.ts. */
+const K_BOLT = 4;
 const TAU = Math.PI * 2;
 
 /** Beyond this the fire is a light source and nothing else. */
@@ -211,6 +218,29 @@ export class FireFX {
     d[o + 4] = life; d[o + 5] = seed; d[o + 6] = kind; d[o + 7] = power;
     d[o + 8] = ax; d[o + 9] = ay; d[o + 10] = az; d[o + 11] = aspect;
     this.n++;
+  }
+
+  /**
+   * One straight piece of bright seam, for the Tintreach bolt.
+   *
+   * The lowest-level emitter on this class and the only one that is not a fire:
+   * `push` is private for the buffer-overrun reason in its own doc comment, and
+   * a lightning bolt is a hundred hand-placed segments rather than a shape this
+   * class can describe. So the geometry lives in `render/bolt-fx.ts` and this
+   * is the door. Everything else — the pipeline, the additive HDR blend, the
+   * absence of a shadow pass — is shared with the flames unchanged.
+   *
+   * `layer` picks the look (glow / halo / core dash / knot) and rides in the
+   * same float as `taper`, which is why the shader reads `floor` and `fract` of
+   * it. See the bolt branch in flame.wgsl.
+   */
+  strand(
+    x: number, y: number, z: number, halfLen: number,
+    dx: number, dy: number, dz: number,
+    halfWidth: number, layer: number, taper: number, power: number, seed: number,
+  ): void {
+    this.push(x, y, z, halfLen, layer + Math.min(0.999, Math.max(0, taper)),
+      seed, K_BOLT, power, dx, dy, dz, halfWidth / Math.max(1e-4, halfLen));
   }
 
   /**
@@ -565,6 +595,15 @@ export interface WorldFireInput {
     | null;
   /** Settlement braziers, gate torches and lamp-post lanterns. */
   settlementFlames: readonly { x: number; y: number; z: number; scale: number }[];
+  /**
+   * The torch in the player's own hand, or null. Handled before the interior
+   * early-return below, because the one place a carried torch matters most is
+   * underground.
+   */
+  heldTorch: {
+    pos: readonly number[]; color: readonly number[];
+    radius: number; scale: number; sortKey: number;
+  } | null;
   /** Current sim time, for fuel drain and burn-out ramps. */
   nowS: number;
   /** Camera eye, for distance culling and light sorting. */
@@ -597,6 +636,29 @@ export function emitWorldFire(fx: FireFX, input: WorldFireInput): FireLight[] {
   const lights: FireLight[] = [];
   const d2of = (x: number, y: number, z: number): number =>
     (x - eye[0]) ** 2 + (y - eye[1]) ** 2 + (z - eye[2]) ** 2;
+
+  // The Tintreach bolt, BEFORE the interior early-return: the bow works
+  // underground and a bolt fired in a dungeon has to be drawn there too. Its
+  // lights carry negative `d2` so the sort below cannot let a campfire evict
+  // the brightest event in the game.
+  emitTintreachBolt(fx, nowS, eye);
+  const nBolt = boltLights(boltLightBuf, nowS);
+  for (let i = 0; i < nBolt; i++) lights.push(boltLightBuf[i]);
+
+  // The player's own torch, also before the interior early-return. Its flame
+  // seed is a CONSTANT, not fireSeed(x, z) like every fixture below: this one
+  // moves, and a position-derived seed re-rolls the flicker every frame, which
+  // reads as a torch full of fireflies rather than a torch.
+  const ht = input.heldTorch;
+  if (ht !== null) {
+    fx.torch(ht.pos[0], ht.pos[1], ht.pos[2], ht.scale, 0x7042);
+    lights.push({
+      pos: [ht.pos[0], ht.pos[1], ht.pos[2]],
+      color: [ht.color[0], ht.color[1], ht.color[2]],
+      radius: ht.radius,
+      d2: ht.sortKey,
+    });
+  }
 
   if (input.interiorLights !== null) {
     // Indoors: the interior generator already placed and culled these, and

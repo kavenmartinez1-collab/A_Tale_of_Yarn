@@ -36,7 +36,51 @@ import {
  *   placement itself shifted with the larger inset and flatness budget.
  * 0x6dcedfe4 — 2026-07-25, first bake.
  */
-const GOLDEN_HASH: number | null = 0x1a92b4eb;
+// 0xb13b89fc — 2026-07-26. Settlement flatness became a whole-footprint spread
+// test (see test-settlement-scatter.mts for the reasoning), which moves where
+// settlements and castles sit. Roads are rooted at castles and routed between
+// settlements, so the network necessarily changes with them. Density went UP:
+// 178 -> 192 settlements, 7 -> 8 castles, so this is not a loss of coverage.
+// Verified after re-bake: 0 castleless components, 0 dangling termini, 0 failed
+// rootward walks — the connectivity promise still holds by construction.
+// 2026-07-26 (later the same day). Castle/town placement tightened after the
+// user reported glitchy placements: flatness now sampled on 5 rings x 14 spokes
+// (was 3 x 8, too coarse to enforce its own budget), castle budget 24 -> 20,
+// town 11 -> 9, CANDIDATES 40 -> 96 to hold density. Settlements moved, so
+// everything keyed off their positions moves with them. Road network stays
+// connected: 10 castles, 176 nodes, 72 junctions, 107.8 km.
+// Previous: 0xb13b89fc
+// 2026-07-26, population pass. `rollKind` rebalanced 40/22/15/13/10 ->
+// 26/14/22/19/19 to stop over half the world being empty ruins (see
+// test-settlement-scatter.mts for the full reasoning). Roads are rooted at
+// castle gates and routed between settlements, so moving the settlements moves
+// the whole network. The direction is the safe one: castles 7 -> 12 in the
+// 576-cell scatter window, so the graph gains roots rather than losing them —
+// which is what `castles >= 8` below exists to protect, since a Dijkstra tree
+// with no root is not a shorter road, it is no road.
+// Verified after re-bake: 0 castleless components, 0 dangling termini, 0 failed
+// rootward walks, and the negative controls still fail as they must.
+// Previous: 0x682d14d8
+// 2026-07-26, river pass. `settlementSiteAt` now rejects any candidate whose
+// footprint crosses a river (full reasoning in test-settlement-scatter.mts),
+// and the forced near-spawn castle moved from cell '-1,0' to cell '-1,-1'
+// because its pin was in one. Roads are rooted at castle gates and routed
+// between settlements, so moving the settlements moves the whole network.
+//
+// This is the direction that needed watching: the river test is a new
+// acceptance cut on top of the flatness one, and on its own it took the
+// 576-cell scatter window from 166 settlements and 12 castles to 162 and 10.
+// `castles >= 8` below is not a style guard — a Dijkstra tree with no root is
+// no road at all — so CANDIDATES rose 96 -> 128 to buy the density back, which
+// lands at 168 settlements and 11 castles. The road network stays connected
+// after the re-bake: 0 castleless components, 0 dangling termini, 0 failed
+// rootward walks, and the negative controls still fail as they must.
+//
+// Rivers themselves did not move, and neither did the road field's own reading
+// of them (`RIVER_COST` on `base.riverFactor > 0`). A road may still cross a
+// river; a settlement may no longer sit in one.
+// Previous: 0x35a6deab
+const GOLDEN_HASH: number | null = 0x8b23eac3;
 
 const WORLD_SEED = 1337;
 

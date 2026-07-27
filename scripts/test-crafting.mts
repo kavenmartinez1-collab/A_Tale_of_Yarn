@@ -202,14 +202,20 @@ check('gathered materials all have a sink',
     && countItem(inv, 'sticks') === 4);
 }
 
-// ---- Arrow recipe: shaft + feather + stone → 4 arrows (hand) ---------------
+// ---- No arrow recipe exists -----------------------------------------------
+// Arrows used to be craftable four at a time. They are Tintreach arrows now —
+// one quiver per save file — and nothing in the game may mint a second. This
+// used to assert the recipe worked; it now asserts the recipe is gone, which
+// is one of the five closed faucets scripts/test-tintreach.mts checks.
 {
+  check('no craftable arrow recipe',
+    RECIPES.every((r) => r.output !== 'arrow'));
   const inv = createInventory();
   addItem(inv, 'arrow_shaft', 1);
   addItem(inv, 'feather', 1);
   addItem(inv, 'stone', 1);
-  check('arrow recipe produces 4', craft(inv, recipe('arrow'), bareCtx)
-    && countItem(inv, 'arrow') === 4);
+  check('the arrow inputs still craft nothing that is ammunition',
+    countItem(inv, 'arrow') === 0);
 }
 
 // ---- Iron armor (forge) -----------------------------------------------------

@@ -57,10 +57,10 @@ import { bonePart, ridgePart, spikePart, type Vec3 } from './draconic-parts';
 // ---------------------------------------------------------------------------
 
 export type HumanoidSpecies =
-  | 'goblin' | 'goblin_archer' | 'skeleton' | 'dread_king';
+  | 'goblin' | 'goblin_archer' | 'skeleton' | 'dread_king' | 'evil_king';
 
 const HUMANOID_SET = new Set<string>(
-  ['goblin', 'goblin_archer', 'skeleton', 'dread_king']);
+  ['goblin', 'goblin_archer', 'skeleton', 'dread_king', 'evil_king']);
 
 /**
  * True when a species uses the biped rig below.
@@ -85,7 +85,7 @@ export function isHumanoid(species: Species): species is HumanoidSpecies {
  * relative to it. Working in fractions rather than metres is what lets the
  * Dread King be a scaled-up plan rather than a third hand-tuned builder.
  */
-interface HumanoidPlan {
+export interface HumanoidPlan {
   /** Hip-joint height. */
   hipY: number;
   /** Head centre height. */
@@ -190,6 +190,44 @@ const HUMANOID_PLANS: Record<HumanoidSpecies, HumanoidPlan> = {
     ankleH: 0.080, ankleSet: 0.40, slack: 1.16, upperFrac: 0.51,
     duty: 0.60, lift: 0.13,
   },
+  // The final boss. The same construction as the Dread King — deliberately, it
+  // is the same order of being — but every proportion pushed toward "lord"
+  // rather than "brute": longer legs (hipY 0.52 against 0.53 on a figure a
+  // third taller again), a narrower waist under wider shoulders, and almost no
+  // forward lean. A hunch is a monster; a straight back is a king.
+  //
+  // `headY` and `headR` are NOT free. `buildEvilKing` closes the helm dome at
+  // `headY + headR * 1.14` — the same formula as the Dread King's — and the
+  // brief is that he stands exactly twice the player's height. At
+  // `SPECIES_DEFS.evil_king.size = 2.5` that fixes the pair:
+  //
+  //     (headY + headR * 1.14) * 2.5 === 2 * CHARACTER_HEIGHT === 3.24 m
+  //     (1.17288 + 0.108 * 1.14) * 2.5 === 1.296 * 2.5 === 3.24 ✓
+  //
+  // `scripts/test-boss-mesh.mts` asserts that identity against the *measured*
+  // mesh, not against these numbers, so changing either one without changing
+  // `size` fails loudly instead of quietly making him 3.19 m.
+  //
+  // `headR` was raised and `chestW`/`chestD` cut after the first offline
+  // previews: at 0.305/0.225 he was deeper than he was tall in the head and
+  // the skull vanished between the pauldrons, which reads as a barrel with a
+  // crown on it. The head is now 16.7% of standing height — a shade heroic
+  // against a real 13% — because the head is what the eye finds first and
+  // this one has to survive being 40 m up on a dragon.
+  evil_king: {
+    hipY: 0.52, headY: 1.17288, headR: 0.108,
+    chestW: 0.272, chestD: 0.183, waistMul: 0.76,
+    limbR: 0.074, legGap: 0.190,
+    lean: 0.05, splay: 0.04,
+    // Human proportion, NOT the Dread King's 0.38/0.36. Those put this rig's
+    // wrist at 0.22 of standing height — knuckles below the knee, which is the
+    // goblin's read and the opposite of regal. 0.255/0.235 lands the wrist at
+    // the hip, where a person's is, and it is also what lets the greatsword
+    // hang from a fist at hip height instead of dragging its pommel.
+    armUpper: 0.255, armFore: 0.235, armSwing: 0.38,
+    ankleH: 0.082, ankleSet: 0.40, slack: 1.15, upperFrac: 0.51,
+    duty: 0.62, lift: 0.11,
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -264,6 +302,32 @@ function bodyBobM(s: number, walkPhase: number, walkAmp: number): number {
   return (Math.cos(walkPhase * 2) * 0.5 - 0.5) * s * 0.042 * walkAmp;
 }
 
+// --- riding seat (pose.seat) -------------------------------------------------
+//
+// Three angles and nothing else, chosen so the leg wraps a barrel rather than
+// dangling beside one. The character rig has the same idea in one number
+// (`SEAT_THIGH_PITCH`) because it has no knee; this rig does, so the thigh and
+// the shin get separate values and the difference between them is the whole
+// silhouette. Thigh forward and a little above horizontal, knee folded back so
+// the shin drops down the mount's flank, and a wide outward roll at the hip so
+// the knees clear the ribs instead of intersecting them.
+
+/** Thigh pitch at a full seat (rad). + swings the below-hip end FORWARD. */
+const SEAT_THIGH_PITCH = 1.34;
+/** Knee bend at a full seat (rad). Negative folds the shin back down. */
+const SEAT_KNEE_BEND = -1.18;
+/**
+ * Extra outward hip roll at a full seat (rad) — the straddle.
+ *
+ * 0.72, which is a very wide abduction for a person and exactly right for the
+ * only thing that uses it: the Evil King astride a dragon whose barrel is
+ * 2.6 m across, nearly as wide as he is tall. At 0.30 his knees were inside
+ * the animal's ribs.
+ */
+const SEAT_SPLAY = 0.72;
+/** Forward torso settle at a full seat (rad). */
+const SEAT_TORSO_LEAN = 0.10;
+
 // ---------------------------------------------------------------------------
 // Shared skeleton: the frame every species is skinned onto
 // ---------------------------------------------------------------------------
@@ -285,7 +349,7 @@ interface LegFrame {
 }
 
 /** The posed frame: joints, chains and torso surface solvers. */
-interface Frame {
+export interface Frame {
   s: number;
   plan: HumanoidPlan;
   bob: number;
@@ -321,12 +385,18 @@ interface Frame {
  * joints rotate about slightly wrong points, which reads as "rubbery" and is
  * almost impossible to diagnose from a screenshot.
  */
-function solveFrame(species: HumanoidSpecies, pose: AnimalPose): Frame {
+export function solveFrame(species: HumanoidSpecies, pose: AnimalPose): Frame {
   const s = SPECIES_DEFS[species].size;
   const rig = humanoidRig(species);
   const plan = rig.plan;
 
-  const walkAmp = pose.walkAmp;
+  // Astride a mount there is no ground to walk on, so the gait is switched off
+  // at the source rather than sixteen places downstream. A seated rider whose
+  // legs still ran through the planted-foot IK would pedal in time with the
+  // mount's own stride — the solver is chasing a ground plane five metres
+  // below it and has no idea.
+  const seat = Math.min(Math.max(pose.seat ?? 0, 0), 1);
+  const walkAmp = pose.walkAmp * (1 - seat);
   const bob = bodyBobM(s, pose.walkPhase, walkAmp);
 
   const hipY = s * plan.hipY;
@@ -351,19 +421,28 @@ function solveFrame(species: HumanoidSpecies, pose: AnimalPose): Frame {
     const lz = legPlan.rootZ;
     // Bandy legs: a constant outward roll about the hip, OUTSIDE the pitch
     // chain so it tilts the whole solved limb rather than skewing the IK
-    // plane the solver worked in.
-    const splayRot = rollZ(splaySign * plan.splay, lx, legPlan.rootY);
-    const hipRot = pitch(sol.upper, legPlan.rootY, lz);
-    const kneeRot = pitch(sol.lower, sol.kneeY, sol.kneeZ);
-    const anklRot = pitch(sol.cannon, sol.ankleY, sol.ankleZ);
+    // plane the solver worked in. Sitting astride widens it a long way — the
+    // straddle IS the read that says "on something" rather than "above it".
+    const splayRot = rollZ(
+      splaySign * (plan.splay + seat * SEAT_SPLAY), lx, legPlan.rootY);
+    // Seated, the joint angles are authored, not solved: thigh forward and
+    // level-ish, knee folded back so the shin hangs down the mount's flank.
+    const hipRot = pitch(
+      sol.upper * (1 - seat) + seat * SEAT_THIGH_PITCH, legPlan.rootY, lz);
+    const kneeRot = pitch(
+      sol.lower * (1 - seat) + seat * SEAT_KNEE_BEND, sol.kneeY, sol.kneeZ);
+    const anklRot = pitch(sol.cannon * (1 - seat), sol.ankleY, sol.ankleZ);
 
     const kneeY = legPlan.rootY - legPlan.l1;
     const ankleY = kneeY - legPlan.l2;
     const toeY = ankleY - legPlan.cannon;
 
     // Cancel the chain's accumulated pitch at the ankle so the sole stays flat
-    // on the floor instead of pointing wherever the shin happens to.
-    const absCan = sol.upper + sol.lower + sol.cannon;
+    // on the floor instead of pointing wherever the shin happens to. Summed
+    // from the angles actually applied above, not from `sol` — seated, those
+    // are authored rather than solved, and reading `sol` here would flatten
+    // the sole against a floor the rider is nowhere near.
+    const absCan = hipRot.a + kneeRot.a + anklRot.a;
     const footFlat = pitch(-absCan, toeY, lz);
 
     legs.push({
@@ -389,7 +468,7 @@ function solveFrame(species: HumanoidSpecies, pose: AnimalPose): Frame {
   const twist = (pose.tailSway ?? 0) * 0.55;
   const spineRots: Rot[] = [
     twistY(twist, 0, 0),
-    pitch(-plan.lean, hipY + bob, 0),
+    pitch(-plan.lean - seat * SEAT_TORSO_LEAN, hipY + bob, 0),
   ];
 
   const headPitch = pose.headPitch ?? 0;
@@ -433,11 +512,34 @@ function solveFrame(species: HumanoidSpecies, pose: AnimalPose): Frame {
     // Right arm (+X) is the weapon arm and carries the attack swing.
     const isWeapon = side === 1;
     const base = side === 1 ? -swing : swing;
-    const shoulderPitch = base + (isWeapon ? fore : fore * 0.28);
-    // A resting arm is never straight; the elbow keeps a live bend that
-    // deepens as the arm comes forward, which is what stops a swing reading as
-    // a swept rod.
-    const elbowBend = -0.30 - Math.max(0, shoulderPitch) * 0.55;
+    const armFore = isWeapon ? fore : fore * 0.28;
+    const shoulderPitch = base + armFore;
+    // A WALKING arm is never straight: the elbow keeps a live bend that deepens
+    // as the arm comes forward, which is what stops a stride reading as a swept
+    // rod. A STRIKING arm does the opposite, and getting the two the same way
+    // round is why no humanoid in this game had ever visibly swung anything.
+    //
+    // A weapon rides `foreRots`, so it inherits the elbow AND the shoulder. The
+    // old rule deepened the elbow by 55% of the shoulder's own travel, and for
+    // anything held in the hand those two very nearly cancelled: measured on
+    // `evil_king_overhead`, the blade rotated from -0.30 rad at rest to +0.22
+    // at contact — thirty degrees, for a two-handed overhead with a 3.1 m
+    // greatsword. The offline strip shows it exactly: cocked over the shoulder
+    // on the windup and then back to vertical on the contact frame, a boss
+    // waving a sword above his head while the damage lands somewhere else.
+    //
+    // So the elbow now COCKS on the windup (`armFore` negative) and EXTENDS
+    // through the blow, which is what an arm actually does and which puts the
+    // whole of the shoulder's travel into the blade instead of half of it —
+    // 120 degrees of arc on the same clip, same channel, same contact frame.
+    // Capped at straight: an elbow that bends past 0 is hyperextended, and a
+    // hyperextended elbow reads as a broken puppet from any distance.
+    //
+    // Keyed on `armFore` rather than on `shoulderPitch` so the walk term is
+    // untouched — a humanoid with `foreSwing` 0 solves to exactly the pose it
+    // did before, which is every humanoid in the game that is not mid-attack.
+    const elbowBend = -0.30 - Math.max(0, base) * 0.55
+      + Math.min(0.30, armFore * 0.45);
     const shoulderRot = pitch(shoulderPitch, shoulderY, 0);
     const elbowRot = pitch(elbowBend, elbowY, 0);
     arms.push({
@@ -479,9 +581,9 @@ function solveFrame(species: HumanoidSpecies, pose: AnimalPose): Frame {
 // ---------------------------------------------------------------------------
 
 /** Solid tapered limbs — goblins and the Dread King. Legs then arms. */
-function fleshLimbs(
+export function fleshLimbs(
   parts: Part[], f: Frame, limbC: Color3, mat: number,
-  thighMul = 1.35, calfMul = 0.80,
+  thighMul = 1.35, calfMul = 0.80, armX?: number,
 ): void {
   const { s, plan } = f;
   const r = s * plan.limbR;
@@ -498,7 +600,7 @@ function fleshLimbs(
   }
 
   for (const arm of f.arms) {
-    const ax = arm.side * f.torsoWidthAt(f.shoulderY) * 0.96;
+    const ax = arm.side * (armX ?? f.torsoWidthAt(f.shoulderY) * 0.96);
     parts.push(bonePart(limbC, arm.upperRots,
       [ax, f.elbowY, 0], [ax, f.shoulderY, 0],
       r * 0.72, r * 0.92, 4, mat));
@@ -508,8 +610,15 @@ function fleshLimbs(
   }
 }
 
-/** Feet: a flattened pad built up from the solved contact point. */
-function feet(parts: Part[], f: Frame, c: Color3, mat: number, toeLen = 1.55): void {
+/**
+ * Feet: a flattened pad built up from the solved contact point.
+ *
+ * `armX` on `fleshLimbs` above exists for the same reason this takes `toeLen`:
+ * a plan whose chest is not `f.torsoWidthAt`'s chest — the Evil King caps his
+ * at the shoulder line so his head is not inside it — needs to say where the
+ * shoulder socket really is, or its arms hang in the gap beside the body.
+ */
+export function feet(parts: Part[], f: Frame, c: Color3, mat: number, toeLen = 1.55): void {
   const { s, plan } = f;
   const pr = s * plan.limbR * 1.05;
   for (const leg of f.legs) {
@@ -520,7 +629,7 @@ function feet(parts: Part[], f: Frame, c: Color3, mat: number, toeLen = 1.55): v
 }
 
 /** Mitten hands at the wrist, riding the forearm chain. */
-function hands(parts: Part[], f: Frame, c: Color3, mat: number): void {
+export function hands(parts: Part[], f: Frame, c: Color3, mat: number): void {
   const { s, plan } = f;
   const hr = s * plan.limbR * 0.86;
   for (const arm of f.arms) {
@@ -1152,9 +1261,19 @@ function buildDreadKing(species: HumanoidSpecies, pose: AnimalPose, variant: num
 // Entry point
 // ---------------------------------------------------------------------------
 
-/** Build the parts for one humanoid enemy. */
+/**
+ * Build the parts for one humanoid enemy.
+ *
+ * `evil_king` is deliberately excluded: he is a humanoid in every other sense
+ * — same plan table, same `solveFrame`, same gait — but his geometry lives in
+ * `king-mesh.ts`, and that module imports `solveFrame` from here. Routing him
+ * through this switch would make the two files import each other. `buildAnimalMesh`
+ * dispatches him directly instead, and the `Exclude` keeps the switch exhaustive
+ * so a sixth humanoid still fails to compile until it is handled.
+ */
 export function buildHumanoid(
-  species: HumanoidSpecies, pose: AnimalPose, variant: number,
+  species: Exclude<HumanoidSpecies, 'evil_king'>, pose: AnimalPose,
+  variant: number,
 ): Part[] {
   switch (species) {
     case 'goblin':

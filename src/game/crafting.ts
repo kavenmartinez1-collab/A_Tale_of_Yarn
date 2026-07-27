@@ -60,7 +60,17 @@ export const RECIPES: readonly Recipe[] = [
   { output: 'bow_string',  count: 1, inputs: [['thread', 2]],                                      station: 'hand',  category: 'weapons' },
   { output: 'rope',        count: 1, inputs: [['plant_fiber', 3]],                                 station: 'hand',  category: 'camp'    },
   { output: 'arrow_shaft', count: 4, inputs: [['sticks', 1]],                                      station: 'hand',  category: 'weapons' },
-  { output: 'arrow',       count: 4, inputs: [['arrow_shaft', 1], ['feather', 1], ['stone', 1]],   station: 'hand',  category: 'weapons' },
+  // The everyday quiver, and the one recipe that makes the bow a weapon rather
+  // than an ornament. `arrow_shaft` was a dead end before this — it had a
+  // recipe and no consumer — because the only ammunition in the game was the
+  // Tintreach quiver, and nobody whittles lightning out of a stick, a feather
+  // and a rock. That is still true of Tintreach: it has NO recipe and never
+  // will (see tintreach.ts). Flint does.
+  //
+  // One stick makes four shafts, so a stick plus a stone plus a feather is
+  // four arrows. Deliberately cheap: ammunition the player rations is
+  // ammunition the player does not use, and the bow was already scarce enough.
+  { output: 'flint_arrow', count: 4, inputs: [['arrow_shaft', 4], ['stone', 1], ['feather', 1]],   station: 'hand',  category: 'weapons' },
   { output: 'wool_yarn',   count: 1, inputs: [['wool', 2]],                                        station: 'hand',  category: 'camp'    },
   { output: 'bone_needle', count: 1, inputs: [['bone', 1]],                                        station: 'hand',  category: 'tools'   },
   { output: 'bone_needle', count: 1, inputs: [['old_bone', 1]],                                    station: 'hand',  category: 'tools'   },

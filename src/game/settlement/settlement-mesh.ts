@@ -30,6 +30,7 @@ import {
   buildHaystack, buildHedge, buildPillory, buildShrine, buildTrough,
   buildWashline, buildWoodpile,
 } from './settlement-props';
+import { buildPathMeshes } from './settlement-paths';
 import { beam, bevelBoxN, boxN, roof } from './settlement-shapes';
 
 export {
@@ -431,6 +432,11 @@ export function buildSettlementMeshes(
   const buckets: Buckets = emptyBuckets();
   const local: Buckets = emptyBuckets();
   const localFlames: SettlementFlame[] = [];
+  // Streets and stairs first, so paving is written before the buildings that
+  // stand on it — irrelevant to the depth buffer, but it keeps a settlement's
+  // vertex buffer laid out ground-up, which is how it reads in a capture.
+  // Already world-space, so unlike pads it does not go through appendYaw.
+  buildPathMeshes(s.paths, buckets[PAL_STONE], buckets[PAL_TIMBER]);
   for (const pad of s.pads) {
     for (const key of ALL_PALETTES) local[key].length = 0;
     localFlames.length = 0;

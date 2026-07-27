@@ -920,7 +920,13 @@ export const ICON_DRAWERS: Record<GameItemId, (ctx: Ctx) => void> = {
   hide_tent:    (ctx) => { drawTent(ctx, [0.58, 0.42, 0.28]); },
 
   // Weapons (Phase E)
-  arrow:        (ctx) => { drawArrow(ctx, [0.55, 0.54, 0.56]); },
+  // The two quivers share `drawArrow` and are told apart by tint alone: pale
+  // thread-cream for the lightning bolt, flint grey for the common one. They
+  // sit next to each other in the pack and the player has to pick the right
+  // stack at a glance, so the difference is a value difference, not a shape
+  // difference that survives at 32 px and nothing else.
+  arrow:        (ctx) => { drawArrow(ctx, [0.87, 0.79, 0.57]); },
+  flint_arrow:  (ctx) => { drawArrow(ctx, [0.46, 0.44, 0.42]); },
   bronze_sword: (ctx) => { drawSword(ctx, [0.72, 0.50, 0.28]); },
   spear:        (ctx) => { drawStaff(ctx, [0.60, 0.45, 0.25]); },
   composite_bow:(ctx) => { drawBow(ctx, [0.42, 0.30, 0.18]); },

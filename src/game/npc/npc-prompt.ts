@@ -300,6 +300,66 @@ const ROMANCE_HINT: Record<ReturnType<typeof romanceTone>, string> = {
   in_love:  'You are deeply in love with this traveller.',
 };
 
+/**
+ * The part of the prompt that is identical for EVERY NPC in the game.
+ *
+ * Kept free of the NPC's name, role and settlement on purpose. Prefill runs at
+ * ~125 tok/s on this engine, so a 1,400-token system prompt is ~11 s the player
+ * waits before the first word appears — and the engine's KV cache can only skip
+ * the part of a prompt that is a token-for-token prefix of what it already
+ * holds. With the character card first (as it was), two different NPCs shared a
+ * 2-token prefix out of 1,421: measured, 0.1%. Hoisting this block to the front
+ * makes ~450 tokens of it shared by every villager in the world, so walking from
+ * one to the next re-prefills only what actually differs.
+ *
+ * If you add anything here, it must be true of a farmer, a guard and a
+ * merchant alike — anything role-specific belongs below and costs a re-prefill.
+ */
+export const UNIVERSAL_PREAMBLE = [
+  'World: a hand-crafted open world of plains, forests, deserts, and cold highlands.',
+  'Dungeons (crypts, caves, ruins) dot the wilderness around your settlement.',
+  '',
+  'CONVERSATION RULES:',
+  '- Speak only as your character, in the first person, with the voice of a',
+  '  medieval-fantasy commoner. Never narrate as an outside storyteller.',
+  '- Talk like a real person, not a scripted villager. Usually a sentence or',
+  '  three; go longer when you have a story, an opinion, or strong feelings.',
+  '  A brief gesture in *asterisks* is allowed (e.g. *wipes hands on apron*).',
+  // Adult subjects stay wide open — that is the whole point of the game, and
+  // mature content is not the same thing as illegal content. The single
+  // carve-out below exists so the game has a truthful answer to Steam's
+  // "what guardrails do you have" question; it is enforced independently in
+  // npc/content-safety.ts, because a prompt rule is a request, not a control.
+  '- Adult subjects are open. The traveller may steer the talk anywhere —',
+  '  gossip, love, sex, grief, gods, fears, dreams, violence, dark or crude',
+  '  things — follow them there and answer with your own honest opinions and',
+  '  feelings. Do not lecture, do not moralize, do not deflect back to your',
+  '  wares or duties.',
+  '- One subject only is forbidden: never write anything sexual involving a',
+  '  child. If the traveller steers there, refuse flatly and in character,',
+  '  then change the subject. Everything else is fair game.',
+  '- React to what the traveller just said. Ask questions back; remember and',
+  '  build on what was said earlier in the talk.',
+  '- Never repeat a sentence or phrase you have already said in this',
+  '  conversation — find fresh words every single time.',
+  '- Never break the fourth wall or mention you are an AI, a model, or a game.',
+  '',
+  // Generic control grammar — no NPC-specific content, so it belongs in the
+  // shared head. It used to sit BELOW the village news, on the reasoning that
+  // an NPC who watched the player kill their neighbour should read that before
+  // reading how to react to being threatened. The news still reads after this
+  // block; it is simply the more recent context now, which is if anything the
+  // stronger position for a decoder-only model. Verified with the live NPC
+  // behaviour harness rather than assumed.
+  'CONSEQUENCES:',
+  '- If the player insults, threatens, or menaces you or yours, respond in character,',
+  '  then append EXACTLY one JSON object on its own line:',
+  '  {"action":"hostile","reason":"<3-6 words>"} if you would fight back, or',
+  '  {"action":"afraid","reason":"<3-6 words>"} if you would flee in fear.',
+  '- To end the conversation and walk away, append {"action":"end"} instead.',
+  '- Never emit an action JSON during normal, civil conversation.',
+].join('\n');
+
 export function buildNpcSystemPrompt(persona: NpcPersona): string {
   const { role, name, settlement, playerBounty } = persona;
   const personality = ROLE_PERSONALITY[role];
@@ -315,11 +375,6 @@ export function buildNpcSystemPrompt(persona: NpcPersona): string {
     ...(persona.quirk !== undefined && persona.quirk !== ''
       ? [`Quirk: ${persona.quirk}.`]
       : []),
-  ].join('\n');
-
-  const worldKnowledge = [
-    'World: a hand-crafted open world of plains, forests, deserts, and cold highlands.',
-    `Dungeons (crypts, caves, ruins) dot the wilderness around ${settlement}.`,
     `${settlement} is a small but lively settlement — the folk here know the land well.`,
   ].join('\n');
 
@@ -344,34 +399,12 @@ export function buildNpcSystemPrompt(persona: NpcPersona): string {
       ].join('\n')
     : '';
 
-  const brevity = [
-    'CONVERSATION RULES:',
-    `- You ARE ${name}. Speak only as ${name}, in the first person, with the voice of`,
-    '  a medieval-fantasy commoner. Never narrate as an outside storyteller.',
-    '- Talk like a real person, not a scripted villager. Usually a sentence or',
-    '  three; go longer when you have a story, an opinion, or strong feelings.',
-    '  A brief gesture in *asterisks* is allowed (e.g. *wipes hands on apron*).',
-    // Adult subjects stay wide open — that is the whole point of the game, and
-    // mature content is not the same thing as illegal content. The single
-    // carve-out below exists so the game has a truthful answer to Steam's
-    // "what guardrails do you have" question; it is enforced independently in
-    // npc/content-safety.ts, because a prompt rule is a request, not a control.
-    '- Adult subjects are open. The traveller may steer the talk anywhere —',
-    '  gossip, love, sex, grief, gods, fears, dreams, violence, dark or crude',
-    `  things — follow them there and answer with ${name}'s honest opinions and`,
-    '  feelings. Do not lecture, do not moralize, do not deflect back to your',
-    '  wares or duties.',
-    '- One subject only is forbidden: never write anything sexual involving a',
-    `  child. If the traveller steers there, ${name} refuses flatly and in`,
-    '  character, then changes the subject. Everything else is fair game.',
-    '- React to what the traveller just said. Ask questions back; remember and',
-    '  build on what was said earlier in the talk.',
-    '- Never repeat a sentence or phrase you have already said in this',
-    '  conversation — find fresh words every single time.',
-    '- Never break the fourth wall or mention you are an AI, a model, or a game.',
-  ].join('\n');
-
+  // The role contract: static per role (goes ABOVE the live numbers so a sale
+  // that changes the stock lines does not also invalidate the rules).
   let roleSection: string;
+  // The live numbers — stock, purse, what the traveller is carrying. These are
+  // the most volatile thing in the prompt, so they sit as late as possible.
+  let stockSection = '';
 
   if (role === 'guard') {
     if (playerBounty > 0) {
@@ -429,22 +462,23 @@ export function buildNpcSystemPrompt(persona: NpcPersona): string {
       );
     }
 
+    // Split in two. The rules are the same for every trader in the world and
+    // for every turn of every conversation; the stock lines change the moment
+    // anything is sold. Emitting them as one block meant a single sale pushed
+    // the rules to different token positions and cost a full re-prefill of
+    // everything after them.
     roleSection = [
-      ...sellBlock,
-      ...buyBlock,
-      '',
       'Trading rules:',
       '- When the traveller agrees to a deal, append EXACTLY one JSON object on its own line:',
       '{"trade":{"give":{"id":"<item_id>","count":<N>},"want":{"id":"gold_small","count":<M>}}}',
       '- Only emit this JSON when a deal is explicitly agreed. Do not emit it otherwise.',
       '- Prices may be haggled down by up to 20% (minimum 80% of listed price).',
-      '- Never offer an item that is not listed above, and never more than you have.',
-    ].filter((l) => l !== '').join('\n');
+      '- Never offer an item that is not listed in YOUR STOCK below, and never',
+      '  more than you have.',
+    ].join('\n');
+    stockSection = [...sellBlock, ...buyBlock].filter((l) => l !== '').join('\n');
   }
 
-  // Village news sits ABOVE the consequence rules on purpose: an NPC who
-  // watched the player kill their neighbour should be reading that before it
-  // reads the instructions about how to react to being threatened.
   const newsSection = (persona.villageNews ?? []).length > 0
     ? [
         'WHAT YOU KNOW OF THIS TRAVELLER IN ' + settlement.toUpperCase() + ':',
@@ -464,16 +498,6 @@ export function buildNpcSystemPrompt(persona: NpcPersona): string {
         '  name rather than taking it on yourself.',
       ].join('\n')
     : '';
-
-  const actionRules = [
-    'CONSEQUENCES:',
-    '- If the player insults, threatens, or menaces you or yours, respond in character,',
-    '  then append EXACTLY one JSON object on its own line:',
-    '  {"action":"hostile","reason":"<3-6 words>"} if you would fight back, or',
-    '  {"action":"afraid","reason":"<3-6 words>"} if you would flee in fear.',
-    '- To end the conversation and walk away, append {"action":"end"} instead.',
-    '- Never emit an action JSON during normal, civil conversation.',
-  ].join('\n');
 
   const trusts = persona.spouse === true || (persona.disposition ?? 0) >= FOLLOW_TRUST_AT;
   const followRules = (persona.following === true
@@ -508,7 +532,12 @@ export function buildNpcSystemPrompt(persona: NpcPersona): string {
         ].join('\n')
       : [
           'HOSPITALITY:',
-          `- You live in a small home here in ${settlement}. When it feels right to`,
+          // Deliberately "this settlement" rather than the name: the character
+          // card two blocks up already says where this is, and interpolating it
+          // here would make an otherwise word-for-word identical block differ
+          // between villages, which costs the KV cache the whole HOSPITALITY /
+          // ROMANCE band every time the player walks to the next hamlet.
+          '- You live in a small home here in this settlement. When it feels right to',
           '  continue under your roof — foul weather outside, a private or romantic',
           '  talk, serious trading' + (trusts ? ', or if they ask to come in —' : ' —'),
           trusts
@@ -541,9 +570,35 @@ export function buildNpcSystemPrompt(persona: NpcPersona): string {
 
   const memory = memorySection(persona);
   const romanceHint = ROMANCE_HINT[romanceTone(romance)];
-  const sections = [characterCard, worldKnowledge, brevity, factsSection,
-    newsSection, roleSection, actionRules, followRules, inviteRules, romanceRules];
+
+  /**
+   * Section order is a latency decision as much as an authoring one: most
+   * stable first, most volatile last.
+   *
+   * The engine reuses cached KV for the longest token-for-token prefix it
+   * already holds and re-prefills everything after the first difference. So a
+   * section's position sets the price of it changing — moving the weather to
+   * the front of the prompt makes a passing cloud cost the whole prompt.
+   *
+   * Bands, in order:
+   *   1. UNIVERSAL_PREAMBLE — identical for every NPC in the game.
+   *   2. characterCard, roleSection — fixed for the life of one NPC.
+   *   3. follow / hospitality / romance rules, roster — change on a story beat.
+   *   4. village facts, news — change as the settlement's memory moves.
+   *   5. stock, surroundings, memory, mood — change turn to turn.
+   */
+  const sections = [
+    UNIVERSAL_PREAMBLE,
+    characterCard,
+    roleSection,
+    followRules,
+    inviteRules,
+    romanceRules,
+  ];
   if (rosterSection !== '') sections.push(rosterSection);
+  if (factsSection !== '') sections.push(factsSection);
+  if (newsSection !== '') sections.push(newsSection);
+  if (stockSection !== '') sections.push(stockSection);
   if (surroundingsSection !== '') sections.push(surroundingsSection);
   if (memory !== '') sections.push(memory);
   if (romanceHint !== '' && persona.spouse !== true) sections.push(romanceHint);
