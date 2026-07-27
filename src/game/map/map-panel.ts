@@ -35,6 +35,9 @@ import type { HeightField } from '../noise';
 import type { RoadNetwork } from '../world/roads';
 import { buildGameMenuPanel } from '../ui/menu-panel';
 import type { GameMenuOptions } from '../ui/menu-panel';
+import { buildSettingsContent } from '../ui/settings-panel';
+import { buildControlsContent } from '../ui/controls-panel';
+import { buildHelpContent } from '../ui/help-panel';
 import { Discovery, MAP_CHUNK, MAP_TILE } from './discovery';
 import type { Landmark } from './map-landmarks';
 import { CLOTH, toCss } from './map-palette';
@@ -173,6 +176,23 @@ const CSS = `
 #pause-screen .stitch-btn.primary { border-color: #e8c35a; color: #e8c35a; }
 #pause-screen .zoom-row { display: flex; gap: 6px; }
 #pause-screen .zoom-row .stitch-btn { flex: 1; text-align: center; }
+/* A rail screen — Settings, Controls, Help — swapped in over the chart and
+   the rail together. It takes the whole body because these are pages to read,
+   not things to do beside a map. */
+#pause-screen .chart-sheet {
+  flex: 1; min-width: 0; min-height: 0;
+  overflow-y: auto;
+  padding: 0 12px 4px 2px;
+}
+/* Back spans the sheet, and that is a NAVIGATION fix, not a look.
+   ui-focus.ts scores a candidate by how far it lies in the pressed direction
+   plus three times its drift off-axis. A compact Back button sits at the left
+   margin while the settings controls are a column away to the right, so
+   pressing down from it scored "Restore defaults" — far below but sharing the
+   same left edge — above every control on the page, and skipped all sixteen.
+   A full-width button overlaps every column, which makes the off-axis term
+   zero for all of them and lets plain distance decide. */
+#pause-screen .chart-sheet > .stitch-btn { display: block; width: 100%; margin: 0 0 12px; }
 
 /* The save menu, re-dyed to match the cloth. */
 #pause-screen #game-menu-panel { margin-top: 2px; }
@@ -374,6 +394,123 @@ export function buildMapPanel(opts: MapPanelOptions): HTMLElement {
   zoomRow.append(zoomOut, zoomIn);
   rail.appendChild(zoomRow);
 
+  // --- the three screens the rail can turn into ---------------------------
+  /**
+   * Settings, Controls and Help swap themselves into the CHART BODY instead of
+   * opening panels of their own, and that is not a styling preference.
+   *
+   * main.ts stops the world on exactly one condition:
+   *
+   *     simClock.setPaused(panels.openId === 'pause')
+   *
+   * A settings screen with a panel id of its own would therefore RESUME the
+   * game behind a menu the player opened *from* the pause screen — the world
+   * running on while they adjust the volume. (The KeyH help panel does have its
+   * own id and does not pause, and that is correct for it: it is reached from
+   * gameplay, not from a pause.) Staying inside `#pause-screen` keeps the id,
+   * keeps the world stopped, keeps the cloth, and keeps the pad's focus context
+   * unbroken — ui-focus.ts watches this root with a MutationObserver, so it
+   * re-scans the swapped-in controls by itself with nothing to notify.
+   *
+   * They sit here, between the map's own controls and the save rail, because
+   * the rail then reads top to bottom as: leave (Resume), the map, the other
+   * screens, this run's data — with New Game last so nothing sits below the one
+   * destructive control. Above the save rail also keeps them above the fold in
+   * a rail that scrolls.
+   */
+  let sheetBack: (() => void) | null = null;
+
+  function openSheet(
+    from: HTMLElement, name: string, subtitle: string, build: () => HTMLElement,
+  ): void {
+    const keep = [...body.children];
+    const title0 = title.textContent;
+    const where0 = where.textContent;
+    const count0 = count.textContent;
+    const foot0 = foot.textContent;
+
+    const restore = (): void => {
+      sheetBack = null;
+      body.replaceChildren(...keep);
+      title.textContent = title0;
+      where.textContent = where0;
+      count.textContent = count0;
+      foot.textContent = foot0;
+      dirty = true;
+      // Put the ring back on the button that opened the screen. UiFocus.rescan
+      // falls back to `document.activeElement` when the element it was on has
+      // gone, so a plain focus() is the whole of it — no ui-focus.ts change.
+      from.focus();
+    };
+
+    /**
+     * The Back control is built HERE, not by the three screens, for two
+     * reasons: it guarantees Back is the FIRST button in DOM order, which is
+     * what lands the pad's ring on it when the sheet opens; and "how you get
+     * back to the map" is the host's business, not the page's.
+     *
+     * There are two of them, top and bottom. Controls and Help are read-only
+     * pages with no other focusable control, so on a short window a pad player
+     * with only one button at the top would have no way to see the end of the
+     * page; pressing down to the second Back scrolls them there.
+     */
+    const backBtn = (): HTMLButtonElement => {
+      const b = document.createElement('button');
+      b.className = 'stitch-btn primary';
+      b.textContent = '‹  Back to the chart';
+      // main.ts's UiFocus `close` hook can look for this to make B step back
+      // one level instead of resuming the game two levels up.
+      b.dataset.sheetBack = '1';
+      b.addEventListener('click', restore);
+      return b;
+    };
+
+    const sheet = document.createElement('div');
+    sheet.className = 'chart-sheet';
+    // Not named `head`/`foot` — those are the chart's own header and footer,
+    // three closures up.
+    const backTop = backBtn();
+    const backBottom = backBtn();
+    backBottom.style.cssText = 'margin:14px 0 0;';
+    const content = build();
+    sheet.append(backTop, content, backBottom);
+
+    sheetBack = restore;
+    title.textContent = name;
+    where.textContent = subtitle;
+    count.textContent = '';
+    foot.textContent = 'Esc goes back to the chart';
+    body.replaceChildren(sheet);
+
+    /**
+     * Land the pad's ring on the first control of the PAGE, falling back to
+     * Back on the read-only pages that have none.
+     *
+     * Not a nicety — starting on Back was measurably broken. ui-focus.ts scores
+     * a candidate by distance along the pressed direction PLUS three times its
+     * drift off-axis, so a far-but-aligned control beats a near-but-offset one.
+     * Back is a narrow button at the left margin; the Settings controls are a
+     * column's width away to the right. Pressing down from Back therefore
+     * skipped all sixteen of them and landed on "Restore defaults", which
+     * shares Back's left edge four hundred pixels lower. Starting inside the
+     * content makes down walk the rows, and Back is one press up.
+     */
+    (content.querySelector<HTMLElement>('button') ?? backTop).focus();
+  }
+
+  function addSheetBtn(label: string, subtitle: string, build: () => HTMLElement): void {
+    const b = document.createElement('button');
+    b.className = 'stitch-btn';
+    b.textContent = label;
+    b.addEventListener('click', () => openSheet(b, label, subtitle, build));
+    rail.appendChild(b);
+  }
+
+  addSheetBtn('Settings', 'sound, controls, and how hard the game works',
+    buildSettingsContent);
+  addSheetBtn('Controls', 'every key and every button', buildControlsContent);
+  addSheetBtn('How to play  (H)', 'the short version', buildHelpContent);
+
   rail.appendChild(buildGameMenuPanel(opts.menu));
 
   // --- interaction --------------------------------------------------------
@@ -438,7 +575,8 @@ export function buildMapPanel(opts: MapPanelOptions): HTMLElement {
   /**
    * Keys are taken in the CAPTURE phase so the ones the map owns never reach
    * the game's own keydown handler on `window`. Escape deliberately is NOT
-   * claimed: it has to fall through to close the panel.
+   * claimed while the chart is up: it has to fall through to close the panel.
+   * The one exception is a rail screen — see the Escape case.
    */
   function onKey(e: KeyboardEvent): void {
     const t = e.target;
@@ -446,9 +584,20 @@ export function buildMapPanel(opts: MapPanelOptions): HTMLElement {
         && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) {
       return;
     }
+    // While a rail screen owns the body the map's keys go back to the page:
+    // the arrows should scroll the settings sheet, not pan a chart that is not
+    // on screen. Escape still comes through, to step back to the chart.
+    if (sheetBack !== null && e.code !== 'Escape') return;
     const step = 0.22 * Math.max(viewW, viewH) * metresPerPixel(view);
     let handled = true;
     switch (e.code) {
+      case 'Escape':
+        // Only ever reached with a rail screen open (see the guard above), and
+        // then Escape unwinds ONE level, the way it does everywhere else: back
+        // to the chart, and a second press resumes.
+        if (sheetBack === null) return;
+        sheetBack();
+        break;
       case 'ArrowLeft':  view = { ...view, cx: view.cx - step }; break;
       case 'ArrowRight': view = { ...view, cx: view.cx + step }; break;
       case 'ArrowUp':    view = { ...view, cz: view.cz - step }; break;
@@ -607,6 +756,12 @@ export function buildMapPanel(opts: MapPanelOptions): HTMLElement {
   function frame(): void {
     if (!root.isConnected) return; // detached: stop, and let the closure go
     requestAnimationFrame(frame);
+    // A rail screen has swapped itself into the body, so the cloth is
+    // detached: `cloth.clientWidth` reads 0, `resize()` would clamp the view
+    // against a 64x64 viewport, and the player would come back to a chart
+    // silently zoomed somewhere else. Idle instead — which also stops paying
+    // for tile baking on a chart nobody is looking at.
+    if (!cloth.isConnected) return;
     resize();
     if (opts.discovery.rev !== lastRev) {
       lastRev = opts.discovery.rev;

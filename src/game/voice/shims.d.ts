@@ -36,6 +36,36 @@ declare module 'onnxruntime-web/wasm' {
       simd?: boolean;
     };
   };
+
+  /**
+   * The inference surface, added for `tts-worker.ts`.
+   *
+   * Whisper never needed this: transformers.js owns its own session and only
+   * receives the runtime as an opaque object. The piper voice calls ORT
+   * directly, so the two classes it touches are declared here — deliberately
+   * narrow, in the spirit of the note above. `run()` is typed loosely on
+   * purpose: the real signature is a map of names to tensors whose keys depend
+   * on the model, and pretending otherwise would be fiction.
+   */
+  export class Tensor {
+    constructor(type: 'int64', data: BigInt64Array, dims: readonly number[]);
+    constructor(type: 'float32', data: Float32Array, dims: readonly number[]);
+    readonly data: Float32Array | BigInt64Array;
+    readonly dims: readonly number[];
+  }
+
+  export class InferenceSession {
+    static create(
+      model: string | Uint8Array,
+      options?: {
+        executionProviders?: string[];
+        graphOptimizationLevel?: 'disabled' | 'basic' | 'extended' | 'all';
+      },
+    ): Promise<InferenceSession>;
+    run(feeds: Record<string, Tensor>): Promise<Record<string, Tensor>>;
+    readonly inputNames: readonly string[];
+    readonly outputNames: readonly string[];
+  }
 }
 
 /** Vite asset import: resolves to the emitted URL of the file. */

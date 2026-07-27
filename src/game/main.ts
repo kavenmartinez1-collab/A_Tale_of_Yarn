@@ -103,7 +103,7 @@ import {
   buildNpcChatPanel, onNpcChatClosed, loadStockMap, saveStockMap,
   chatState, npcGoldFromMap, isNpcModelKey, preloadNpcChat, warmNpcApproach,
   voiceInput,
-  type StockMap,
+  type StockMap, setVoiceOut,
 } from './ui/npc-chat-panel';
 import {
   loadMemoryMap, getOrCreateMemory, adjustDisposition, saveMemoryMap,
@@ -191,6 +191,9 @@ import {
   type CrimeState,
 } from './crime';
 import { GameAudio, type AmbienceState } from './audio/audio-engine';
+import { settings, type GameSettings } from './ui/game-settings';
+import { buildControlsPanel } from './ui/controls-panel';
+import { VoiceOut } from './voice/voice-out';
 import { CastleManager, castleWorld, CASTLE_STATE_KEY } from './castle/castle-manager';
 // Arena floor height, so the boss's leash anchor and its flight home sit on
 // the same circle `castleManager.flightPose` patrols at.
@@ -557,6 +560,26 @@ declare global {
       toggleMute(): void;
       /** Returns true if audio is currently muted. */
       audioMuted(): boolean;
+      /**
+       * Synthesize a line through the real voice worker and return the
+       * waveform's statistics, without playing it. Resolves null when speech
+       * is off or unavailable. `scripts/steam-pack-check.mjs` uses this to
+       * assert a packaged offline build makes actual sound.
+       */
+      voiceProbe(text: string): Promise<{
+        samples: number; sampleRate: number; peak: number; rms: number; synthMs: number;
+      } | null>;
+      /** Whether the voice worker has the model resident. */
+      voiceReady(): boolean;
+      /**
+       * The live settings store. `scripts/controller-ui-check.mjs` asserts
+       * both halves of the contract through this: that a change made in the
+       * panel applies immediately, and that it is still there after a reload.
+       */
+      settings(): Readonly<import('./ui/game-settings').GameSettings> & {
+        set(patch: Partial<import('./ui/game-settings').GameSettings>): void;
+        reset(): void;
+      };
       /** Nearest npcOwned horse within given radius of (x, z), or null. */
       nearestNpcOwnedHorse(x: number, z: number, radius?: number): import('./entities/entity-manager').EntityState | null;
       /** Ownership flags of a live entity by id, or null (e2e). */
@@ -731,6 +754,11 @@ declare global {
 }
 
 const WORLD_SEED = 1337;
+// The procedural score (src/game/music/**). Constructed on the first user
+// gesture in resumeAudio(); state-driven from the frame loop's music mount.
+import { createMusic, type MusicEngine } from './music';
+import { SETTLEMENT_RADIUS } from './settlement/settlement-scatter';
+import type { MusicState } from './music/state';
 /**
  * Thirst restored by drinking at a settlement well. A river gives 40; drawn
  * water is clean and cold, so walking to a well is never the worse choice.
@@ -944,6 +972,37 @@ async function boot() {
   // Feature: Audio engine (Feature 10)
   // -------------------------------------------------------------------------
   const audio = new GameAudio();
+
+  // Settings → audio buses. `subscribe` fires immediately, so this is also the
+  // initial application: one path for "apply live" and "restore on boot", which
+  // is what keeps the two from drifting.
+  settings.subscribe((st) => {
+    audio.setVolume(st.volMaster);
+    audio.setBusVolume('music', st.volMusic);
+    audio.setBusVolume('sfx', st.volSfx);
+    audio.setBusVolume('voice', st.volVoice);
+  });
+
+  // ---- Villager voices (speech out) --------------------------------------
+  // Synthesis runs in a worker on ORT wasm — never the GPU queue, which the
+  // renderer and the NPC LLM already contend for. See src/game/voice/tts-worker.ts.
+  const voiceOut = new VoiceOut({
+    output: () => audio.voiceBus(),
+    enabled: () => settings.get().voiceEnabled && !audio.muted,
+  });
+  setVoiceOut(voiceOut);
+  // Turning speech off mid-sentence must actually stop the sentence.
+  settings.subscribe((st) => { if (!st.voiceEnabled) voiceOut.stop(); });
+
+  // ---- Music mount point (parallel work — src/game/music/**) --------------
+  // The `music` bus above exists and is wired to the Settings slider already;
+  // nothing routes into it yet. When the music engine lands it needs exactly
+  // two things from this file: construction next to `audio` with
+  // `audio.musicBus()` as its destination, and one `music.update(state)` call
+  // per frame in the render loop (see the matching marker there). Deliberately
+  // left as a comment rather than a stub object so there is no dead interface
+  // to keep in sync.
+
   // Restore mute state from localStorage.
   const AUDIO_MUTE_KEY = 'artifex-audio-muted:v1';
   try {
@@ -955,10 +1014,16 @@ async function boot() {
 
   // Resume on first user gesture (browser autoplay policy).
   let audioResumed = false;
+  let music: MusicEngine | null = null;
   function resumeAudio() {
     if (audioResumed) return;
     audioResumed = true;
     audio.resume();
+    // Seeded from the world seed: a given world always has the same score,
+    // the same property every other generated thing here has. Routed into
+    // the `music` bus so the Settings slider and the M mute both apply.
+    const mb = audio.musicBus();
+    if (mb) music = createMusic(mb.ctx, WORLD_SEED, { destination: mb.node });
   }
   document.addEventListener('pointerdown', resumeAudio, { once: true });
   document.addEventListener('keydown', resumeAudio, { once: true });
@@ -1964,6 +2029,10 @@ async function boot() {
   // pitch is not a trade worth making.
   const torchBar = new TorchBar();
   let torchFuelS = TORCH_BURN_S;
+  /** Previous lit/unlit state of the held torch — drives the light/douse cue. */
+  let prevTorchLit = false;
+  /** Previous interior state — drives the door open/close cue. */
+  let prevInsideForAudio = false;
   /**
    * Torches in the SELECTED SLOT — the stack that will actually relight.
    * Deliberately not `countItem(inventory, 'torch')`: the auto-relight pulls
@@ -2226,9 +2295,17 @@ async function boot() {
       ? WEATHER_PRESETS[weatherParam as WeatherKind]
       : null;
 
-  // AI Director: ON by default (proven in M0/M4) — opt out with ?director=off.
+  // AI Director: ON by default (proven in M0/M4).
   // Shares the game's GPU device; failures degrade to fixtures, never __gameError.
-  const directorOff = debugParams().get('director') === 'off';
+  //
+  // Two ways off, and the second is the one that ships. `?director=off` is the
+  // developer/harness route and `debugParams()` blanks it in a release build;
+  // the Settings panel's toggle is the player's, because a packaged player has
+  // no URL bar. release-flags.ts called for exactly this. Read once at boot on
+  // purpose: the director owns GPU resources and an LLM session, and tearing
+  // those down mid-session is a different and much larger change than a
+  // checkbox — the panel says the setting applies on restart.
+  const directorOff = debugParams().get('director') === 'off' || settings.get().directorOff;
 
   // NPC dialogue model: defaults to STOCK Qwen3-1.7B Q4_K_M (Apache-2.0), the
   // same model the Dungeon Director runs — one download, one set of resident
@@ -6635,6 +6712,13 @@ async function boot() {
       } catch { /* quota */ }
     },
     audioMuted: () => audio.muted,
+    voiceProbe: (text: string) => voiceOut.probe(text),
+    voiceReady: () => voiceOut.ready,
+    settings: () => Object.assign(
+      {},
+      settings.get(),
+      { set: (p: Partial<GameSettings>) => settings.set(p), reset: () => settings.reset() },
+    ),
     nearestNpcOwnedHorse: (x: number, z: number, radius = 50) => {
       let best: import('./entities/entity-manager').EntityState | null = null;
       let bestD = radius;
@@ -7079,6 +7163,14 @@ async function boot() {
     // every one of them would change how the game is played, which is not
     // what was asked for. Escape is the pause.
     simClock.setPaused(panels.openId === 'pause', performance.now());
+    // Hard pause silences the villager. PanelManager allows one panel at a
+    // time, so opening the pause screen has already closed the conversation —
+    // carrying its audio over the map would be sound from a screen that is
+    // gone, and the voice slider on that very screen would be unjudgeable with
+    // someone mid-sentence. VoiceOut.stop() fades over 80 ms so it does not
+    // click. Speech deliberately KEEPS playing while the chat panel is open;
+    // that is the whole feature.
+    if (panels.openId === 'pause') voiceOut.stop();
     if (!open) {
       // If the NPC chat panel was just closed, reset its state.
       onNpcChatClosed();
@@ -7269,97 +7361,12 @@ async function boot() {
     // Feature 7: H — help panel.
     if (e.code === 'KeyH') {
       audio.play('ui_click');
-      panels.toggle('help', () => {
-        const el = document.createElement('div');
-        el.id = 'help-panel';
-        const title = document.createElement('h2');
-        title.textContent = 'Controls';
-        el.appendChild(title);
-        const controls: [string, string][] = [
-          ['WASD',       'Move / strafe'],
-          ['Shift',      'Sprint'],
-          ['Space',      'Jump (or paddle while swimming)'],
-          ['Mouse',      'Orbit camera / aim'],
-          ['Wheel',      'Zoom camera'],
-          ['Left-click', 'Gather / attack / use  (hold with a bow to draw, release to shoot)'],
-          ['X',          'Swap arrows — flint (common) / Tintreach (lightning)'],
-          ['Right-click','Toggle pet stay/follow'],
-          ['Z / Middle-click', 'Lock on to the nearest enemy you are facing (again to release)'],
-          ['Tab',        'While locked on: next target (Shift+Tab for the previous one)'],
-          ['E',          'Interact / talk / eat / drink / mount'],
-          ['Mounted',    'Left-click is still YOUR weapon or bow — F and G are the mount’s'],
-          ['F',          'Dragon fire breath / mount stomp'],
-          ['G',          'Mount bite (dragon / wyvern)'],
-          ['Space / Q',  'Ascend / descend while flying'],
-          ['P',          'Drop held item (Shift = whole stack)'],
-          ['I / Tab',    'Inventory'],
-          ['B',          'Crafting'],
-          ['C',          'Character customization'],
-          ['R',          'Toggle fly camera (debug)'],
-          ['M',          'Toggle mute audio'],
-          ['H',          'Help (this panel)'],
-          ['Esc',        'Pause — world map, save and load'],
-          ['F8',         'Debug snapshot'],
-          ['F9',         'Toggle auto-snapshot'],
-        ];
-        const addRow = ([key, desc]: [string, string]): void => {
-          const row = document.createElement('div');
-          row.className = 'panel-row';
-          row.style.cssText = 'display:flex;gap:8px;align-items:baseline';
-          const keyEl = document.createElement('span');
-          keyEl.style.cssText = [
-            'font:600 11px system-ui,sans-serif',
-            'background:rgba(205,214,228,0.12)',
-            'border:1px solid rgba(205,214,228,0.25)',
-            'border-radius:4px',
-            'padding:1px 6px',
-            'min-width:80px',
-            'text-align:center',
-            'flex-shrink:0',
-          ].join(';');
-          keyEl.textContent = key;
-          const descEl = document.createElement('span');
-          descEl.style.cssText = 'font:400 11px system-ui,sans-serif;opacity:0.8';
-          descEl.textContent = desc;
-          row.appendChild(keyEl);
-          row.appendChild(descEl);
-          el.appendChild(row);
-        };
-        for (const c of controls) addRow(c);
-
-        // Controller. This panel is the ONLY place the pad bindings are
-        // written down, and the pad can open it (Back), so it is also the
-        // only discoverable place — which is why it lists the two that a
-        // player would otherwise never find: Y for the pack, X for the bench.
-        const padTitle = document.createElement('h2');
-        padTitle.textContent = 'Controller';
-        padTitle.style.cssText = 'margin-top:14px';
-        el.appendChild(padTitle);
-        for (const c of ([
-          ['Left stick', 'Move  ·  pans the map while the chart is focused'],
-          ['Right stick', 'Camera'],
-          ['A',           'Interact / talk  ·  in a menu: press the highlighted control'],
-          ['B',           'Jump  ·  in a menu: close it'],
-          ['X',           'Crafting  ·  in the pack: drop one from the highlighted slot'],
-          ['Y',           'Inventory'],
-          ['D-pad ←→',    'Change active item  ·  in a menu: move the highlight'],
-          ['LB',          'Hold to speak to an NPC'],
-          ['RB',          'Next page (crafting)'],
-          ['Triggers',    'Right: attack  ·  left: lock on  ·  on the chart: zoom in / out'],
-          ['LT',          'Lock on to an enemy (again to release)'],
-          ['Right stick flick', 'While locked on: next target'],
-          ['L3',          'Sprint'],
-          ['R3',          'Character customization'],
-          ['Start',       'Pause — world map, save and load'],
-          ['Back',        'This panel'],
-        ] as [string, string][])) addRow(c);
-
-        const hint = document.createElement('div');
-        hint.className = 'hint';
-        hint.textContent = 'Press H, Back or Esc to close';
-        el.appendChild(hint);
-        return el;
-      });
+      // One binding table, one place. This used to be ~95 lines of inline rows
+      // that were the ONLY documentation of the pad bindings and had quietly gone
+      // stale — no V push-to-talk, no 1-5 hotbar, no map keys. `controls-panel.ts`
+      // is now the single source and the pause screen's Controls sheet renders the
+      // same table, so the two cannot drift again.
+      panels.toggle('help', buildControlsPanel);
       return;
     }
     // Feature 10: M — toggle audio mute.
@@ -8636,7 +8643,13 @@ async function boot() {
   }
 
   /** Drop the lock. Named so every exit reads the same at the call site. */
-  function releaseLock(): void { lockOnId = null; }
+  function releaseLock(): void {
+    // Only tick when a lock was actually held — releaseLock() is also called
+    // defensively when the target dies or leaves range, and a tick with no
+    // preceding lock reads as a phantom input.
+    if (lockOnId !== null) audio.play('lock_off');
+    lockOnId = null;
+  }
 
   /**
    * Acquire, or release if already locked. Returns the new state.
@@ -8652,7 +8665,7 @@ async function boot() {
       buildLockCandidates(), controller.pos[0], controller.pos[2], orbitCam.yaw);
     if (picked === null) return false;
     lockOnId = picked;
-    audio.play('ui_click');
+    audio.play('lock_on');
     return true;
   }
 
@@ -8664,7 +8677,7 @@ async function boot() {
       controller.pos[0], controller.pos[2], orbitCam.yaw, dir);
     if (next !== null && next !== lockOnId) {
       lockOnId = next;
-      audio.play('ui_click');
+      audio.play('lock_on');
     }
   }
 
@@ -8735,6 +8748,7 @@ async function boot() {
     }
     bowDrawing = true;
     bowDrawT = 0;
+    audio.play('bow_draw');
     return true;
   }
 
@@ -8866,7 +8880,10 @@ async function boot() {
         nowS: simTime,
       }));
       saveTintreach();
-      audio.play('thunder', { intensity: 1 });
+      // Its own cue, not the weather's. The recipe's crack/sizzle/decay stages
+      // are cut to STRIKE_S / BURN_S / LIFE_S from tintreach.ts, so the sound
+      // and the light are the same event rather than two that nearly line up.
+      audio.play('tintreach_bolt', { intensity: 1 });
     } else {
       // BALLISTIC. The velocity is the arc solve onto the aim point, not a copy
       // of the camera direction — firing parallel to the camera was wrong twice
@@ -8887,10 +8904,10 @@ async function boot() {
         vx: dir[0] * speed, vy: dir[1] * speed, vz: dir[2] * speed,
         damage, nowS: simTime,
       });
-      // `swing` is the whoosh cue, not a sword-specific one — the closest
-      // thing the roster has to a bowstring. Tintreach keeps `thunder`, which
-      // is the whole point of telling the two shots apart by ear.
-      audio.play('swing');
+      // The roster has a real bowstring now, so the ordinary shot no longer
+      // borrows the sword's whoosh. Tintreach has `tintreach_bolt`, which is
+      // the whole point of telling the two shots apart by ear.
+      audio.play('bow_loose');
     }
 
     invChanged();
@@ -9580,7 +9597,11 @@ async function boot() {
 
   window.addEventListener('mousedown', (e) => {
     if (e.button !== 0 || flyMode || panels.isOpen) return;
-    if (document.pointerLockElement !== canvas) return;
+    // The pad synthesises this event, and a pad-only player never acquires
+    // pointer lock — without the __pad pass RT cannot attack (audio agent's
+    // find). Real mice still need the lock so overlay clicks don't swing.
+    if (document.pointerLockElement !== canvas
+      && !(e as { __pad?: boolean }).__pad) return;
     resolveLeftClick();
   });
 
@@ -9667,6 +9688,18 @@ async function boot() {
       // B backs out of a panel. It does NOT back out of dying: the death card
       // has one exit and it is the Respawn button.
       if (isDead || !panels.isOpen) return false;
+      // One level at a time. The pause screen can have a Settings/Controls/Help
+      // sheet swapped into its body (map-panel.ts `openSheet`); B there means
+      // "back to the chart", not "resume the game" — backing out two levels
+      // from one press is how a player loses a screen they were reading.
+      // The sheet marks its own Back button, so this is one query rather than
+      // any shared state between the two files.
+      const sheetBack = panels.openEl?.querySelector<HTMLElement>('[data-sheet-back]');
+      if (sheetBack) {
+        audio.play('ui_click');
+        sheetBack.click();
+        return true;
+      }
       audio.play('ui_click');
       panels.close();
       return true;
@@ -9707,6 +9740,39 @@ async function boot() {
       if (!panels.isOpen) cycleLock(dir);
     },
   };
+
+  /** 'village' when standing inside a settlement's radius, else null.
+   *  Ruins and ranches are too small to earn their own cue; they read as
+   *  wilds. findNearestSite, NOT nearestSettlement() — the latter resolves a
+   *  full layout and is too heavy per-frame (MUSIC_HOOK.md). */
+  function musicSettlementKind(): 'village' | null {
+    const site = settlementManager.findNearestSite(
+      controller.pos[0], controller.pos[2], 2);
+    if (!site) return null;
+    const dx = controller.pos[0] - site.x;
+    const dz = controller.pos[2] - site.z;
+    const r = SETTLEMENT_RADIUS[site.kind];
+    if (dx * dx + dz * dz > r * r) return null;
+    return site.kind === 'village' || site.kind === 'town' ? 'village' : null;
+  }
+
+  /** The music engine's view of the world, derived once per frame.
+   *  Interiors FIRST: dungeon/building arenas sit at y=-300 with x/z
+   *  unrelated to world space, so any XZ test below would read garbage. */
+  function musicState(tod: number, wx: Weather, paused: boolean): MusicState {
+    const region: MusicState['region'] =
+      dungeonManager.isInside ? 'dungeon'
+      : buildingManager.isInside ? 'interior'
+      : castleManager.collider.inFootprint(controller.pos[0], controller.pos[2]) ? 'castle'
+      : musicSettlementKind() ?? 'wilds';
+    // Dungeon melee holds its own token pool (dungeon-combat.ts) — without
+    // the passthrough, underground fights would read as calm forever.
+    const inCombat = (dungeonManager.isInside
+      ? dungeonManager.meleeHeld : meleeTokens.heldCount) > 0 || lockOnId !== null;
+    const intensity: MusicState['intensity'] =
+      castleManager.hostile ? 'boss' : inCombat ? 'combat' : 'calm';
+    return { region, intensity, tod, weather: wx.rainLevel, paused };
+  }
 
   function tick(now: number) {
     // The clock, not the stepping, is what pause stops — see sim-clock.ts for
@@ -9791,6 +9857,18 @@ async function boot() {
         const heldId = equipped(inventory);
         const isHoldingStaff = heldId === 'oak_staff';
         const isHoldingTorch = heldId === 'torch';
+
+        // Torch light/douse cues. The hand IS the switch (see the burn note
+        // below), so "lit" is holding a torch with fuel in it, and the edges of
+        // that predicate are exactly the moments the player sees the light
+        // change. Driven off the edge rather than off the swap so that a torch
+        // that burns out, a torch put away and a torch drawn all sound right
+        // with one rule.
+        const torchIsLit = isHoldingTorch && torchFuelS > 0;
+        if (torchIsLit !== prevTorchLit) {
+          audio.play(torchIsLit ? 'torch_light' : 'torch_douse');
+          prevTorchLit = torchIsLit;
+        }
 
         // Held torch burns down. This runs inside the fixed-step loop, so the
         // clock is `simTime` and a paused game burns nothing — the leak the
@@ -10196,16 +10274,49 @@ async function boot() {
         night:    isNightForAudio,
         interior: inDungeon,
         fireNear: fireNearIntensity,
+        // Under a roof the open-sky rain bed is ducked and the on-a-roof bed
+        // comes up in its place. `shelter` is the eased value the rain/wind
+        // mixes already use, so the beds cross-fade with them rather than
+        // snapping a beat apart from the sound they are replacing.
+        sheltered: shelter > 0.5,
+        // Room tone. A dungeon and a castle great hall are the two interiors
+        // big enough to have a voice of their own.
+        dungeon: inDungeon ? 1 : 0,
+        castle: underCastleRoof() ? 1 : 0,
       };
       audio.setAmbience(ambienceState);
+      // The score. Runs OUTSIDE the pause gate on purpose: music keeps
+      // playing (ducked) under the pause chart, so it takes wall-clock
+      // `now`, not simTime, which freezes there. Ducks under NPC speech —
+      // idempotent per the bus contract, so calling every frame is the API.
+      music?.update(musicState(tod, wx, paused), now / 1000);
+      music?.duck(voiceOut.pending > 0 ? 1 : 0);
+
+      // Door cue on the interior edge. Buildings and dungeons are both entered
+      // through a door the player never explicitly "opens" — crossing the
+      // threshold IS the interaction — so the transition is the event.
+      const insideNow = buildingManager.isInside || dungeonManager.isInside;
+      if (insideNow !== prevInsideForAudio) {
+        audio.play(insideNow ? 'door_open' : 'door_close');
+        prevInsideForAudio = insideNow;
+      }
 
       // Footstep SFX: tick accumulator while moving on ground.
       if (controller.grounded && controller.moveSpeed > 0 && !flyMode) {
         footstepAccum += SIM_DT;
         if (footstepAccum >= 0.45) {
           footstepAccum = 0;
-          // Grass everywhere for now (surface type detection deferred).
-          audio.play(inDungeon ? 'footstep_stone' : 'footstep_grass');
+          // Surface type, which the roster can finally express. The order is
+          // most-specific-first: a dungeon floor and a plank floor are both
+          // "indoors" but they are not the same sound, and a beach inside the
+          // desert biome is still sand underfoot.
+          const biomeHere = biomeField.biomeAt(controller.pos[0], controller.pos[2]);
+          const surface = inDungeon ? 'footstep_stone'
+            : buildingManager.isInside ? 'footstep_wood'
+              : (biomeHere === 'beach' || biomeHere === 'desert') ? 'footstep_sand'
+                : (biomeHere === 'mountain_forest' || biomeHere === 'alpine') ? 'footstep_stone'
+                  : 'footstep_grass';
+          audio.play(surface);
         }
       } else {
         footstepAccum = 0;
