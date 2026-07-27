@@ -27,6 +27,11 @@
 
 import { box, bevelBox, sphere, capsule, taperedCapsule, cylinder } from '../mesh-utils';
 import type { HeldKind } from '../items';
+// Type-only: erased at build time, so this adds no runtime edge from the
+// character rig to the combat module. Importing the union rather than
+// re-declaring it is what stops a fifth shield tier existing in one file and
+// not the other.
+import type { ShieldTier } from '../combat/shields';
 import { MAT } from '../render/material-table';
 
 export type Color3 = [number, number, number];
@@ -76,6 +81,15 @@ export interface CharacterOptions {
   body?: 'male' | 'female';
   /** Armor pieces to show. Absent = no armor (current geometry unchanged). */
   armor?: ArmorOptions;
+  /**
+   * Shield strapped to the LEFT forearm. Absent = no shield geometry at all.
+   *
+   * Not part of `ArmorOptions` because a shield is not worn — see the note on
+   * `ItemKind` in items.ts. It is drawn whenever the player is CARRYING one,
+   * not only while blocking: a defence you cannot see you have is a defence
+   * nobody uses, and the arm is where it lives when it is not up.
+   */
+  shield?: ShieldTier;
 }
 
 /** Item shown in the right hand (D-M3); swings with the attack pose. */
@@ -150,9 +164,67 @@ export interface Pose {
    * the doll reads as sitting on something.
    */
   seat?: number;
+  /**
+   * Guard, 0 = shield on the arm at rest, 1 = shield up across the chest.
+   *
+   * A THIRD channel, beside `attackT` and `aim`, and for the same reason `aim`
+   * is separate from `attackT`: a block is HELD for as long as the player holds
+   * the button, so it cannot be a one-shot 0→1 the caller has no way to pause.
+   *
+   * It drives the LEFT arm only (plus a small torso twist to present the
+   * board), so it composes with everything on the right: nothing here prevents
+   * the mesh from showing a raised guard and a mid-swing sword at once. The
+   * rule that you may not do both is a GAMEPLAY rule and lives in main.ts —
+   * putting it in the rig would have meant the geometry silently disagreeing
+   * with the simulation the first time the rule was relaxed.
+   */
+  block?: number;
 }
 
 export const IDLE_POSE: Pose = { yaw: 0, walkPhase: 0, walkAmp: 0, attackT: 0 };
+
+/**
+ * Guard-pose joint angles at `block` = 1.
+ *
+ * Pitch convention: + kicks the below-pivot end FORWARD (-Z). The upper arm
+ * hangs below the shoulder and the forearm below the elbow, so a positive
+ * shoulder pitch brings the whole arm forward and a positive elbow pitch folds
+ * the forearm up. The twist swings the LEFT shoulder forward (+ swings the
+ * RIGHT one back), so the doll turns side-on behind its own shield instead of
+ * squaring up to the blow.
+ *
+ * ## WHY THE SHIELD DOES NOT RIDE THESE
+ *
+ * This rig has two joint types — pitch about X and twist about Y — and no ROLL
+ * about Z. That is fine for limbs and fatal for a board whose whole job is
+ * which way its face points, because the shield's normal starts at −Z:
+ *
+ *   - A pitch tilts the face up or down by exactly the angle applied. The first
+ *     attempt used a 1.55 rad elbow bend to bring the shield across the chest,
+ *     and 1.55 rad of pitch turns a vertical board into a HORIZONTAL one. The
+ *     doll came out holding a tray. (It rendered exactly that way; see
+ *     `scripts/_probe-shield-shot.mjs`.)
+ *   - A twist yaws the face left or right by exactly the angle applied, so a
+ *     big enough twist to move the board across the body points it at the
+ *     player's own flank.
+ *   - Any rotation large enough to MOVE the board is large enough to turn it
+ *     away from the thing it is supposed to be between you and.
+ *
+ * Real anatomy solves this with internal rotation of the humerus — a roll about
+ * the arm's own long axis — which this rig cannot express and which is not
+ * worth adding a third joint type and a third branch in the transform loop for.
+ *
+ * So the shield is POSED DIRECTLY: its local position lerps from the hip to the
+ * chest with `block`, it carries its own small tilt and yaw, and it rides the
+ * arm's NATURAL chain (walk swing and torso, no guard terms). At `block` 0 that
+ * chain is bit-identical to the forearm's, so a shield at rest swings with the
+ * arm exactly as a strapped-on board should; at `block` 1 the arm folds up
+ * behind a board that is already where it needs to be. Nobody can see that the
+ * strap is a fiction, and everybody can see a tray.
+ */
+const GUARD_SHOULDER = 0.55;
+const GUARD_ELBOW = 0.95;
+const GUARD_TWIST = 0.22;
 
 /** Total character height (m) — head top, without hair. */
 export const CHARACTER_HEIGHT = 1.62;
@@ -394,6 +466,244 @@ function nockedArrowParts(aim: number, rots: Rot[]): Part[] {
   ];
 }
 
+// --- the shield ---------------------------------------------------------------
+
+/**
+ * Per-tier look. Four fields, one row each, so a retint is a one-line diff and
+ * cannot accidentally give two tiers the same face.
+ *
+ * `motif` is what makes them tell apart across a courtyard, which is the only
+ * distance at which anyone will ever read them: plank seams / metal banding /
+ * overlapping scales.
+ */
+interface ShieldSkin {
+  face: Color3;
+  faceMat: number;
+  /** Boss (the central umbo), rim banding and motif furniture. */
+  trim: Color3;
+  trimMat: number;
+  /** The running stitch around the rim. Thread, not metal. */
+  stitch: Color3;
+  motif: 'planks' | 'bands' | 'scales';
+}
+
+/**
+ * DRAGONSCALE IS THE BOSS PALETTE, NOT THE ARMOUR PALETTE.
+ *
+ * `dragonscale_helm`/`_chest`/`_legs` are emerald (`ARMOR_TINT.dragon`) and
+ * gilded (`ARMOR_MATERIAL.dragon` = GOLD), which was a deliberate choice made
+ * when the only dragons were the green wild ones. The shield is black hide and
+ * oxblood — `creature-parts.ts`'s `black_dragon` body and accent, the Evil
+ * King's own chroma. The divergence is the point: this is the one piece of gear
+ * that turns dragon fire, and it should look like it was cut off the thing in
+ * the tower rather than off a wyvern in a field.
+ *
+ * It is also the first thing on the character rig to use `MAT.SCALE`. The
+ * armour tier avoided it on purpose (see `ARMOR_MATERIAL`'s note) because
+ * gilded plate is not reptilian; a shield made of literal scales is.
+ */
+const SHIELD_SKIN: Record<ShieldTier, ShieldSkin> = {
+  wood: {
+    face: [0.58, 0.42, 0.24], faceMat: MAT.WOOD,
+    trim: [0.30, 0.30, 0.33], trimMat: MAT.IRON,
+    stitch: [0.92, 0.88, 0.75], motif: 'planks',
+  },
+  bronze: {
+    face: [0.70, 0.47, 0.25], faceMat: MAT.IRON,
+    trim: [0.90, 0.66, 0.35], trimMat: MAT.IRON,
+    stitch: [0.92, 0.88, 0.75], motif: 'bands',
+  },
+  iron: {
+    face: [0.66, 0.68, 0.74], faceMat: MAT.IRON,
+    trim: [0.88, 0.90, 0.94], trimMat: MAT.IRON,
+    stitch: [0.90, 0.86, 0.76], motif: 'bands',
+  },
+  dragonscale: {
+    face: [0.085, 0.080, 0.092], faceMat: MAT.SCALE,
+    trim: [0.46, 0.085, 0.080], trimMat: MAT.SCALE,
+    stitch: [0.52, 0.11, 0.10], motif: 'scales',
+  },
+};
+
+// Board geometry, body-local, against the LEFT forearm (x -0.37..-0.27,
+// y 0.72..1.02, z -0.08..0.09).
+//
+// The clearance rule is in Z, not in X. Held items in the right hand are kept
+// OUTBOARD in x so nothing interpenetrates the sleeve; a shield is the opposite
+// shape of problem — it is SUPPOSED to cover the arm from the front — so the
+// board sits entirely forward of the forearm's front face (z <= -0.106 against
+// the arm's -0.08) and overlaps it freely in x and y. That is what makes it
+// read as strapped on rather than floating beside the elbow.
+/** Centre line of the MALE left forearm — the reference every offset is from. */
+const MALE_FORE_CX = -0.32;
+
+const SH_REST_X = -0.375;
+const SH_REST_Y = 0.90;
+const SH_REST_Z = -0.160;
+
+/**
+ * Where the board sits at full guard: across the chest, edge past the
+ * centreline, with the fist tucked ~2 cm behind its back face.
+ *
+ * Solved against the arm pose rather than eyeballed. `GUARD_ELBOW` 0.95 then
+ * `GUARD_SHOULDER` 0.55 puts the left fist at roughly (−0.32, 1.03, −0.35);
+ * the board's back face lands at z −0.38, so the hand is behind the board and
+ * the board covers it. Change either angle and this wants re-solving.
+ */
+const SH_GUARD_X = -0.19;
+const SH_GUARD_Y = 1.08;
+const SH_GUARD_Z = -0.42;
+
+/** Board lean at full guard: the top tips slightly away, as a braced shield does. */
+const SH_GUARD_TILT = -0.10;
+/** Board yaw at full guard: angled across the body so a blow glances off it. */
+const SH_GUARD_YAW = 0.28;
+
+/** Board half-width in x. Times SH_SY for the half-height: a tall heater. */
+const SH_R = 0.225;
+const SH_SY = 1.16;
+/** Flattening in z. 0.225 * 0.19 = 0.043 half-depth — a board, not a bowl. */
+const SH_SZ = 0.19;
+
+/**
+ * The shield, in body-local space, on the caller's rotation chain (the left
+ * forearm's).
+ *
+ * The board is an ELLIPSOID, not a box, for the reason recorded in the graphics
+ * gotchas: a large flat face shades to exactly one value and reads as a
+ * rectangle pasted onto the arm — which is what the very first pass looked
+ * like. A rounded board catches a gradient across its whole width and the
+ * chamfer at the rim does the rest.
+ *
+ * The rim is EIGHT SEPARATE STITCHES rather than a torus. A torus at this size
+ * costs several hundred verts to say "there is an edge here"; eight little
+ * knots say "somebody sewed this", which in a world made of wool is the more
+ * useful sentence, and they cost 36 verts each.
+ */
+function shieldParts(
+  tier: ShieldTier, armRots: Rot[], guard: number,
+  /** Signed x of the LEFT forearm's centre line: male −0.32, female −0.2938. */
+  foreCx: number,
+  /** Height scale: 1 for the male rig, 0.96 for the female one. */
+  yScale: number,
+): Part[] {
+  const s = SHIELD_SKIN[tier];
+  const out: Part[] = [];
+
+  // ANCHORED TO THE ARM IT IS STRAPPED TO, not to hard-coded male numbers.
+  //
+  // The female rig's forearm sits 2.6 cm further inboard and its shoulder and
+  // elbow are 4% lower, so a shield authored against the male arm hangs off the
+  // side of a woman's and rides high. `foreCx` and `yScale` are the two numbers
+  // that fixes; everything else in the shield is expressed relative to them.
+  const scale = yScale;
+  const R = SH_R * scale;
+  const ry = R * SH_SY;
+  const rz = R * SH_SZ;
+  // Outboard offset from the forearm's centre line — the strap, in effect.
+  const restX = foreCx + (SH_REST_X - MALE_FORE_CX) * scale;
+  // The guard position is a fraction of the way across the CHEST, so it scales
+  // with the body's width rather than with the arm's offset.
+  const guardX = SH_GUARD_X * (foreCx / MALE_FORE_CX);
+
+  // Hip -> chest. See GUARD_SHOULDER's note for why this is a lerp and not a
+  // joint chain.
+  const cx = restX + (guardX - restX) * guard;
+  const cy = (SH_REST_Y + (SH_GUARD_Y - SH_REST_Y) * guard) * scale;
+  const cz = SH_REST_Z + (SH_GUARD_Z - SH_REST_Z) * guard;
+
+  // Its own tilt and yaw, pivoted on the board itself so they turn it in place
+  // rather than swinging it somewhere else. Both are 0 at rest, and the
+  // transform loop drops zero-angle rotations, so a shield at rest is
+  // bit-identical to one built with no guard channel at all.
+  const rots: Rot[] = [
+    pitch(guard * SH_GUARD_TILT, cy, cz),
+    twistY(guard * SH_GUARD_YAW, cx, cz),
+    ...armRots,
+  ];
+
+  // Front face of the board — everything decorative sits proud of this.
+  const front = cz - rz;
+
+  // RIM BAND, drawn FIRST and slightly larger than the board so a ring of it
+  // shows all the way round.
+  //
+  // This is the single thing that makes a shield read as a shield rather than
+  // as a lump on the arm. The first pass had no band: the board was one flat
+  // colour close to the default tunic's, and at two metres in a screenshot it
+  // vanished into the doll. A bright edge is what gives it a silhouette, and it
+  // costs 120 verts to say so, which is cheaper than every alternative that was
+  // tried first (a darker board, a bigger board, a brighter face — none of
+  // which survive being backlit).
+  //
+  // Squashed a touch flatter in z than the board so the band is an EDGE rather
+  // than a second board peeking out in front.
+  out.push(spherePart(s.trim, rots, cx, cy, cz, R * 1.075,
+    SH_SY, SH_SZ * 0.80, 10, 3, s.trimMat));
+
+  // Board.
+  out.push(spherePart(s.face, rots, cx, cy, cz, R,
+    SH_SY, SH_SZ, 10, 4, s.faceMat));
+
+  // Motif, drawn on the face and slightly proud of it so it is never z-fighting
+  // the ellipsoid it decorates.
+  if (s.motif === 'planks') {
+    // Two seams down the boards. Inset in y so they stop short of the curved
+    // rim instead of hanging off it.
+    for (const dx of [-0.075, 0.075]) {
+      out.push(part(s.trim, rots,
+        cx + dx - 0.010, cy - ry * 0.72, front - 0.008,
+        cx + dx + 0.010, cy + ry * 0.72, front + 0.020, MAT.WOOD));
+    }
+  } else if (s.motif === 'bands') {
+    for (const dy of [-ry * 0.52, ry * 0.52]) {
+      out.push(part(s.trim, rots,
+        cx - R * 0.86, cy + dy - 0.022, front - 0.008,
+        cx + R * 0.86, cy + dy + 0.022, front + 0.020, s.trimMat));
+    }
+  } else {
+    // Three overlapping scales down the face, shrinking toward the point.
+    const rows: [number, number][] = [[0.58, 0.058], [0.16, 0.050], [-0.28, 0.042]];
+    for (const [t, r] of rows) {
+      out.push(spherePart(s.trim, rots,
+        cx, cy + ry * t, front + r * 0.30, r, 0.85, 0.55, 5, 3, MAT.SCALE));
+    }
+  }
+
+  // Boss: the umbo, dead centre, proud of the face.
+  out.push(spherePart(s.trim, rots, cx, cy, front + 0.012, 0.055,
+    1, 0.85, 6, 3, s.trimMat));
+
+  // Running stitch round the rim: eight short DASHES, each lying along the
+  // rim's tangent at the point it sits.
+  //
+  // The first pass made them 4 cm cubes and they read as ice cubes stuck to
+  // the edge — a stitch is a mark that follows a line, and a cube follows
+  // nothing. Boxes are axis-aligned in this rig, so the tangent is approximated
+  // by swapping which axis is long: near the top and bottom of the ellipse the
+  // dash is wide and thin, near the sides it is tall and narrow, and it blends
+  // between them. That is enough at 2 m, which is the only distance anyone
+  // will ever look at this from.
+  //
+  // Offset by half a step so no dash lands exactly on the widest point, where
+  // it would silhouette as a bump instead of as part of a run.
+  for (let i = 0; i < 8; i++) {
+    const a = (i + 0.5) * (Math.PI / 4);
+    const ca = Math.cos(a);
+    const sa = Math.sin(a);
+    const kx = cx + ca * R * 1.02;
+    const ky = cy + sa * ry * 1.02;
+    // |sin| near the top/bottom -> long in x; |cos| near the sides -> long in y.
+    const hx = 0.008 + 0.018 * Math.abs(sa);
+    const hy = 0.008 + 0.018 * Math.abs(ca);
+    out.push(part(s.stitch, rots,
+      kx - hx, ky - hy, front + 0.004,
+      kx + hx, ky + hy, front + 0.020, MAT.KNIT));
+  }
+
+  return out;
+}
+
 // --- held items --------------------------------------------------------------
 
 const WOOD: Color3 = [0.40, 0.28, 0.16];
@@ -621,6 +931,10 @@ export function buildCharacterMesh(
     ? -swing * 0.7 * (1 - seat) + seat * SEAT_THIGH_PITCH
     : -swing * 0.7;
   const armPitch = -swing * 0.5;
+  // Guard, 0..1. Clamped like `aim` and `seat`; a caller easing it will pass
+  // out-of-range values on the first frame of a lerp often enough that this is
+  // not defensive, it is the contract.
+  const guard = Math.min(Math.max(pose.block ?? 0, 0), 1);
 
   // Keyframed chop: overhead windup → downward strike → recovery, with the
   // torso coiling back then leaning into the blow. All joints return to rest
@@ -635,8 +949,15 @@ export function buildCharacterMesh(
   // Torso chain shared by everything above the hips (not the legs).
   // Seated adds a small forward settle so the rider is over the withers
   // rather than bolt upright like a fence post.
+  //
+  // The guard twist rides on `chop.twist` rather than on its own joint: they
+  // are the same axis through the same pivot, and two twistY entries in one
+  // chain would compose to the sum anyway while costing a second rotation on
+  // every vertex above the hips. Adding 0 when `guard` is 0 keeps every golden
+  // hash — the `r.a !== 0` skip in the transform loop drops the whole rotation.
   const torsoRots: Rot[] =
-    [pitch(chop.lean - seat * SEAT_TORSO_LEAN, hipY), twistY(chop.twist)];
+    [pitch(chop.lean - seat * SEAT_TORSO_LEAN, hipY),
+      twistY(chop.twist + guard * GUARD_TWIST)];
 
   // ----- torso masses (see TorsoProfile) -----------------------------------
   // Generous vertical overlap between neighbours: gaps would read as three
@@ -671,11 +992,21 @@ export function buildCharacterMesh(
   const rHeldRots: Rot[] = bowWrist !== 0
     ? [pitch(bowWrist, wristY, -0.02), ...rForeRots]
     : rForeRots;
-  const lArmRots: Rot[] = [pitch(armPitch + chop.offShoulder, shoulderY), ...torsoRots];
+  // The arm's chain WITHOUT the guard: the walk swing, the bow draw, the torso.
+  // The shield hangs off this rather than off the guard-folded forearm — see
+  // GUARD_SHOULDER's note. Identical to `lArmRots` whenever `guard` is 0.
+  const lArmNatural: Rot[] =
+    [pitch(armPitch + chop.offShoulder, shoulderY), ...torsoRots];
+  const lArmRots: Rot[] =
+    [pitch(armPitch + chop.offShoulder + guard * GUARD_SHOULDER, shoulderY),
+      ...torsoRots];
   // Left forearm: identical to lArmRots at rest (offElbow 0 makes pitch() a
-  // no-op rotation), so the idle mesh is unchanged; only a draw bends it.
-  const lForeRots: Rot[] = chop.offElbow !== 0
-    ? [pitch(chop.offElbow, elbowY), ...lArmRots]
+  // no-op rotation), so the idle mesh is unchanged; only a draw or a raised
+  // guard bends it. The `!== 0` test must consider BOTH contributors or a
+  // guard with no draw would silently keep the arm straight.
+  const lElbow = chop.offElbow + guard * GUARD_ELBOW;
+  const lForeRots: Rot[] = lElbow !== 0
+    ? [pitch(lElbow, elbowY), ...lArmRots]
     : lArmRots;
 
   // sleeveTop: top of the upper-arm capsule.  For male this must be the
@@ -1041,6 +1372,21 @@ export function buildCharacterMesh(
     }
   }
 
+  // The shield rides the LEFT forearm chain, so `pose.block` moves it for free
+  // through the same joints that move the arm — there is no second transform
+  // here and no way for the board to drift off the arm it is strapped to.
+  //
+  // Gated on CARRYING one, not on blocking: an unused shield hangs at the side.
+  //
+  // `lArmNatural`, not `lForeRots`: the shield rides the arm's WALK SWING and
+  // the torso, and poses itself for the guard. See GUARD_SHOULDER. At `guard`
+  // 0 with no bow draw the two chains are identical, so nothing about a shield
+  // at rest depends on this distinction — only the raise does.
+  if (options?.shield !== undefined) {
+    parts.push(...shieldParts(options.shield, lArmNatural, guard,
+      -(forI + forO) * 0.5, isFemale ? 0.96 : 1));
+  }
+
   const totalVerts = parts.reduce((n, p) => n + p.verts.length / 6, 0);
   const floats = totalVerts * 10;
   // Callers that rebuild every frame (the player, every visible NPC) pass a
@@ -1149,7 +1495,24 @@ export function buildCharacterMesh(
  * failing assertion rather than as a black screen, which is the entire reason
  * it replaced the old single hand-picked case.
  *
- * At 40 B/vertex this is 296 KB per character buffer, ~3.8 MB across the ~13
+ * Raised to 8100 for the SHIELD. A carried shield is 612 verts (board + boss +
+ * eight rim stitches + a two-piece motif) and 720 for dragonscale, whose motif
+ * is three scale masses rather than two flat strips. It is drawn whenever the
+ * player carries one — not only while blocking — so it lands on the worst case
+ * unconditionally: 6933 → 7653 (female, dragonscale armour, NPC accessories,
+ * bow at half draw, dragonscale shield).
+ *
+ * The sweep was widened at the same time and this is the important half of the
+ * change. Adding `shield` to `CharacterOptions` and `block` to `Pose` are two
+ * NEW axes of the option space, and a budget swept over the old axes would have
+ * reported green while missing 720 verts — exactly the "one hand-picked
+ * combination" failure that produced the black screen at 5200, in a new
+ * costume. The sweep now covers 5 shield states × 11 poses on top of everything
+ * it already did (36,960 builds).
+ *
+ * 8100 leaves 447 verts of headroom, the same margin 7400 left over 6933.
+ *
+ * At 40 B/vertex this is 324 KB per character buffer, ~4.2 MB across the ~13
  * humanoids on screen — nothing against the render budget.
  */
-export const CHARACTER_MAX_VERTS = 7400;
+export const CHARACTER_MAX_VERTS = 8100;

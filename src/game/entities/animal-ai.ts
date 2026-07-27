@@ -156,7 +156,45 @@ type CombatState = EntityState & {
   /** What it is running from, when that is not the player. */
   _fleeFromX?: number;
   _fleeFromZ?: number;
+  /**
+   * Seconds of stagger remaining — the whole AI is frozen while this is > 0.
+   *
+   * Written only by `staggerAnimal`, which is only called by a successful
+   * parry (`combat/shields.ts`). Counted down in `stepAnimal`, so it stops with
+   * the sim clock and a paused game neither eats nor extends it.
+   */
+  _staggerS?: number;
 };
+
+/**
+ * Take this creature out of the fight for `seconds` — a parry landed.
+ *
+ * Exported as a function rather than a field on `EntityState` on purpose: this
+ * is AI-private state (see the `CombatState` note above), and the two callers
+ * that need it — the overworld damage path and the dungeon one — should be
+ * saying "stagger this thing" rather than reaching into the AI's bookkeeping.
+ *
+ * Additive-max rather than additive: two parries inside one stagger extend it
+ * to the longer of the two, they do not stack into a stun-lock. A boss with two
+ * players' worth of parries landing on it would otherwise never move again, and
+ * the same rule keeps a pack of goblins from being permanently frozen by a
+ * player who has learned the timing.
+ */
+export function staggerAnimal(e: EntityState, seconds: number): void {
+  const c = e as CombatState;
+  if (seconds <= 0) return;
+  c._staggerS = Math.max(c._staggerS ?? 0, seconds);
+}
+
+/** Seconds of stagger left on this creature. 0 when it is free to act. */
+export function staggerRemaining(e: EntityState): number {
+  return (e as CombatState)._staggerS ?? 0;
+}
+
+/** True while a parry has this creature reeling. */
+export function isStaggered(e: EntityState): boolean {
+  return staggerRemaining(e) > 0;
+}
 
 /** A ranged attack this creature is loosing right now. */
 export interface RangedShot {
@@ -687,6 +725,33 @@ export function stepAnimal(
   // Collision radius scales with the animal; water species skip solids entirely.
   const radius  = Math.max(0.3, speciesDef.size * 0.45);
   const collide = isWater ? undefined : moveXZ;
+
+  // ---- Parry stagger -------------------------------------------------------
+  //
+  // Reeling: no movement, no targeting, no swing. Returned from BEFORE the LOD
+  // gates, the owned-stay branch and the whole state machine, because a
+  // staggered creature should do nothing at all and every branch below this
+  // does something.
+  //
+  // `stateTimer` is parked at a full cadence for the same reason the
+  // token-denied and out-of-reach branches park it: `creature-anim.ts` starts a
+  // windup when the timer counts down to the move's `contactT`, so leaving it
+  // near zero would have a staggered enemy winding up a blow it cannot throw,
+  // and then throwing it the instant the stagger ended with no tell at all.
+  // Recovery therefore costs the attacker a fresh cadence on top of the
+  // stagger, which is the "opening" a parry is supposed to buy.
+  //
+  // `y` is deliberately NOT touched. Every other early-return in this function
+  // re-pins y to the ground, but those branches have all just MOVED the body;
+  // this one has not, so re-solving the terrain here would be a no-op on foot
+  // and would yank a parried flier out of the air, where `main.ts` owns
+  // altitude. Doing nothing is the whole contract of this branch.
+  const reeling = e as CombatState;
+  if ((reeling._staggerS ?? 0) > 0) {
+    reeling._staggerS = Math.max(0, (reeling._staggerS ?? 0) - dtS);
+    e.stateTimer = attackCadence(speciesDef);
+    return;
+  }
 
 
   // ---- Owned stay/sit (right-click toggle) ---------------------------------

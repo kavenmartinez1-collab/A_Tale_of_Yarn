@@ -2,8 +2,8 @@
  * admit it: a pad player who never clicked the canvas holds no pointer lock,
  * and without the mark RT could not attack at all (found by the audio agent,
  * fixed here). `cancelable` for symmetry with the keyboard synthesis. */
-function padMouse(type: 'mousedown' | 'mouseup'): MouseEvent {
-  const ev = new MouseEvent(type, { button: 0, bubbles: true, cancelable: true });
+function padMouse(type: 'mousedown' | 'mouseup', button = 0): MouseEvent {
+  const ev = new MouseEvent(type, { button, bubbles: true, cancelable: true });
   (ev as { __pad?: boolean }).__pad = true;
   return ev;
 }
@@ -208,6 +208,15 @@ export interface PadIntent {
   look: { dx: number; dy: number };
   /** True while the attack input is held (right trigger). */
   attack: boolean;
+  /**
+   * True while the block input is held (right BUMPER).
+   *
+   * A hold, exactly like `attack`, because the parry window is measured from
+   * the press edge and a raised guard has to stay raised. An edge-toggled
+   * shield would make "hold block" impossible to express and would make the
+   * parry window unreachable — you cannot time a press you did not make.
+   */
+  block: boolean;
   /** Focus-cursor step for this poll — UI context only, else (0, 0). */
   nav: { dx: number; dy: number };
   /** Left stick post-dead-zone, for the map pane's analog pan. */
@@ -303,6 +312,12 @@ export function mapPad(
         dy: look.y * cfg.lookSpeed * dtSec * sign,
       },
       attack: !uiMode && isDown(pad, BUTTON.RT, cfg.triggerThreshold),
+      // RB blocks — in GAMEPLAY only. In a panel RB is still "next crafting
+      // page" (the edge handler in poll()), and the two never contend because
+      // `uiMode` is one boolean decided once per poll: the same button, two
+      // contexts, exactly like RT (attack / zoom in) and LT (lock-on / zoom
+      // out) already are. RB was the last unclaimed gameplay button on the pad.
+      block: !uiMode && isDown(pad, BUTTON.RB, cfg.triggerThreshold),
       nav: uiMode ? navDirection(pad, cfg, navFromStick) : { dx: 0, dy: 0 },
       stick: move,
     },
@@ -417,6 +432,7 @@ export class GamepadInput {
   private held = new Set<string>();
   private buttons: ButtonState = {};
   private attackHeld = false;
+  private blockHeld = false;
   /** Index of the pad we are following, or -1. */
   private padIndex = -1;
   /** Focus-cursor direction currently held, and time to the next repeat. */
@@ -461,6 +477,14 @@ export class GamepadInput {
     if (this.attackHeld) {
       window.dispatchEvent(padMouse('mouseup'));
       this.attackHeld = false;
+    }
+    // A pad yanked out with RB down must drop the guard, for the same reason it
+    // must close the microphone: a shield stuck up forever is a player who
+    // moves at half speed and cannot swing, with nothing on screen to explain
+    // why and no button left that would clear it.
+    if (this.blockHeld) {
+      window.dispatchEvent(padMouse('mouseup', 2));
+      this.blockHeld = false;
     }
     this.buttons = {};
     this.navDx = 0;
@@ -642,6 +666,22 @@ export class GamepadInput {
     if (intent.attack !== this.attackHeld) {
       window.dispatchEvent(padMouse(intent.attack ? 'mousedown' : 'mouseup'));
       this.attackHeld = intent.attack;
+    }
+
+    // Block is the same shape as attack, one button along: RB synthesises the
+    // RIGHT mouse button, which is what the keyboard-and-mouse player holds.
+    // Synthesising the event the game already listens for is the rule this
+    // whole module is built on, and it means `main.ts` has exactly one block
+    // input path rather than a mouse one and a pad one free to drift.
+    //
+    // Edge-diffed, not dispatched every frame: `setGuardInput` only acts on
+    // transitions, but a mousedown per frame would re-stamp `raisedAtS` sixty
+    // times a second and turn a held guard into a permanent parry window —
+    // exactly the exploit `PARRY_REARM_S` exists to prevent, handed out for
+    // free to anyone holding a bumper.
+    if (intent.block !== this.blockHeld) {
+      window.dispatchEvent(padMouse(intent.block ? 'mousedown' : 'mouseup', 2));
+      this.blockHeld = intent.block;
     }
 
     if (intent.look.dx !== 0 || intent.look.dy !== 0) {

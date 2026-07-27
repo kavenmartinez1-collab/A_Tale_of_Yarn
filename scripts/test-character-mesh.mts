@@ -308,8 +308,8 @@ check('golden female-full-iron hash',
 // Raised to 6200 when armour became real geometry. The sweep below, not this
 // constant, is what actually secures the budget — see CHARACTER_MAX_VERTS's
 // doc comment in character-mesh.ts for the black-screen this caused.
-check('CHARACTER_MAX_VERTS is 7400 (three-mass torso + deltoids + bust)',
-  CHARACTER_MAX_VERTS === 7400);
+check('CHARACTER_MAX_VERTS is 8100 (three-mass torso + deltoids + bust + shield)',
+  CHARACTER_MAX_VERTS === 8100);
 
 // ---- dragonscale tier: bone horn/spike boxes --------------------------------
 const maleFullDragon = buildCharacterMesh(DEFAULT_CUSTOMIZATION, IDLE_POSE, null,
@@ -346,9 +346,17 @@ check('full dragonscale ≤ CHARACTER_MAX_VERTS',
 // adds a nocked arrow (shaft + head + two fletches) that exists at no other
 // attackT and in no other hand. A sweep over IDLE_POSE alone would have
 // reported the budget green while the real worst case sat four parts higher.
+//
+// SHIELDS ADDED TWO MORE AXES and both had to come in here at the same time as
+// the geometry, not after it. `CharacterOptions.shield` adds up to 720 verts
+// unconditionally (the shield is drawn whenever it is CARRIED, not only while
+// blocking), and `Pose.block` moves the left arm — so a sweep missing either
+// would have secured a budget for a character that does not exist. Worst case
+// went 6933 → 7653 and the cap 7400 → 8100 on the strength of this loop.
 {
   const TIERS = [undefined, 'fiber', 'leather', 'iron', 'dragon'] as const;
-  const HELD_KINDS = [null, 'sword', 'axe', 'pickaxe', 'bow', 'staff'] as const;
+  const HELD_KINDS = [null, 'sword', 'axe', 'pickaxe', 'bow', 'staff', 'torch'] as const;
+  const SHIELDS = [undefined, 'wood', 'bronze', 'iron', 'dragonscale'] as const;
   const POSES: { name: string; pose: typeof IDLE_POSE }[] = [
     { name: 'idle',     pose: IDLE_POSE },
     { name: 'walk',     pose: { yaw: 0.7, walkPhase: 1.2, walkAmp: 1, attackT: 0 } },
@@ -360,6 +368,17 @@ check('full dragonscale ≤ CHARACTER_MAX_VERTS',
     // The genuine worst case for a mounted archer: seated AND at full draw.
     { name: 'seated-draw',
       pose: { yaw: 0, walkPhase: 0.6, walkAmp: 1, attackT: 1, aim: 1, seat: 1 } },
+    // Guard, at rest and mid-stride, plus the two combinations gameplay
+    // forbids (guard + draw, guard + seat). Forbidden by the SIM is not the
+    // same as impossible to BUILD, and a budget that assumes the sim's rules
+    // is a budget that breaks the day someone relaxes one.
+    { name: 'guard',      pose: { yaw: 0, walkPhase: 0, walkAmp: 0, attackT: 0, block: 1 } },
+    { name: 'guard-half', pose: { yaw: 0, walkPhase: 0, walkAmp: 0, attackT: 0, block: 0.5 } },
+    { name: 'guard-walk', pose: { yaw: 0.3, walkPhase: 1.2, walkAmp: 1, attackT: 0, block: 1 } },
+    { name: 'guard-draw',
+      pose: { yaw: 0, walkPhase: 0, walkAmp: 0, attackT: 1, aim: 1, block: 1 } },
+    { name: 'guard-seat',
+      pose: { yaw: 0, walkPhase: 0.6, walkAmp: 1, attackT: 1, aim: 1, seat: 1, block: 1 } },
   ];
   const ACC = {
     skirt: [0.4, 0.3, 0.5], belt: [0.3, 0.2, 0.1], apron: [0.6, 0.6, 0.6],
@@ -367,25 +386,31 @@ check('full dragonscale ≤ CHARACTER_MAX_VERTS',
   } as never;
   let worst = 0;
   let worstDesc = '';
+  let builds = 0;
   for (const body of ['male', 'female'] as const) {
     for (const hairStyle of [0, 1, 2, 3]) {
       for (const accessories of [undefined, ACC]) {
         for (const tier of TIERS) {
           for (const heldKind of HELD_KINDS) {
-            for (const { name: poseName, pose } of POSES) {
-              const custom = { ...DEFAULT_CUSTOMIZATION, hairStyle, accessories } as never;
-              const held: HeldItem | null = heldKind === null
-                ? null : { kind: heldKind, color: [0.7, 0.7, 0.7] };
-              const mesh = buildCharacterMesh(custom, pose, held, {
-                body,
-                armor: tier === undefined
-                  ? undefined : { head: tier, body: tier, legs: tier },
-              });
-              const n = mesh.length / 10;
-              if (n > worst) {
-                worst = n;
-                worstDesc = `${body} hair${hairStyle} ${tier ?? 'none'} ` +
-                  `${accessories ? 'acc' : 'no-acc'} ${heldKind ?? 'empty'} ${poseName}`;
+            for (const shield of SHIELDS) {
+              for (const { name: poseName, pose } of POSES) {
+                const custom = { ...DEFAULT_CUSTOMIZATION, hairStyle, accessories } as never;
+                const held: HeldItem | null = heldKind === null
+                  ? null : { kind: heldKind, color: [0.7, 0.7, 0.7] };
+                const mesh = buildCharacterMesh(custom, pose, held, {
+                  body,
+                  armor: tier === undefined
+                    ? undefined : { head: tier, body: tier, legs: tier },
+                  shield,
+                });
+                builds++;
+                const n = mesh.length / 10;
+                if (n > worst) {
+                  worst = n;
+                  worstDesc = `${body} hair${hairStyle} ${tier ?? 'none'} ` +
+                    `${accessories ? 'acc' : 'no-acc'} ${heldKind ?? 'empty'} ` +
+                    `shield=${shield ?? 'none'} ${poseName}`;
+                }
               }
             }
           }
@@ -395,7 +420,7 @@ check('full dragonscale ≤ CHARACTER_MAX_VERTS',
   }
   check('every buildCharacterMesh combination fits CHARACTER_MAX_VERTS',
     worst <= CHARACTER_MAX_VERTS,
-    `worst=${worst} (${worstDesc}) cap=${CHARACTER_MAX_VERTS}`);
+    `worst=${worst} (${worstDesc}) cap=${CHARACTER_MAX_VERTS} over ${builds} builds`);
   // Keep the cap honest in the other direction too — a cap far above the real
   // maximum is wasted per-character GPU memory across every humanoid.
   check('CHARACTER_MAX_VERTS is not wildly oversized (≤ 1.6x the true worst)',
@@ -632,6 +657,142 @@ check('female attack pose changes the mesh',
     { yaw: 0, walkPhase: 0, walkAmp: 0, attackT: 0, aim: 4, seat: -3 }, bow);
   check('aim/seat clamp to [0,1]',
     fnv1a(new Uint8Array(overdrawn.buffer)) === fnv1a(new Uint8Array(fullDraw.buffer)));
+}
+
+// ---- shields and the guard pose ---------------------------------------------
+//
+// Two independent things, tested together because they only make sense
+// together: `CharacterOptions.shield` is the geometry, `Pose.block` is what
+// moves it. Neither is worth much if the board ends up on the sword arm or if
+// raising the guard turns out to move nothing.
+{
+  const SHIELD_TIERS = ['wood', 'bronze', 'iron', 'dragonscale'] as const;
+  const GUARD = { yaw: 0, walkPhase: 0, walkAmp: 0, attackT: 0, block: 1 };
+
+  // 1. `block` is a no-op when absent or zero — the golden hashes above are
+  //    only meaningful if adding a pose channel did not move the idle mesh.
+  const blockZero = buildCharacterMesh(DEFAULT_CUSTOMIZATION,
+    { yaw: 0, walkPhase: 0, walkAmp: 0, attackT: 0, block: 0 });
+  check('block: 0 is bit-identical to omitting block',
+    fnv1a(new Uint8Array(blockZero.buffer)) === fnv1a(new Uint8Array(idle.buffer)));
+
+  // 2. ...and a shieldless guard still moves the doll. If this passed only
+  //    because the shield geometry appeared, the pose channel would be doing
+  //    nothing and a shieldless player raising nothing would be invisible.
+  const guardNoShield = buildCharacterMesh(DEFAULT_CUSTOMIZATION, GUARD);
+  check('a raised guard changes the mesh even with no shield on the arm',
+    fnv1a(new Uint8Array(guardNoShield.buffer)) !== fnv1a(new Uint8Array(idle.buffer)));
+  check('...without changing the vertex count (pose, not geometry)',
+    guardNoShield.length === idle.length,
+    `${guardNoShield.length / 10} vs ${vertCount}`);
+
+  for (const tier of SHIELD_TIERS) {
+    const rest = buildCharacterMesh(DEFAULT_CUSTOMIZATION, IDLE_POSE, null, { shield: tier });
+    const rest2 = buildCharacterMesh(DEFAULT_CUSTOMIZATION, IDLE_POSE, null, { shield: tier });
+    const up = buildCharacterMesh(DEFAULT_CUSTOMIZATION, GUARD, null, { shield: tier });
+
+    check(`${tier} shield adds geometry`, rest.length > idle.length,
+      `${rest.length / 10} vs ${vertCount}`);
+    check(`${tier} shield is deterministic`,
+      fnv1a(new Uint8Array(rest.buffer)) === fnv1a(new Uint8Array(rest2.buffer)));
+    check(`${tier} shield fits CHARACTER_MAX_VERTS`,
+      rest.length / 10 <= CHARACTER_MAX_VERTS, `${rest.length / 10}`);
+
+    // On the LEFT arm. The held-item tests assert `maxX > 0.35` for the right
+    // hand; this is the mirror, and it is the assertion that would have caught
+    // a sign flip in SH_CX — which renders as the doll holding two swords.
+    const { minX, maxX } = xExtent(rest);
+    const baseX = xExtent(idle);
+    check(`${tier} shield hangs off the left side`,
+      minX < baseX.minX - 0.1, `minX ${minX.toFixed(3)} vs base ${baseX.minX.toFixed(3)}`);
+    check(`${tier} shield does not widen the right side`,
+      Math.abs(maxX - baseX.maxX) < 1e-6,
+      `maxX ${maxX.toFixed(3)} vs base ${baseX.maxX.toFixed(3)}`);
+
+    // Raising it puts the board in FRONT of the body. -Z is forward, so the
+    // guard has to push the mesh's minimum z out past what the arm-at-rest
+    // reaches. This is the one assertion that proves the pose does the job the
+    // mechanic needs rather than merely being different.
+    const restZ = aabb(rest).lo[2];
+    const upZ = aabb(up).lo[2];
+    check(`${tier} shield comes UP in front of the chest when blocking`,
+      upZ < restZ - 0.15, `z ${restZ.toFixed(3)} -> ${upZ.toFixed(3)}`);
+    check(`${tier} raised guard keeps the same vertex count`,
+      up.length === rest.length);
+    check(`${tier} raised guard fits CHARACTER_MAX_VERTS`,
+      up.length / 10 <= CHARACTER_MAX_VERTS, `${up.length / 10}`);
+  }
+
+  // The board is strapped to an ARM, and the female rig's arm is 2.6 cm further
+  // inboard with its shoulder and elbow 4% lower. A shield authored against the
+  // male numbers hangs off the side of a woman and rides high — invisible to
+  // every other assertion here, because the vertex count and the hash are
+  // identical either way.
+  {
+    const m = buildCharacterMesh(DEFAULT_CUSTOMIZATION, IDLE_POSE, null,
+      { shield: 'iron' });
+    const f = buildCharacterMesh(DEFAULT_CUSTOMIZATION, IDLE_POSE, null,
+      { body: 'female', shield: 'iron' });
+    const mBase = xExtent(buildCharacterMesh(DEFAULT_CUSTOMIZATION, IDLE_POSE));
+    const fBase = xExtent(buildCharacterMesh(DEFAULT_CUSTOMIZATION, IDLE_POSE, null,
+      { body: 'female' }));
+    const mOut = mBase.minX - xExtent(m).minX;   // how far the board juts past
+    const fOut = fBase.minX - xExtent(f).minX;   // the doll's own silhouette
+    check('the female shield sits inboard of the male one, like her arm does',
+      xExtent(f).minX > xExtent(m).minX,
+      `${xExtent(m).minX.toFixed(3)} vs ${xExtent(f).minX.toFixed(3)}`);
+    check('...by tracking the arm rather than shrinking away from it',
+      Math.abs(mOut - fOut) < 0.03,
+      `juts ${mOut.toFixed(3)} m vs ${fOut.toFixed(3)} m past the body`);
+    check('...and it rides at the female rig\'s own height',
+      aabb(f).lo[1] > aabb(m).lo[1] - 1e-6 && aabb(f).hi[1] < aabb(m).hi[1],
+      `y ${aabb(m).lo[1].toFixed(3)}..${aabb(m).hi[1].toFixed(3)} vs `
+      + `${aabb(f).lo[1].toFixed(3)}..${aabb(f).hi[1].toFixed(3)}`);
+  }
+
+  // Tiers must be visually distinct — four shields that render identically are
+  // a ladder the player cannot see.
+  const hashes = SHIELD_TIERS.map((t) => fnv1a(new Uint8Array(
+    buildCharacterMesh(DEFAULT_CUSTOMIZATION, IDLE_POSE, null, { shield: t }).buffer)));
+  check('all four shield tiers render differently',
+    new Set(hashes).size === SHIELD_TIERS.length);
+
+  // The dragonscale shield is the BOSS palette, not the armour palette. Getting
+  // this backwards is invisible to every other assertion here.
+  const dsShield = buildCharacterMesh(DEFAULT_CUSTOMIZATION, IDLE_POSE, null,
+    { shield: 'dragonscale' });
+  check('dragonscale shield uses the black_dragon hide colour',
+    hasColor(dsShield, 0.085, 0.080, 0.092));
+  check('dragonscale shield uses an oxblood trim, not the emerald armour tint',
+    hasColor(dsShield, 0.46, 0.085, 0.080) && !hasColor(dsShield, 0.14, 0.45, 0.26));
+
+  // A shield and a sword coexist — that is the whole point of it being a
+  // hotbar item rather than an equipment slot.
+  const both = buildCharacterMesh(DEFAULT_CUSTOMIZATION, GUARD,
+    { kind: 'sword', color: [0.7, 0.72, 0.76] },
+    { armor: { head: 'dragon', body: 'dragon', legs: 'dragon' }, shield: 'dragonscale' });
+  check('sword + shield + full dragonscale fits CHARACTER_MAX_VERTS',
+    both.length / 10 <= CHARACTER_MAX_VERTS, `${both.length / 10}`);
+  const bothX = xExtent(both);
+  check('a raised guard keeps the sword hand on the right',
+    bothX.maxX > 0.35, `maxX ${bothX.maxX.toFixed(3)}`);
+  // At REST the board hangs outboard; RAISED it comes across the chest, so its
+  // far edge crosses toward the centreline and the silhouette narrows on the
+  // left. Both are asserted, because "the shield moved" and "the shield moved
+  // to the right place" are different claims and only the second one matters.
+  const restBoth = buildCharacterMesh(DEFAULT_CUSTOMIZATION, IDLE_POSE,
+    { kind: 'sword', color: [0.7, 0.72, 0.76] },
+    { armor: { head: 'dragon', body: 'dragon', legs: 'dragon' }, shield: 'dragonscale' });
+  const restX = xExtent(restBoth);
+  check('...and at rest the shield hangs outboard on the left',
+    restX.minX < -0.5, `minX ${restX.minX.toFixed(3)}`);
+  check('...while raising it brings the board in across the chest',
+    bothX.minX > restX.minX + 0.08,
+    `minX ${restX.minX.toFixed(3)} -> ${bothX.minX.toFixed(3)}`);
+
+  console.log(`  shield cost: ${SHIELD_TIERS.map((t) =>
+    `${t} +${buildCharacterMesh(DEFAULT_CUSTOMIZATION, IDLE_POSE, null,
+      { shield: t }).length / 10 - vertCount}`).join(', ')}`);
 }
 
 // ---- vertex counts summary --------------------------------------------------

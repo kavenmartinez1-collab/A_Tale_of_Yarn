@@ -46,7 +46,7 @@ import type { DungeonSpec } from './dungeon-spec';
 import {
   spawnDungeonEnemies, type DungeonEnemy,
 } from './dungeon-enemies';
-import { DungeonCombat } from './dungeon-combat';
+import { DungeonCombat, type DungeonTickCtx } from './dungeon-combat';
 import { rollBossTintreach, saltChestLoot } from './dungeon-loot';
 
 // Re-exported so `main.ts` (and anything else holding a manager) can keep
@@ -401,7 +401,11 @@ export class DungeonManager {
     playerX: number,
     playerZ: number,
     simTime: number,
-    onAttackPlayer: (damage: number) => void,
+    // Pure pass-through to `DungeonTickCtx.onAttackPlayer` — see the contract
+    // there. It carries the attacker so the player's shield can tell a blow to
+    // the face from one to the back, and the pool so a parry can hand the
+    // attacker's turn back to the rotation.
+    onAttackPlayer: DungeonTickCtx['onAttackPlayer'],
   ): void {
     const res = this.resident;
     if (res === null) return;

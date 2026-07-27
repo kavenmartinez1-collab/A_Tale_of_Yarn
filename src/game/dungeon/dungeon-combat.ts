@@ -176,8 +176,26 @@ type LosState = DungeonEnemy & {
 export interface DungeonTickCtx {
   layout: DungeonLayout;
   origin: Vec3;
-  /** Land a blow on the player. Already gated on sight and on the grace window. */
-  onAttackPlayer: (damage: number) => void;
+  /**
+   * Land a blow on the player. Already gated on sight and on the grace window.
+   *
+   * `source` and `tokens` exist for the SHIELD. Blocking is a frontal-cone test
+   * against the attacker's world position, and a parry has to stagger the
+   * attacker and hand its token back — none of which is expressible from a
+   * damage number. This callback used to be `(damage: number) => void`, which
+   * made the dungeon the one place in the game where the defender could not
+   * tell which direction it was being hit from; `onAttackEntity` and
+   * `onRangedAttack` below always passed their source, and only this one
+   * dropped it.
+   *
+   * `kind` distinguishes a swing (parryable) from an arrow (blockable by the
+   * cone, never parryable) — the archer's shot arrives through this same
+   * callback when no projectile renderer is wired.
+   */
+  onAttackPlayer: (
+    damage: number, source: DungeonEnemy, kind: 'melee' | 'projectile',
+    tokens: MeleeTokenPool,
+  ) => void;
   /** Land a blow on another dungeon enemy. Already gated on sight. */
   onAttackEntity: (source: DungeonEnemy, targetId: string, damage: number) => void;
   /**
@@ -311,7 +329,7 @@ export class DungeonCombat {
           // `false`: the landing floor was already consulted in `engage`,
           // before the swing was allowed out. Consulting it twice would eat
           // every second blow.
-          this._hitPlayer(damage, seesNow, ctx, null);
+          this._hitPlayer(damage, seesNow, ctx, null, e, 'melee');
         },
         combat: this.index,
         tokens: this.tokens,
@@ -335,7 +353,7 @@ export class DungeonCombat {
             // its cadence is already sparse, so it is not part of the
             // shoulder-to-shoulder problem tokens exist to solve. The floor is
             // therefore still this call's own job.
-            this._hitPlayer(shot.damage, () => true, ctx, e.species);
+            this._hitPlayer(shot.damage, () => true, ctx, e.species, e, 'projectile');
             return;
           }
           if (shot.kind === 'entity' && shot.id !== undefined) {
@@ -368,10 +386,11 @@ export class DungeonCombat {
   private _hitPlayer(
     damage: number, seesNow: () => boolean, ctx: DungeonTickCtx,
     rateGate: Species | null,
+    source: DungeonEnemy, kind: 'melee' | 'projectile',
   ): void {
     if (!seesNow()) { this.blockedByWall++; return; }
     if (rateGate !== null && !this.tokens.mayLand(rateGate)) return;
-    ctx.onAttackPlayer(damage);
+    ctx.onAttackPlayer(damage, source, kind, this.tokens);
   }
 
   /**

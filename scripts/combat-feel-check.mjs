@@ -1,5 +1,6 @@
 /**
- * combat-feel-check.mjs — does a pack of wolves menace you, or mug you?
+ * combat-feel-check.mjs — does a pack of wolves menace you, or mug you? And
+ * does a shield turn a blow, or a raised-at-the-last-moment shield turn it back?
  *
  * Run:  node scripts/combat-feel-check.mjs [baseUrl] [outDir]
  *       (needs `npm run dev` on :5173)
@@ -548,6 +549,534 @@ say(afterTp === null, 'walking out of range breaks the lock',
   `was ${preTp}, now ${afterTp === null ? 'released' : afterTp.id}`);
 
 await clearWolves([subject, second]);
+
+// ---------------------------------------------------------------------------
+// 4. The shield: the cone, the ladder, and the 0.18 s that separates a parry
+//    from an ordinary block
+// ---------------------------------------------------------------------------
+//
+// WHAT IS REAL HERE. The wolf, its AI, its bite, the damage path, the stamina,
+// the stagger, the token pool, and — for the first two beats — WHEN it decides
+// to bite. The block input is a real `mousedown`/`mouseup` on button 2, the
+// same events a mouse produces, dispatched with the `__pad` mark that the RMB
+// handler already honours for the pad (a headless page can never hold pointer
+// lock; that is why the left button grew the same mark).
+//
+// WHAT IS SCRIPTED, AND WHY IT HAS TO BE. The parry window is 0.18 s wide. A
+// harness cannot wait for a wolf to choose to swing inside a specific 180 ms
+// and then also prove the case 20 ms LATER resolves differently — the two
+// samples would be different swings at different bearings with different
+// stamina behind them, which is not a comparison. `forceAttackOnPlayer` lands
+// one blow through the real `applyAttackOnPlayer`, built from the real live
+// entity, at a moment this file picks. Only the clock is scripted.
+//
+// THE INSTRUMENT IS TESTED BEFORE THE MEASUREMENT IS BELIEVED. Every timing
+// claim below is a PAIR: window − ε asserted to parry AND window + ε asserted
+// to be an ordinary block, same shield, same wolf, same bearing. A "parry test"
+// that only checks the first half passes identically against an implementation
+// that parries unconditionally, which is to say it measures nothing.
+
+section('4. The shield: cone, ladder, and the parry window');
+
+const SHIELD_LADDER = await D(() => window.__gameDebug.shieldLadder());
+const PARRY_WINDOW = 0.18;
+
+/** Press or release the block input, exactly as a mouse or a pad would. */
+const setBlock = (down) => D((d) => {
+  const ev = new MouseEvent(d ? 'mousedown' : 'mouseup',
+    { button: 2, bubbles: true, cancelable: true });
+  ev.__pad = true;                       // headless pages hold no pointer lock
+  window.dispatchEvent(ev);
+}, down);
+
+// Back to open flat ground — section 3 teleported 60 m away to break a lock,
+// and a shield beat run on a hillside inherits every hazard in this file's
+// header. Then: a sword in hand and a shield in the OTHER hotbar slot, which is
+// the arrangement the whole feature is about.
+const shieldSite = await findFlatGround();
+if (shieldSite === null) { log('\n!! no flat ground for the shield beats'); process.exit(3); }
+await D(() => {
+  const g = window.__gameDebug;
+  g.equipItem('iron_sword', 1);          // selected slot
+  g.giveShield('iron');                  // slot 1 — never the selected one
+  g.setVitals({ hp: 20, stamina: 100, alive: true });
+});
+{
+  const st = await D(() => window.__gameDebug.guardState());
+  say(st.shield === 'iron', 'a shield in a NON-selected hotbar slot is the one that raises',
+    `shield=${st.shield}`);
+  say(st.down === false && st.raised === false, '...and it starts lowered');
+}
+
+// --- 4a. A REAL wolf, a REAL bite, blocked --------------------------------
+//
+// The wolf is pinned in front of the player's actual facing. Facing is read,
+// not assumed: `controller.yaw` is whatever the last movement left it as, and
+// the mesh convention is forward = (sin yaw, −cos yaw).
+const facing = await D(() => window.__gameDebug.playerMotion().yaw);
+const biter = await D((f) => {
+  const g = window.__gameDebug;
+  const p = g.playerPos();
+  const x = p[0] + Math.sin(f) * 2.0;
+  const z = p[2] - Math.cos(f) * 2.0;
+  const id = g.placeEntity('wolf', x, g.groundHeightAt(x, z), z);
+  return { id, x, z, y: g.groundHeightAt(x, z) };
+}, facing);
+
+/** Hold the wolf on a bearing relative to the player's facing, and top up. */
+const pinBiter = (bearing, topUp = true) => D((k) => {
+  const g = window.__gameDebug;
+  const p = g.playerPos();
+  const a = k.f + k.bearing;
+  const x = p[0] + Math.sin(a) * 2.0;
+  const z = p[2] - Math.cos(a) * 2.0;
+  g.setEntityPos(k.id, x, g.groundHeightAt(x, z), z);
+  if (k.topUp) g.setVitals({ hp: 20, stamina: 100, alive: true });
+}, { id: biter.id, f: facing, bearing, topUp });
+
+/**
+ * Hold the block for `seconds` while the wolf bites, re-pinning it each sample.
+ * Returns what moved.
+ */
+async function blockFor(seconds, bearing) {
+  await pinBiter(bearing, true);
+  await page.waitForTimeout(400);          // let it close and aggro
+  await pinBiter(bearing, true);
+  const t0 = await D(() => {
+    const g = window.__gameDebug;
+    g.setVitals({ hp: 20, stamina: 100, alive: true });
+    return g.simTime();
+  });
+  await setBlock(true);
+  let minHp = 20;
+  let minSta = 100;
+  const samples = Math.round(seconds / 0.1);
+  for (let i = 0; i < samples; i++) {
+    const s = await D((k) => {
+      const g = window.__gameDebug;
+      const p = g.playerPos();
+      const a = k.f + k.bearing;
+      const x = p[0] + Math.sin(a) * 2.0;
+      const z = p[2] - Math.cos(a) * 2.0;
+      g.setEntityPos(k.id, x, g.groundHeightAt(x, z), z);
+      const v = g.vitals();
+      return { hp: v.hp, stamina: v.stamina, guard: g.guardState() };
+    }, { id: biter.id, f: facing, bearing });
+    minHp = Math.min(minHp, s.hp);
+    minSta = Math.min(minSta, s.stamina);
+    await page.waitForTimeout(100);
+  }
+  const end = await D(() => ({
+    guard: window.__gameDebug.guardState(),
+    t: window.__gameDebug.simTime(),
+  }));
+  await setBlock(false);
+  return { minHp, minSta, guard: end.guard, elapsed: end.t - t0 };
+}
+
+const frontal = await blockFor(4.5, 0);
+log(`     front: hp floor ${frontal.minHp.toFixed(1)}, stamina floor ${frontal.minSta.toFixed(0)}, `
+  + `${frontal.guard.blocked} blocked / ${frontal.guard.flanked} flanked`);
+say(frontal.guard.blocked > 0,
+  'a real wolf really did bite a raised shield', `${frontal.guard.blocked} blows stopped`);
+say(frontal.minHp === 20,
+  'blocking a frontal bite costs NO health', `hp floor ${frontal.minHp}`);
+say(frontal.minSta <= 100 - SHIELD_LADDER.iron.staminaPerBlock,
+  '...and it costs stamina instead',
+  `floor ${frontal.minSta} (iron = ${SHIELD_LADDER.iron.staminaPerBlock}/block)`);
+
+const behind = await blockFor(4.5, Math.PI);
+log(`     rear:  hp floor ${behind.minHp.toFixed(1)}, `
+  + `${behind.guard.blocked - frontal.guard.blocked} blocked / `
+  + `${behind.guard.flanked - frontal.guard.flanked} flanked`);
+say(behind.minHp < 20,
+  'the SAME bite from behind the same raised shield lands',
+  `hp floor ${behind.minHp}`);
+say(behind.guard.flanked > frontal.guard.flanked,
+  '...and the guard reports it as a flank, not as a block',
+  `${behind.guard.flanked - frontal.guard.flanked} flanked`);
+say(behind.guard.lastBearingDeg > 120,
+  '...from behind the 120 degree arc',
+  `${behind.guard.lastBearingDeg?.toFixed(0)} deg off centre`);
+
+// --- 4b. The parry window, both edges -------------------------------------
+//
+// Raise the guard, wait inside the page until the SIM clock says `heldS` has
+// reached the target, then land one blow. Waiting inside the page (rAF, sim
+// time) rather than out here (wall clock, Playwright round trips) is what makes
+// a 20 ms margin reachable at all.
+await pinBiter(0, true);
+await page.waitForTimeout(300);
+
+/**
+ * Raise the guard, wait in SIM time, land one blow.
+ *
+ * `atS` is a hold time; `'before'` and `'after'` instead land the blow on the
+ * last frame INSIDE the window and the first frame OUTSIDE it — the tightest
+ * ε the frame rate allows, rather than an ε this file guessed. `'before'`
+ * tracks the largest step it has seen and fires when one more step would carry
+ * it past the edge, which is what makes the margin a frame rather than the
+ * 150 ms a fixed target would have to leave for safety at 30 fps.
+ */
+const hitAfterHold = (atS, wolfId, damage = 5, kind = 'melee') => D((k) => new Promise((res) => {
+  const g = window.__gameDebug;
+  g.setVitals({ hp: 20, stamina: 100, alive: true });
+  const up = new MouseEvent('mousedown', { button: 2, bubbles: true, cancelable: true });
+  up.__pad = true;
+  window.dispatchEvent(up);
+  const t0 = g.guardState().raisedAtS;
+  const W = k.window;
+  let prev = 0;
+  let step = 1 / 60;
+  const fire = () => {
+    const out = g.forceAttackOnPlayer(k.wolfId, k.damage, k.kind);
+    const down = new MouseEvent('mouseup', { button: 2, bubbles: true, cancelable: true });
+    down.__pad = true;
+    window.dispatchEvent(down);
+    res(out);
+  };
+  const tick = () => {
+    const held = g.simTime() - t0;
+    step = Math.max(step, held - prev);
+    prev = held;
+    const ready = k.atS === 'before' ? held + step * 1.15 >= W
+      : k.atS === 'after' ? held > W
+        : held >= k.atS;
+    if (ready) { fire(); return; }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}), { atS, wolfId, damage, kind, window: PARRY_WINDOW });
+
+// A whole re-arm interval between presses, or the anti-mash rule denies the
+// second one its window and the "late" case would pass for the wrong reason.
+const early = await hitAfterHold('before', biter.id);
+await page.waitForTimeout(800);
+const late = await hitAfterHold('after', biter.id);
+
+log(`     held ${early.heldS.toFixed(3)}s -> ${early.reason}   |   `
+  + `held ${late.heldS.toFixed(3)}s -> ${late.reason}`);
+say(early.heldS < PARRY_WINDOW,
+  `the early blow really did land inside the window`, `${early.heldS.toFixed(3)}s`);
+say(early.reason === 'parried', 'window - eps: PARRIED', early.reason);
+say(early.hpLost === 0, '...for no health', `${early.hpLost}`);
+say(early.staminaSpent === 0, '...and no stamina', `${early.staminaSpent}`);
+
+say(late.heldS > PARRY_WINDOW,
+  'the late blow really did land outside the window', `${late.heldS.toFixed(3)}s`);
+say(late.reason === 'blocked', 'window + eps: ORDINARY BLOCK, not a parry', late.reason);
+say(late.hpLost === 0, '...still no health (a block is a block)', `${late.hpLost}`);
+say(late.staminaSpent === SHIELD_LADDER.iron.staminaPerBlock,
+  '...but it COSTS the tier stamina', `${late.staminaSpent}`);
+say(late.staggerS === 0, '...and staggers nobody', `${late.staggerS}`);
+say(Math.abs(late.heldS - early.heldS) < 0.10,
+  'the two samples straddle the edge within a couple of frames',
+  `${early.heldS.toFixed(3)}s vs ${late.heldS.toFixed(3)}s, edge ${PARRY_WINDOW}s`);
+
+// Held forever. The turtle case, and the reason the window is press-edged.
+await setBlock(false);
+await page.waitForTimeout(700);
+await setBlock(true);
+await page.waitForTimeout(2500);
+const turtled = await D((id) => {
+  const g = window.__gameDebug;
+  g.setVitals({ hp: 20, stamina: 100, alive: true });
+  return g.forceAttackOnPlayer(id, 5, 'melee');
+}, biter.id);
+say(turtled.heldS > 2, 'the guard really had been up for a while',
+  `${turtled.heldS.toFixed(2)}s`);
+say(turtled.reason === 'blocked', 'a guard held forever NEVER parries', turtled.reason);
+say(turtled.staminaSpent > 0, '...and pays the stamina every time', `${turtled.staminaSpent}`);
+await setBlock(false);
+
+// --- 4c. A pause mid-window neither eats it nor extends it -----------------
+//
+// The window is a difference of two SIM times and the sim clock stops on Esc,
+// so a pause is invisible to it. Asserted by pausing INSIDE the window for far
+// longer than the window and then landing the blow: a wall-clock window would
+// have expired several times over.
+await page.waitForTimeout(800);
+const beforePause = await D(() => {
+  const g = window.__gameDebug;
+  g.setVitals({ hp: 20, stamina: 100, alive: true });
+  const ev = new MouseEvent('mousedown', { button: 2, bubbles: true, cancelable: true });
+  ev.__pad = true;
+  window.dispatchEvent(ev);
+  return { raisedAtS: g.guardState().raisedAtS, sim: g.simTime() };
+});
+await page.keyboard.press('Escape');
+await page.waitForTimeout(2000);          // 11x the window, in wall time
+const duringPause = await D(() => window.__gameDebug.simTime());
+await page.keyboard.press('Escape');
+await page.waitForTimeout(60);
+const afterPause = await D((id) => window.__gameDebug.forceAttackOnPlayer(id, 5, 'melee'),
+  biter.id);
+await setBlock(false);
+log(`     paused ~2.0 s wall; sim advanced ${(duringPause - beforePause.sim).toFixed(3)} s; `
+  + `held at impact ${afterPause.heldS.toFixed(3)} s`);
+say(duringPause - beforePause.sim < 0.25,
+  'the sim clock really did stop for the pause',
+  `${(duringPause - beforePause.sim).toFixed(3)} s of sim in 2 s of wall`);
+say(afterPause.heldS < PARRY_WINDOW,
+  'a 2 s pause did not EAT the parry window', `held ${afterPause.heldS.toFixed(3)} s`);
+say(afterPause.reason === 'parried', '...and the blow after it still parries',
+  afterPause.reason);
+say(afterPause.heldS > 0,
+  '...nor did the pause EXTEND it into negative time', `${afterPause.heldS.toFixed(3)}`);
+
+// --- 4d. The ladder: same bite, four shields, exact stamina ---------------
+//
+// The relations are unit-tested in `test-shields.mts`; what this proves is that
+// the shipped ladder is the one the running game actually spends.
+await page.waitForTimeout(700);
+const ladderRows = [];
+for (const tier of ['wood', 'bronze', 'iron', 'dragonscale']) {
+  await D((t) => window.__gameDebug.giveShield(t), tier);
+  await page.waitForTimeout(120);
+  const melee = await hitAfterHold(PARRY_WINDOW + 0.05, biter.id, 5, 'melee');
+  await page.waitForTimeout(700);
+  const fire = await hitAfterHold(PARRY_WINDOW + 0.05, biter.id, 4, 'breath');
+  await page.waitForTimeout(700);
+  ladderRows.push({ tier, melee, fire });
+  say(melee.staminaSpent === SHIELD_LADDER[tier].staminaPerBlock,
+    `${tier}: a blocked bite costs exactly ${SHIELD_LADDER[tier].staminaPerBlock} stamina`,
+    `${melee.staminaSpent}`);
+  say(melee.hpLost === 0, `${tier}: ...and no health`, `${melee.hpLost}`);
+}
+for (let i = 1; i < ladderRows.length; i++) {
+  say(ladderRows[i].melee.staminaSpent <= ladderRows[i - 1].melee.staminaSpent,
+    `${ladderRows[i].tier} costs no more stamina than ${ladderRows[i - 1].tier}`,
+    `${ladderRows[i - 1].melee.staminaSpent} -> ${ladderRows[i].melee.staminaSpent}`);
+  say(ladderRows[i].fire.hpLost <= ladderRows[i - 1].fire.hpLost,
+    `${ladderRows[i].tier} takes no more fire than ${ladderRows[i - 1].tier}`,
+    `${ladderRows[i - 1].fire.hpLost} -> ${ladderRows[i].fire.hpLost} hp`);
+}
+{
+  const wood = ladderRows[0].fire;
+  const ds = ladderRows[3].fire;
+  log(`     4 hp of breath: wood takes ${wood.hpLost.toFixed(2)}, `
+    + `dragonscale takes ${ds.hpLost.toFixed(2)}`);
+  say(wood.reason === 'mitigated' && ds.reason === 'mitigated',
+    'breath is mitigated by a shield, never stopped outright',
+    `${wood.reason} / ${ds.reason}`);
+  say(wood.hpLost > 0 && ds.hpLost > 0,
+    '...so some fire always gets through, at every tier');
+  say(ds.hpLost * 3 <= wood.hpLost,
+    'dragonscale turns at least 3x the fire wood does',
+    `${wood.hpLost.toFixed(2)} vs ${ds.hpLost.toFixed(2)} hp`);
+  say(wood.staminaSpent > ds.staminaSpent,
+    '...and costs less to brace with, too',
+    `${wood.staminaSpent} vs ${ds.staminaSpent}`);
+}
+
+// --- 4e. The parry stagger, measured on the wolf --------------------------
+await D(() => window.__gameDebug.giveShield('iron'));
+await pinBiter(0, true);
+await page.waitForTimeout(700);
+const parried = await hitAfterHold(0.02, biter.id);
+say(parried.reason === 'parried', 'the wolf was parried', parried.reason);
+const stagger0 = await D((id) => window.__gameDebug.staggerOf(id), biter.id);
+
+// The spark, sampled DURING the burst. Sampled after it, `sparks` is correctly
+// zero and the assertion would have been "the counter exists" — which is what
+// the first version of this beat measured, and it is nothing.
+{
+  let peak = 0;
+  for (let i = 0; i < 8; i++) {
+    peak = Math.max(peak, await D(() => window.__gameDebug.guardState().sparks));
+    await page.waitForTimeout(40);
+  }
+  say(peak > 0, 'the parry threw a visible thread-spark',
+    `${peak} billboards at its peak`);
+}
+say(Math.abs(stagger0 - 1.2) < 0.25,
+  'an ordinary enemy is left reeling for ~1.2 s', `${stagger0?.toFixed(2)} s`);
+
+// It has to actually STOP. A stagger nobody can see is a number in a struct.
+const frozen = await D((id) => {
+  const g = window.__gameDebug;
+  const e = g.entities().find((x) => x.id === id);
+  return e ? { x: e.x, z: e.z } : null;
+}, biter.id);
+await page.waitForTimeout(500);
+const stillFrozen = await D((id) => {
+  const g = window.__gameDebug;
+  const e = g.entities().find((x) => x.id === id);
+  return { pos: e ? { x: e.x, z: e.z } : null, stagger: g.staggerOf(id) };
+}, biter.id);
+say(frozen !== null && stillFrozen.pos !== null
+  && Math.hypot(stillFrozen.pos.x - frozen.x, stillFrozen.pos.z - frozen.z) < 0.05,
+  'a staggered enemy stops dead — it does not walk while it reels',
+  frozen === null ? 'gone' : `${Math.hypot(stillFrozen.pos.x - frozen.x, stillFrozen.pos.z - frozen.z).toFixed(3)} m`);
+say(stillFrozen.stagger < stagger0,
+  '...and the stagger runs down on the sim clock',
+  `${stagger0?.toFixed(2)} -> ${stillFrozen.stagger?.toFixed(2)} s`);
+
+// The delay a parry actually buys, measured as a gap between landed blows.
+{
+  await D((id) => {
+    const g = window.__gameDebug;
+    g.setVitals({ hp: 20, stamina: 100, alive: true });
+    return g.staggerOf(id);
+  }, biter.id);
+  // Baseline: how long between two unblocked bites from this wolf.
+  const base = await D(() => ({ t: window.__gameDebug.simTime(), log: window.__gameDebug.attackLog() }));
+  for (let i = 0; i < 45; i++) { await pinBiter(0, true); await page.waitForTimeout(100); }
+  const run = await D(() => ({ t: window.__gameDebug.simTime(), log: window.__gameDebug.attackLog() }));
+  const blows = run.log.filter((e) => e.id === biter.id && e.t >= base.t).map((e) => e.t);
+  let worstGap = 0;
+  for (let i = 1; i < blows.length; i++) worstGap = Math.max(worstGap, blows[i] - blows[i - 1]);
+  log(`     unblocked: ${blows.length} bites in ${(run.t - base.t).toFixed(1)} s, `
+    + `longest gap ${worstGap.toFixed(2)} s`);
+  say(blows.length >= 2, 'the wolf bites on a regular cadence with no shield up',
+    `${blows.length} bites`);
+  say(worstGap < 1.2, '...and its natural gap is under the stagger it would cost it',
+    `${worstGap.toFixed(2)} s`);
+}
+
+// --- 4f. Block and attack are mutually exclusive --------------------------
+await page.waitForTimeout(700);
+await setBlock(true);
+await page.waitForTimeout(80);
+const swungWhileUp = await D(() => {
+  const g = window.__gameDebug;
+  const before = g.attackT();
+  const ev = new MouseEvent('mousedown', { button: 0, bubbles: true, cancelable: true });
+  ev.__pad = true;
+  window.dispatchEvent(ev);
+  return { before, after: g.attackT(), raised: g.guardState().raised };
+});
+say(swungWhileUp.raised === true, 'the shield is up for the exclusivity test',
+  `raised=${swungWhileUp.raised}`);
+say(swungWhileUp.after === swungWhileUp.before && swungWhileUp.after === 1,
+  'a swing does not fire while the shield is raised',
+  `attackT ${swungWhileUp.before} -> ${swungWhileUp.after}`);
+await setBlock(false);
+await page.waitForTimeout(120);
+const swungWhileDown = await D(() => {
+  const g = window.__gameDebug;
+  const ev = new MouseEvent('mousedown', { button: 0, bubbles: true, cancelable: true });
+  ev.__pad = true;
+  window.dispatchEvent(ev);
+  return { after: g.attackT(), raised: g.guardState().raised };
+});
+say(swungWhileDown.after < 1,
+  '...and it fires perfectly well the moment the shield comes down',
+  `attackT ${swungWhileDown.after}`);
+
+// --- 4g. The Evil King is parryable, for half as long ---------------------
+await clearWolves([biter.id]);
+await page.waitForTimeout(300);
+// FACING IS RE-READ, NOT REUSED. `facing` was captured before beat 4a, and
+// beat 4f fires a real swing — `resolveLeftClick` snaps `controller.yaw` to the
+// camera, so the player is no longer pointing where they were. The first
+// version of this beat placed the King on the stale bearing, and every
+// assertion here came back `flank` for the perfectly good reason that he was
+// standing behind the player's shoulder.
+const kingFacing = await D(() => window.__gameDebug.playerMotion().yaw);
+const king = await D((f) => {
+  const g = window.__gameDebug;
+  const p = g.playerPos();
+  const x = p[0] + Math.sin(f) * 2.4;
+  const z = p[2] - Math.cos(f) * 2.4;
+  const id = g.placeEntity('evil_king', x, g.groundHeightAt(x, z), z);
+  return { id, x, z, y: g.groundHeightAt(x, z) };
+}, kingFacing);
+if (king.id === null) {
+  say(false, 'the Evil King could be placed for the parry beat');
+} else {
+  await D((k) => {
+    window.__gameDebug.setEntityPos(k.id, k.x, k.y, k.z);
+    window.__gameDebug.setVitals({ hp: 20, stamina: 100, alive: true });
+  }, king);
+  await page.waitForTimeout(400);
+  const royal = await hitAfterHold('before', king.id, 6, 'melee');
+  const kingStagger = await D((id) => window.__gameDebug.staggerOf(id), king.id);
+  say(royal.bearingDeg !== null && royal.bearingDeg < 60,
+    'the King is in front of the player for this beat',
+    `${royal.bearingDeg?.toFixed(0)} deg off centre`);
+  log(`     king: ${royal.reason}, ${royal.hpLost} hp lost, `
+    + `stagger ${kingStagger?.toFixed(2)} s`);
+  say(royal.reason === 'parried', 'the Evil King IS parryable', royal.reason);
+  say(royal.hpLost === 0, '...for zero damage', `${royal.hpLost}`);
+  say(Math.abs(kingStagger - 0.5) < 0.15,
+    '...but he only reels for ~0.5 s, not the ordinary 1.2',
+    `${kingStagger?.toFixed(2)} s`);
+  say(kingStagger < stagger0 / 2,
+    '...which is less than half what a wolf gets',
+    `${kingStagger?.toFixed(2)} vs ${stagger0?.toFixed(2)} s`);
+
+  // ...and a boss blow that is NOT parried still hurts, or the beat above is
+  // just "the king does no damage".
+  await page.waitForTimeout(800);
+  const royalLate = await hitAfterHold('after', king.id, 6, 'melee');
+  say(royalLate.reason === 'blocked', 'a mistimed guard against the king is an ordinary block',
+    royalLate.reason);
+  await D((id) => {
+    const g = window.__gameDebug;
+    g.setVitals({ hp: 20, stamina: 0, alive: true });
+    return g.forceAttackOnPlayer(id, 6, 'melee');
+  }, king.id);
+  const unguarded = await D((id) => {
+    const g = window.__gameDebug;
+    g.setVitals({ hp: 20, stamina: 100, alive: true });
+    return g.forceAttackOnPlayer(id, 6, 'melee');
+  }, king.id);
+  say(unguarded.hpLost > 0 && unguarded.reason === 'not-raised',
+    '...and with no guard up at all, the king takes health off',
+    `${unguarded.hpLost} hp, ${unguarded.reason}`);
+  await D((id) => window.__gameDebug.removeEntity(id), king.id);
+}
+
+// --- 4h. Blocking costs half your speed ------------------------------------
+//
+// Measured as REAL distance walked over a REAL keyboard hold, not by reading a
+// multiplier back out of the game. The two runs are the same key for the same
+// wall time from the same standing start, and the only difference is whether
+// the right button is down.
+{
+  await D(() => window.__gameDebug.giveShield('iron'));
+  /** Hold W for `ms` and report how far the player actually moved. */
+  const walk = async (ms) => {
+    const a = await D(() => window.__gameDebug.playerPos());
+    await page.keyboard.down('w');
+    await page.waitForTimeout(ms);
+    await page.keyboard.up('w');
+    await page.waitForTimeout(120);
+    const b = await D(() => window.__gameDebug.playerPos());
+    return Math.hypot(b[0] - a[0], b[2] - a[2]);
+  };
+  await setBlock(false);
+  await page.waitForTimeout(200);
+  const free = await walk(1200);
+  await setBlock(true);
+  await page.waitForTimeout(200);
+  const guarded = await walk(1200);
+  await setBlock(false);
+  const ratio = free > 0 ? guarded / free : 0;
+  log(`     walked ${free.toFixed(2)} m free vs ${guarded.toFixed(2)} m behind the shield `
+    + `(${(ratio * 100).toFixed(0)}%)`);
+  say(free > 3, 'the player really did walk with no shield up', `${free.toFixed(2)} m`);
+  say(guarded > 0, '...and blocking does not freeze them solid', `${guarded.toFixed(2)} m`);
+  say(ratio > 0.35 && ratio < 0.68,
+    'a raised shield costs about half the walking speed', `${(ratio * 100).toFixed(0)}%`);
+}
+
+// --- 4i. Losing the shield lowers the guard --------------------------------
+await D(() => window.__gameDebug.giveShield(null));
+{
+  const gone = await D(() => {
+    const g = window.__gameDebug;
+    const ev = new MouseEvent('mousedown', { button: 2, bubbles: true, cancelable: true });
+    ev.__pad = true;
+    window.dispatchEvent(ev);
+    return g.guardState();
+  });
+  say(gone.shield === null && gone.raised === false,
+    'with the shield gone, the right button raises nothing',
+    `shield=${gone.shield} raised=${gone.raised}`);
+}
+await setBlock(false);
 
 // ---------------------------------------------------------------------------
 // Verdict

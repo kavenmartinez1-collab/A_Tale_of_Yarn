@@ -54,6 +54,12 @@ export const TRADE_CATALOG: Record<NpcRole, CatalogEntry[]> = {
     { id: 'arrow_shaft', price: 3, stock: 12 },
     { id: 'spear',    price: 35, stock: 1  },
     { id: 'iron_helm',price: 60, stock: 1  },
+    // Wood only. A garrison issues plank shields by the crate; it does not sell
+    // dragonscale, and the same reasoning that keeps Tintreach off this list
+    // applies harder here — the top-tier shield is the reward for killing
+    // dragons, and a quartermaster with a restocking supply of them would be an
+    // unbounded faucet for the one piece of gear that turns the last fight.
+    { id: 'wood_shield', price: 18, stock: 2 },
   ],
 };
 
