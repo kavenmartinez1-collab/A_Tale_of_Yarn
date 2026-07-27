@@ -10,7 +10,7 @@
     "server": "tsx server/dev-server.ts",
     "typecheck": "tsc --noEmit",
     "test:mesh": "tsx scripts/check-winding.mts && tsx scripts/test-character-mesh.mts && tsx scripts/test-animal-mesh.mts && tsx scripts/test-boss-mesh.mts",
-    "test:combat": "tsx scripts/test-attack-routing.mts && tsx scripts/test-projectiles.mts && tsx scripts/test-aim.mts && tsx scripts/test-animal-ai.mts && tsx scripts/test-mounting.mts && tsx scripts/test-attack-tokens.mts && tsx scripts/test-lock-on.mts && tsx scripts/test-dungeon-combat.mts",
+    "test:combat": "tsx scripts/test-attack-routing.mts && tsx scripts/test-projectiles.mts && tsx scripts/test-aim.mts && tsx scripts/test-animal-ai.mts && tsx scripts/test-mounting.mts && tsx scripts/test-attack-tokens.mts && tsx scripts/test-lock-on.mts && tsx scripts/test-shields.mts && tsx scripts/test-dungeon-combat.mts",
     "test:world": "tsx scripts/test-roads.mts",
     "test:castle": "tsx scripts/test-castle-layout.mts && tsx scripts/test-castle-zfight.mts",
     "test:pause": "tsx scripts/test-sim-clock.mts && tsx scripts/test-map.mts && tsx scripts/test-save-slots.mts",

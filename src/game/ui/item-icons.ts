@@ -775,6 +775,69 @@ function drawArmorBody(ctx: Ctx, c: C3): void {
   ctx.stroke();
 }
 
+/**
+ * A shield: heater board, running-stitch rim, central boss, plus one
+ * tier-specific motif.
+ *
+ * `motif` rather than four near-identical drawers, because the four shields
+ * differ by exactly one detail and a copy-pasted quartet would have drifted the
+ * moment anyone nudged the outline. `rim` is drawn as DASHES, matching the
+ * running stitch the reticle and every panel chrome in this game already use —
+ * a shield is a stitched thing here, not a riveted one.
+ */
+function drawShield(
+  ctx: Ctx, c: C3, motif: 'planks' | 'bands' | 'scales', rim: C3,
+): void {
+  // Heater outline: square shoulders, tapering to a point.
+  const board: number[][] = [[9, 8], [39, 8], [39, 24], [24, 42], [9, 24]];
+  poly(ctx, board, css(c));
+
+  if (motif === 'planks') {
+    // Two vertical seams: three boards lashed together.
+    for (const x of [18, 30]) {
+      ctx.beginPath();
+      ctx.moveTo(x, 8);
+      ctx.lineTo(x, 24 + (x === 18 ? 9 : 9));
+      ctx.strokeStyle = css(c, 0.68);
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  } else if (motif === 'bands') {
+    // Two horizontal bands, brighter than the face — beaten metal.
+    rrect(ctx, 9, 13, 30, 4, css(c, 1.22));
+    rrect(ctx, 10, 24, 28, 4, css(c, 1.22));
+  } else {
+    // Overlapping scales, three rows, shrinking with the taper.
+    const rows: [number, number, number][] = [[13, 3, 5], [21, 3, 4.4], [29, 2, 3.8]];
+    for (const [y, n, r] of rows) {
+      const span = (n - 1) * (r * 2.1);
+      for (let i = 0; i < n; i++) {
+        const x = 24 - span / 2 + i * (r * 2.1);
+        ctx.beginPath();
+        ctx.arc(x, y, r, Math.PI, 0);
+        ctx.fillStyle = css(c, 1.9);
+        ctx.fill();
+        outline(ctx);
+      }
+    }
+  }
+
+  // Running-stitch rim: short dashes following the board edge.
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(board[0][0], board[0][1]);
+  for (let i = 1; i < board.length; i++) ctx.lineTo(board[i][0], board[i][1]);
+  ctx.closePath();
+  ctx.setLineDash([3, 2.4]);
+  ctx.strokeStyle = css(rim);
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.restore();
+
+  // Boss.
+  circle(ctx, 24, 21, 4.5, css(c, motif === 'scales' ? 2.4 : 1.35));
+}
+
 /** Armor piece: leggings (legs slot). */
 function drawArmorLegs(ctx: Ctx, c: C3): void {
   // Belt
@@ -950,6 +1013,14 @@ export const ICON_DRAWERS: Record<GameItemId, (ctx: Ctx) => void> = {
   dragonscale_helm:  (ctx) => { drawArmorHead(ctx, [0.16, 0.48, 0.28]); },
   dragonscale_chest: (ctx) => { drawArmorBody(ctx, [0.14, 0.45, 0.26]); },
   dragonscale_legs:  (ctx) => { drawArmorLegs(ctx, [0.13, 0.42, 0.24]); },
+
+  // Shields. Rim colour is the STITCHING, so it is thread-cream on the three
+  // ordinary tiers and oxblood on the dragonscale — sewn with something that
+  // matches what it was cut from.
+  wood_shield:        (ctx) => { drawShield(ctx, [0.52, 0.38, 0.22], 'planks', [0.88, 0.84, 0.72]); },
+  bronze_shield:      (ctx) => { drawShield(ctx, [0.72, 0.50, 0.28], 'bands',  [0.88, 0.84, 0.72]); },
+  iron_shield:        (ctx) => { drawShield(ctx, [0.66, 0.68, 0.72], 'bands',  [0.86, 0.83, 0.74]); },
+  dragonscale_shield: (ctx) => { drawShield(ctx, [0.22, 0.06, 0.07], 'scales', [0.62, 0.14, 0.13]); },
 
   // Consumables with effectClass
   healing_potion: (ctx) => { drawPotion(ctx, [0.75, 0.20, 0.25], [1.0, 0.60, 0.65]); },

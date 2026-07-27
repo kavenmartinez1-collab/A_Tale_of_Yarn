@@ -8,6 +8,7 @@ import {
   addItem, countItem, createInventory, PACK_SIZE,
 } from '../src/game/inventory';
 import { isGameItemId, ITEM_DEFS } from '../src/game/items';
+import { isShield } from '../src/game/combat/shields';
 
 let passed = 0;
 let failed = 0;
@@ -60,11 +61,20 @@ for (const r of RECIPES) {
     r.inputs.every(([id]) => isGameItemId(id)));
 }
 
-// Every armor recipe output has an armor field.
+// Every armor-category recipe output is defensive gear: either WORN (an
+// `armor` field, so it has an equip slot and a defence rating) or CARRIED (a
+// shield, which has neither and is only ever raised by holding block).
+//
+// The two halves are both real assertions, not an escape hatch. A helm with no
+// `armor` field would still fail; and a shield that is not in `SHIELD_STATS`
+// fails too, which is what stops a fifth shield item being added to the tab
+// without a rung on the ladder to go with it.
 for (const r of RECIPES.filter((r) => r.category === 'armor')) {
-  check(`armor recipe output has armor field: ${r.output}`,
-    !!ITEM_DEFS[r.output as keyof typeof ITEM_DEFS] &&
-    'armor' in ITEM_DEFS[r.output as keyof typeof ITEM_DEFS]);
+  const def = ITEM_DEFS[r.output as keyof typeof ITEM_DEFS];
+  const worn = !!def && 'armor' in def;
+  const carried = isShield(r.output);
+  check(`armor recipe output is worn armour or a registered shield: ${r.output}`,
+    worn !== carried, `worn=${worn} shield=${carried}`);
 }
 
 // Consumables with effectClass are edible or drinkable.

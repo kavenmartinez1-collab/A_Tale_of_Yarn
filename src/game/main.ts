@@ -82,6 +82,7 @@ import {
 } from './shelter';
 import { buildFireMeshes, buildTentMeshes } from './fire-mesh';
 import { emitWorldFire } from './render/fire-fx';
+import { emitParrySpark, PARRY_SPARK_S } from './render/parry-fx';
 import {
   fireTintreach, applyTintreachPost, loadTintreach, saveTintreach,
 } from './tintreach';
@@ -149,9 +150,14 @@ import { EntityRenderer, DEAD_SHOW_S } from './entities/entity-renderer';
 import {
   stepAnimal, onEntityDamaged, FOLLOW_RADIUS, DEFEND_GIVEUP_DIST,
   type DefendTarget,
-  CombatIndex, wantsAirborne,
+  CombatIndex, wantsAirborne, staggerAnimal, staggerRemaining,
 } from './entities/animal-ai';
-import { MeleeTokenPool } from './combat/attack-tokens';
+import { MeleeTokenPool, isExempt } from './combat/attack-tokens';
+import {
+  bestShieldTier, createGuard, setGuardInput, dropGuard, resolveBlock, blockSfx,
+  parryReady, SHIELD_STATS, BLOCK_MOVE_MUL,
+  type ShieldTier, type IncomingKind, type BlockOutcome,
+} from './combat/shields';
 import {
   pickLockTarget, cycleLockTarget, lockBreakReason, lockCameraYaw,
   lockFacingYaw, easeAngle, indicatorFade, LOCK_EASE_PER_S,
@@ -332,6 +338,40 @@ declare global {
        * one.
        */
       setAttackTokens(on: boolean): void;
+      /**
+       * The shield/guard state, including WHY the last blow resolved as it
+       * did. HP alone cannot distinguish a parry from a block (both are zero
+       * damage) or a flank from having no shield (both are full damage), so a
+       * harness reading only vitals measures nothing.
+       */
+      guardState(): {
+        shield: string | null; down: boolean; raised: boolean;
+        parryWindow: boolean; armed: boolean; raisedAtS: number; blend: number;
+        lastKind: string | null; lastReason: string | null;
+        lastBearingDeg: number | null; lastStaggerS: number; sparks: number;
+        blocked: number; parried: number; brokeGuard: number; flanked: number;
+      };
+      /** Seconds of parry-stagger left on an entity, or null if unknown. */
+      staggerOf(id: string): number | null;
+      /** Put a shield in hotbar slot 1 (never the selected slot). */
+      giveShield(tier: string | null): boolean;
+      /**
+       * Land one blow through the real damage path, at a moment the harness
+       * chooses. The only way to test a 0.18 s window from outside the page.
+       */
+      forceAttackOnPlayer(
+        entityId: string | null, damage: number,
+        kind?: 'melee' | 'projectile' | 'breath',
+      ): {
+        hit: boolean; heldS: number; hpLost: number; staminaSpent: number;
+        kind: string | null; reason: string | null; staggerS: number;
+        bearingDeg: number | null;
+      };
+      /** The shipped shield stat ladder, keyed by tier. */
+      shieldLadder(): Record<string, {
+        tier: string; rank: number; itemId: string;
+        staminaPerBlock: number; fireMitigation: number;
+      }>;
       /** Current Z-target id and its bearing, or null when not locked. */
       lockOn(): { id: string; x: number; z: number; dist: number } | null;
       /** Toggle/force Z-targeting. `null` toggles. Returns the resulting id. */
@@ -1139,6 +1179,67 @@ async function boot() {
    * shipping build so the numbers a harness reads come from the same code the
    * player runs, and `__gameDebug` (the only reader) is what strips in release.
    */
+  // -------------------------------------------------------------------------
+  // The guard — see `combat/shields.ts` for every rule; this is only the state.
+  // -------------------------------------------------------------------------
+
+  /** Press-edge bookkeeping for the parry window. Sim-timed, never wall-clock. */
+  const guard = createGuard();
+
+  /** 0..1 eased visual guard, so the arm swings up instead of snapping. */
+  let guardBlend = 0;
+
+  /** Counters the harnesses read. Not gameplay — nothing branches on these. */
+  const guardStats = { blocked: 0, parried: 0, brokeGuard: 0, flanked: 0 };
+  /** The most recent resolution, for `__gameDebug.guardState()`. */
+  let lastBlock: BlockOutcome | null = null;
+
+  /**
+   * Sim time of the last parry, or -Infinity. Drives the thread-spark.
+   *
+   * A timestamp rather than a countdown so the effect is derived from the sim
+   * clock instead of accumulating its own: a paused game freezes the spark
+   * mid-burst for free, and there is no second timer to forget to tick.
+   */
+  let parrySparkAtS = -Infinity;
+
+  /**
+   * The best shield in the HOTBAR, or null.
+   *
+   * The hotbar, not the selected slot: a shield coexists with your weapon, so
+   * requiring it to be selected would mean choosing between blocking and
+   * hitting back, and the cost of the feature is meant to be the SLOT, not the
+   * hand. The pack proper is excluded for the same reason a sword in your
+   * backpack does not swing — five slots is the loadout, and reaching past it
+   * would make the slot cost nothing.
+   */
+  function shieldTier(): ShieldTier | null {
+    return bestShieldTier(inventory.hotbar.map((s) => s?.id ?? null));
+  }
+
+  /**
+   * True when the shield is actually up: carrying one, holding the input, and
+   * alive to hold it.
+   *
+   * AN OPEN PANEL IS DELIBERATELY NOT IN THIS LIST, and it was at first. The
+   * gate belongs on RAISING the guard, not on holding it — the RMB listener
+   * already refuses while a panel is open, because there the right button
+   * belongs to the inventory. But a guard that was already up when you opened
+   * your map has no business falling: the button is still down, the sim is
+   * still running for anything that does not pause it, and a shield that
+   * silently stops working because you glanced at the chart is a bug the player
+   * would only ever discover by dying.
+   *
+   * It also keeps the parry window honest across a pause. The window is a
+   * difference of two sim times; the sim clock stops; therefore pausing can
+   * neither eat the window nor extend it. Dropping the guard on a panel would
+   * have replaced that clean property with "pausing cancels your block", which
+   * is a different rule wearing the same clothes.
+   */
+  function blocking(): boolean {
+    return guard.down && shieldTier() !== null && vitals.alive && !flyMode;
+  }
+
   const ATTACK_LOG_N = 256;
   const attackLogId: string[] = new Array<string>(ATTACK_LOG_N).fill('');
   const attackLogT = new Float64Array(ATTACK_LOG_N);
@@ -1561,7 +1662,12 @@ async function boot() {
             // and the village terraced, which is up to 2.5 m out on a road
             // cutting; the routing test then decided a guard standing on a
             // causeway could not reach a rider it was standing next to.
-            applyAttackOnPlayer(GUARD_MELEE_DMG, 'guard', 'melee', 1.7, rt.wy);
+            // No `id`/`entity`: guards are NPC runtimes, not entities, so there
+            // is nothing `staggerAnimal` could be handed. Their blows are still
+            // blockable and still parryable — the parry simply buys the zero
+            // damage and not the stagger, which is the honest degradation.
+            applyAttackOnPlayer(GUARD_MELEE_DMG, 'guard', 'melee', 1.7, rt.wy,
+              { x: rt.wx, z: rt.wz, kind: 'melee' });
           }
           // Bow: the answer to a target the guard cannot reach — up a cliff,
           // sprinting away, or thirty metres up on a dragon.
@@ -1701,6 +1807,8 @@ async function boot() {
    * rewrites and the hand-rolled campfire light list — see render/fire-fx.ts.
    */
   let lastFireBillboards = 0;
+  /** Billboards the parry spark queued this frame. Diagnostics + harnesses. */
+  let lastParrySparks = 0;
   function emitFireVfx(
     eye: Vec3, indoors: boolean,
     heldTorch: { pos: Vec3; radius: number } | null,
@@ -1740,6 +1848,28 @@ async function boot() {
       nowS: simTime,
       eye,
     });
+    // The parry spark, queued into the same billboard system between `begin`
+    // and the frame's draw. Position is the SHIELD, not the attacker: the blow
+    // was turned aside at the board, so that is where the seam pops. Left arm,
+    // chest height, half a metre in front — `controller.yaw` is the mesh facing
+    // convention, forward is `(sin yaw, -cos yaw)`, and left is that rotated a
+    // quarter turn.
+    const sparkAge = simTime - parrySparkAtS;
+    if (sparkAge >= 0 && sparkAge < PARRY_SPARK_S) {
+      const fy = Math.sin(controller.yaw);
+      const fz = -Math.cos(controller.yaw);
+      lastParrySparks = emitParrySpark(renderer.fire,
+        controller.pos[0] + fy * 0.42 + fz * 0.30,
+        controller.pos[1] + PLAYER_HEIGHT * 0.55,
+        controller.pos[2] + fz * 0.42 - fy * 0.30,
+        sparkAge,
+        // Deterministic per parry: the sim time it happened at, quantised to
+        // the sim step so every frame of one burst gets the SAME seed and the
+        // threads fly along fixed paths instead of re-scattering each frame.
+        Math.round(parrySparkAtS * 1000) >>> 0);
+    } else {
+      lastParrySparks = 0;
+    }
     lastFireBillboards = renderer.fire.count;
     return lights;
   }
@@ -3160,7 +3290,8 @@ async function boot() {
             rt.attackCooldown = CIVILIAN_MELEE_PERIOD;
             // Carved ground via the NPC's own foot height — see the guard
             // melee site above for why the raw field was wrong here.
-            applyAttackOnPlayer(CIVILIAN_MELEE_DMG, 'combat', 'melee', 1.7, rt.wy);
+            applyAttackOnPlayer(CIVILIAN_MELEE_DMG, 'combat', 'melee', 1.7, rt.wy,
+              { x: rt.wx, z: rt.wz, kind: 'melee' });
           }
           continue;
         }
@@ -4058,9 +4189,13 @@ async function boot() {
         if (inBreathCone(mouth, dir,
           controller.pos[0], controller.pos[1] + PLAYER_HEIGHT * 0.5,
           controller.pos[2], spec.reach)) {
+          // The MOUTH, not the body. A dragon is 4 m long and its head can be
+          // well off the axis its centre sits on; the cone test asks "where did
+          // this come from", and for a jet of fire that is the muzzle.
           applyAttackOnPlayer(
             Math.max(1, Math.round(BREATH_DMG_NPC * spec.dmg)),
-            'animal', 'ranged', def.size, e.y);
+            'animal', 'ranged', def.size, e.y,
+            { x: mouth[0], z: mouth[2], kind: 'breath', id: e.id, entity: e });
         }
       }
     }
@@ -4304,7 +4439,12 @@ async function boot() {
     if (!vitals.alive) return;
     if (bossBreathLast.hit) {
       bossBreathHits++;
-      applyAttackOnPlayer(BOSS_BREATH_DMG, 'animal', 'ranged', def.size, e.y);
+      // `boss: true` costs nothing here — breath is never parryable, so the
+      // shorter boss stagger can never be reached down this path — but it is
+      // set anyway, because a source struct that lies about what it is is a
+      // struct that will be copied to somewhere the lie matters.
+      applyAttackOnPlayer(BOSS_BREATH_DMG, 'animal', 'ranged', def.size, e.y,
+        { x: mouth[0], z: mouth[2], kind: 'breath', id: e.id, entity: e, boss: true });
     }
     void playerDist;
   }
@@ -4514,8 +4654,113 @@ async function boot() {
   }
 
   /**
+   * Who is hitting you, and with what. Everything the shield needs and the
+   * damage number cannot say.
+   *
+   * This exists because `applyAttackOnPlayer` used to take a damage figure, a
+   * cause, a reach and the attacker's SIZE and HEIGHT — and nothing about where
+   * the attacker was standing. Five of its six call sites had the position in
+   * scope and threw it away at the boundary; the sixth (the dungeon) had lost
+   * it three layers earlier. A frontal-cone block is unimplementable from that,
+   * which is why widening this signature was the first thing the shield needed.
+   */
+  interface AttackSource {
+    /** Attacker world X/Z. The cone test's entire input. */
+    x: number;
+    z: number;
+    /** Which shield rule applies — only `melee` may be parried. */
+    kind: IncomingKind;
+    /** Entity id, when the attacker holds a token that a parry should free. */
+    id?: string;
+    /**
+     * The attacker itself, when the caller has it.
+     *
+     * Passed rather than looked up by id because the dungeon's enemies do not
+     * live in `entityManager` at all — they are owned by the resident dungeon —
+     * so an id-only contract would have made underground parries silently
+     * stagger nothing. Every caller that can stagger already has the object.
+     */
+    entity?: import('./entities/entity-manager').EntityState;
+    /** True for the two boss species: half the parry stagger. */
+    boss?: boolean;
+    /** Pool holding the attacker's turn, so a parry can hand it straight back. */
+    tokens?: MeleeTokenPool | null;
+  }
+
+  /**
+   * Run an incoming blow through the guard and return the damage that survives.
+   *
+   * THE SINGLE SHIELD DECISION. Both damage paths call it — the melee/breath
+   * one below and `resolveEnemyProjectileHit`, which does its own routing and
+   * its own `damagePlayer` and would otherwise have been free to disagree with
+   * this one about what a shield stops. Two paths that must agree and are not
+   * forced to is how "arrows are blockable" ends up true in one of them.
+   *
+   * Applies every consequence EXCEPT the damage: stamina, the SFX, the spark,
+   * the attacker's stagger, and handing its token back. The caller keeps the
+   * damage because the two paths route it differently (mount vs player).
+   */
+  function guardIncoming(dmg: number, src: AttackSource): number {
+    // A corpse does not block, and neither does a free-fly camera. Returned
+    // before `resolveBlock` rather than folded into it so `lastBlock` keeps
+    // meaning "why the guard decided what it decided" instead of picking up a
+    // reason that is really about being dead.
+    if (!vitals.alive || flyMode) return dmg;
+    const out = resolveBlock({
+      tier: shieldTier(),
+      guard,
+      nowS: simTime,
+      stamina: vitals.stamina,
+      // `controller.yaw` is the MESH facing convention, which is what
+      // `blockBearing` expects. Feeding it `orbitCam.yaw` would have inverted
+      // the cone — blocks would have worked only with your back to the enemy —
+      // and nothing would have type-checked differently. See lock-on.ts's
+      // header for why this codebase has two yaw conventions at all.
+      facingYaw: controller.yaw,
+      px: controller.pos[0],
+      pz: controller.pos[2],
+    }, { kind: src.kind, x: src.x, z: src.z, boss: src.boss === true });
+    lastBlock = out;
+
+    if (out.kind === 'through') {
+      if (out.reason === 'flank') guardStats.flanked++;
+      else if (out.reason === 'guard-break') guardStats.brokeGuard++;
+      return dmg;
+    }
+
+    // One-shot drain: rate `cost` over 1 s, matching the swing's own
+    // `drainStamina(vitals, 3, 1)`. It also stamps `sinceDrainS = 0`, so a
+    // player under sustained attack never regenerates between blows — which is
+    // what makes the per-tier stamina figure mean anything.
+    if (out.staminaCost > 0) drainStamina(vitals, out.staminaCost, 1);
+
+    const sfx = blockSfx(out);
+    if (sfx !== null) audio.play(sfx);
+
+    if (out.kind === 'parry') {
+      guardStats.parried++;
+      parrySparkAtS = simTime;
+      const ent = src.entity ?? (src.id === undefined
+        ? undefined : entityManager.entities.get(src.id));
+      if (ent !== undefined) staggerAnimal(ent, out.staggerS);
+      // Hand the turn back so the pack keeps rotating. A staggered enemy stops
+      // asking and would fall out on `INTENT_TTL_S` anyway; saying it outright
+      // is 0.35 s of the pack not standing around.
+      if (src.id !== undefined) src.tokens?.releaseToken(src.id);
+    } else {
+      guardStats.blocked++;
+    }
+    return dmg * out.damageMul;
+  }
+
+  /**
    * Apply an attack aimed at the player through the routing rules.
    * Returns true when the player themself was hit.
+   *
+   * The guard runs AFTER the routing, not before, and that ordering is the
+   * whole rule: `routePlayerDamage` can send a melee swing to the MOUNT you are
+   * sitting on, and a shield on your arm does not cover a horse. Blocking first
+   * would have made the shield protect the animal.
    */
   function applyAttackOnPlayer(
     dmg: number,
@@ -4523,10 +4768,16 @@ async function boot() {
     reach: 'melee' | 'ranged',
     attackerSize: number,
     attackerY: number,
+    src: AttackSource,
   ): boolean {
     const routing = routePlayerDamage(reach, { size: attackerSize, y: attackerY }, riderState());
     if (routing.target === 'player') {
-      damagePlayer(vitals, dmg, cause, totalDefense(inventory));
+      const landed = guardIncoming(dmg, src);
+      // A fully-stopped blow is not a hit: no flash, no hurt cry, no vitals
+      // write. `false` here also keeps it out of the "player was hit" bookkeeping
+      // every caller does with the return value.
+      if (landed <= 0) return false;
+      damagePlayer(vitals, landed, cause, totalDefense(inventory));
       triggerDamageFlash();
       audio.play('hurt');
       saveVitals(vitals);
@@ -5926,6 +6177,108 @@ async function boot() {
       deniedByRate: meleeTokens.deniedByRate,
       enabled: meleeTokensOn,
     }),
+    /**
+     * The guard, as the sim sees it.
+     *
+     * `combat-feel-check.mjs` needs to prove that a blocked bite cost exactly
+     * the tier's stamina and that a parry cost none, and neither claim is
+     * visible from HP alone — a parry and an ordinary block look identical on
+     * the health bar, which is precisely the trap a "parry test" falls into.
+     * `lastReason` is what tells them apart, and `parried`/`blocked` are what
+     * catch a test that is measuring nothing because the shield never engaged.
+     *
+     * Read-only. Nothing in the feature branches on any of it (see the release
+     * rule): `__gameDebug` is stripped from a release build and blocking has to
+     * behave identically with it gone.
+     */
+    guardState: () => ({
+      shield: shieldTier(),
+      down: guard.down,
+      raised: blocking(),
+      /** True right now — the window is open and a blow landing would parry. */
+      parryWindow: parryReady(guard, simTime),
+      /** Whether this raise was allowed to arm at all (the anti-mash rule). */
+      armed: guard.armed,
+      raisedAtS: guard.raisedAtS,
+      blend: guardBlend,
+      lastKind: lastBlock?.kind ?? null,
+      lastReason: lastBlock?.reason ?? null,
+      lastBearingDeg: lastBlock === null ? null : lastBlock.bearing * 180 / Math.PI,
+      lastStaggerS: lastBlock?.staggerS ?? 0,
+      sparks: lastParrySparks,
+      ...guardStats,
+    }),
+    /** Seconds of parry-stagger left on an entity, or null when unknown. */
+    staggerOf: (id: string) => {
+      const e = entityManager.entities.get(id);
+      return e === undefined ? null : staggerRemaining(e);
+    },
+    /**
+     * Put a shield in hotbar slot 1 — NOT the selected slot.
+     *
+     * Slot 1 on purpose: the whole claim of the feature is that a shield
+     * coexists with the weapon in your hand, so a harness that had to select
+     * the shield to use it would be testing something the game does not do.
+     * `null` clears the slot.
+     */
+    giveShield: (tier: string | null) => {
+      if (tier === null) { inventory.hotbar[1] = null; invChanged(); return true; }
+      const s = (SHIELD_STATS as Record<string, { itemId: string }>)[tier];
+      if (s === undefined) return false;
+      inventory.hotbar[1] = { id: s.itemId as GameItemId, count: 1 };
+      invChanged();
+      return true;
+    },
+    /**
+     * Land one blow on the player RIGHT NOW, through the real damage path.
+     *
+     * The one thing a harness cannot otherwise do is choose WHEN a blow lands,
+     * and the parry window is 0.18 s wide — so proving that `window − ε` parries
+     * and `window + ε` does not is unreachable by waiting for a wolf to make up
+     * its own mind. Everything else is real: this calls the same
+     * `applyAttackOnPlayer` the wolf calls, builds the same source struct from
+     * the same live entity, and the HP and stamina it moves are the real ones.
+     * Only the clock is the harness's.
+     *
+     * Returns what the guard decided plus the exact `heldS` at impact, so a
+     * timing assertion can report the margin it actually achieved rather than
+     * the one it hoped for.
+     */
+    forceAttackOnPlayer: (
+      entityId: string | null, damage: number,
+      kind: 'melee' | 'projectile' | 'breath' = 'melee',
+    ) => {
+      const e = entityId === null ? undefined : entityManager.entities.get(entityId);
+      const heldS = guard.down ? simTime - guard.raisedAtS : -1;
+      const hpBefore = vitals.hp;
+      const staBefore = vitals.stamina;
+      const hit = applyAttackOnPlayer(damage,
+        e === undefined ? 'combat' : 'animal',
+        kind === 'melee' ? 'melee' : 'ranged',
+        e === undefined ? 1.7 : SPECIES_DEFS[e.species].size,
+        e === undefined ? controller.pos[1] : e.y,
+        {
+          x: e?.x ?? controller.pos[0],
+          z: e?.z ?? (controller.pos[2] - 2),
+          kind,
+          id: e?.id,
+          entity: e,
+          boss: e === undefined ? false : isExempt(e.species),
+          tokens: meleeTokensOn ? meleeTokens : null,
+        });
+      return {
+        hit,
+        heldS,
+        hpLost: hpBefore - vitals.hp,
+        staminaSpent: staBefore - vitals.stamina,
+        kind: lastBlock?.kind ?? null,
+        reason: lastBlock?.reason ?? null,
+        staggerS: lastBlock?.staggerS ?? 0,
+        bearingDeg: lastBlock === null ? null : lastBlock.bearing * 180 / Math.PI,
+      };
+    },
+    /** The published ladder, so a harness asserts on the shipped numbers. */
+    shieldLadder: () => SHIELD_STATS,
     lockOn: () => {
       const t = lockOnId === null ? undefined : lockedCandidate();
       if (t === undefined) return null;
@@ -7413,6 +7766,14 @@ async function boot() {
       toggleAmmo();
       return;
     }
+    // T — tell the animal to stay or to follow. Unconditional, because the
+    // right button that used to do this belongs to the shield the moment the
+    // player crafts one (see the RMB handler), and a command that vanishes
+    // when you pick up a piece of gear is a command that reads as broken.
+    if (e.code === 'KeyT') {
+      togglePetStay();
+      return;
+    }
     // P drops the held item — one, or the whole stack with Shift.
     //
     // A full pack is otherwise a dead end: crafting needs a free slot for its
@@ -7971,10 +8332,17 @@ async function boot() {
 
     // Tick dungeon enemies when inside — replaces the normal overworld tick.
     if (dungeonManager.isInside) {
-      dungeonManager.tickEnemies(dtS, px, pz, simTime, (damage: number) => {
+      dungeonManager.tickEnemies(dtS, px, pz, simTime, (damage, src, kind, tokens) => {
         // Mounts cannot be brought into a dungeon, so this always resolves to
         // the player — routed anyway so there is exactly one damage path.
-        applyAttackOnPlayer(damage, 'animal', 'melee', 1.0, controller.pos[1]);
+        //
+        // `reach` stays 'melee' even for the archer's shot: `routePlayerDamage`
+        // is about whether a blow reaches a MOUNTED rider, and there are no
+        // mounts down here. `kind` is the shield's question and it is the one
+        // that has to be right — an underground arrow is blockable and never
+        // parryable.
+        applyAttackOnPlayer(damage, 'animal', 'melee', 1.0, controller.pos[1],
+          { x: src.x, z: src.z, kind, id: src.id, entity: src, tokens });
       });
       return;
     }
@@ -8125,8 +8493,17 @@ async function boot() {
           // never reach a rider in the saddle: it hits the mount, or nothing
           // at all if the mount is out of reach overhead (attack-routing.ts).
           noteAttackOnPlayer(e.id, simTime);
+          // The overworld melee path, and the one the Evil King uses once he is
+          // off his dragon — which is what makes him parryable. `isExempt`
+          // rather than a species list so the boss stagger and the token
+          // exemption can never come to disagree about who is a boss.
           applyAttackOnPlayer(damage, 'animal', 'melee',
-            SPECIES_DEFS[e.species].size, e.y);
+            SPECIES_DEFS[e.species].size, e.y,
+            {
+              x: e.x, z: e.z, kind: 'melee', id: e.id, entity: e,
+              boss: isExempt(e.species),
+              tokens: meleeTokensOn ? meleeTokens : null,
+            });
         },
         // Turn-taking, so a pack menaces instead of mobbing. Wildlife brawling
         // with each other is deliberately NOT arbitrated — see the pool.
@@ -9105,10 +9482,29 @@ async function boot() {
 
     const routing = routePlayerDamage('ranged', { size: 1.7, y: p.y }, riderState());
     if (routing.target === 'player') {
-      damagePlayer(vitals, p.damage, 'combat', totalDefense(inventory));
-      triggerDamageFlash();
-      audio.play('hurt');
-      saveVitals(vitals);
+      // ARROWS ARE BLOCKABLE, AND NOT PARRYABLE. Classic Zelda blocks a frontal
+      // arrow and so does this: a shield you have to drop to deal with archers
+      // is a shield that stops being a shield the moment a fight gets
+      // interesting. It is `kind: 'projectile'`, so `resolveBlock` gives it the
+      // cone test and the full stamina cost but never the parry window —
+      // there is no windup on an arrow for the player to read, so a parry would
+      // be a coin flip dressed as skill.
+      //
+      // `p.ox/p.oz` is where the shot was FIRED FROM, not where it is now. That
+      // is the correct input to a cone test the player experiences as "which
+      // way is it coming from": an arrow's own position is a point already
+      // inside the player's capsule and its bearing is meaningless. It is also
+      // what keeps this path in agreement with the melee one, which uses the
+      // attacker's body.
+      const landed = guardIncoming(p.damage, {
+        x: p.ox, z: p.oz, kind: 'projectile',
+      });
+      if (landed > 0) {
+        damagePlayer(vitals, landed, 'combat', totalDefense(inventory));
+        triggerDamageFlash();
+        audio.play('hurt');
+        saveVitals(vitals);
+      }
     } else if (routing.target === 'mount') {
       damageMount(p.damage);
     }
@@ -9312,11 +9708,12 @@ async function boot() {
   // hands. Steps 1–5 are world interactions that make no sense at saddle
   // height (you cannot chop a tree or fill a waterskin from a flying dragon)
   // and are skipped while mounted so they can never swallow the attack.
-  // Right click: toggle stay/sit on a nearby owned animal (mounts, pets).
-  // A staying animal sits where it was left and stops following the player.
-  window.addEventListener('mousedown', (e) => {
-    if (e.button !== 2 || flyMode || panels.isOpen) return;
-    if (document.pointerLockElement !== canvas) return;
+  /**
+   * Toggle stay/sit on the nearest owned animal. Extracted so it has a home on
+   * `T` as well as on the right button — see the RMB handler below for why it
+   * needed one.
+   */
+  function togglePetStay(): void {
     let bestStay: import('./entities/entity-manager').EntityState | null = null;
     let bestStayDist = 4;
     for (const ent of entityManager.entities.values()) {
@@ -9329,8 +9726,51 @@ async function boot() {
     bestStay.staying = bestStay.staying !== true;
     const stayName = SPECIES_DEFS[bestStay.species].name;
     setGatherNotice(bestStay.staying
-      ? `The ${stayName} sits and stays here. (right-click to call)`
+      ? `The ${stayName} sits and stays here. (T to call)`
       : `The ${stayName} follows you again.`);
+  }
+
+  // -------------------------------------------------------------------------
+  // Right button: RAISE THE SHIELD, or — when you are not carrying one — the
+  // old pet stay/follow toggle.
+  //
+  // Every mouse button was already taken when shields arrived: left is
+  // gather/attack/draw, middle is Z-targeting, right was the pet toggle. One of
+  // them had to give, and it is not a close call — blocking is a core combat
+  // verb used several times a second in every fight, and telling a tamed wolf
+  // to sit is a convenience used a handful of times a session.
+  //
+  // So the right button is CONDITIONAL, and deliberately so rather than simply
+  // reassigned: a player with no shield in their hotbar — which is every player
+  // before they craft one, and the whole of the existing save-game population —
+  // sees no change at all. The pet toggle also gains an unconditional home on
+  // `T`, so it is never unreachable for the shield-carrying player; the
+  // notice text above says T rather than right-click for that reason.
+  //
+  // `__pad` bypasses the pointer-lock gate exactly as the left-button handler
+  // does: a pad player never acquires pointer lock, and without it RB could
+  // not block at all — the same defect RT once had.
+  window.addEventListener('mousedown', (e) => {
+    if (e.button !== 2 || flyMode || panels.isOpen) return;
+    if (document.pointerLockElement !== canvas
+      && !(e as { __pad?: boolean }).__pad) return;
+    if (shieldTier() !== null) {
+      if (!vitals.alive) return;
+      // The press EDGE is the parry window's origin. `setGuardInput` ignores
+      // anything that is not a transition, so a key-repeat-style storm of
+      // mousedowns cannot re-arm it.
+      setGuardInput(guard, true, simTime);
+      return;
+    }
+    togglePetStay();
+  });
+  window.addEventListener('mouseup', (e) => {
+    // Unconditional, and NOT gated on pointer lock or on still carrying a
+    // shield. Releasing the button must always drop the guard: dropping a
+    // shield from the hotbar mid-block, or letting go with the cursor outside
+    // the canvas, would otherwise leave it raised with no way to lower it.
+    if (e.button !== 2) return;
+    setGuardInput(guard, false, simTime);
   });
   window.addEventListener('contextmenu', (e) => {
     if (document.pointerLockElement === canvas) e.preventDefault();
@@ -9343,6 +9783,19 @@ async function boot() {
   // been broken and nothing would have caught it.
   function resolveLeftClick(): void {
     if (attackT < 1) return; // swing still in progress
+    // BLOCK AND ATTACK ARE MUTUALLY EXCLUSIVE, in this direction only.
+    //
+    // You cannot swing behind a raised shield — that is the cost that stops
+    // blocking from being strictly free, and the reason a fight has a rhythm
+    // rather than being "hold RMB, click forever". The other direction is
+    // deliberately open: raising the guard mid-swing is allowed, because a
+    // shield that refuses to come up for the third of a second an axe takes to
+    // recover feels like the game ignoring the button, and a swing that is
+    // already out cannot be un-thrown anyway.
+    //
+    // The gate is here rather than in the listener so the pad's synthesised
+    // click, the mouse, and any harness driving `resolveLeftClick` all obey it.
+    if (blocking()) return;
 
     const heldId2 = equipped(inventory);
     const isMounted = mountedEntityId !== null;
@@ -9815,8 +10268,42 @@ async function boot() {
           const lt = lockOnId === null ? undefined : lockedCandidate();
           const faceYaw = lt === undefined ? null
             : lockFacingYaw(controller.pos[0], controller.pos[2], lt.x, lt.z);
+          // BLOCKING COSTS SPEED — half of it. Applied by pulling the step
+          // back toward where it started rather than by scaling `SIM_DT` or by
+          // adding a multiplier to `PlayerController`: scaling the timestep
+          // would halve gravity too (you would fall slower behind a shield),
+          // and the shortened step still ends between two positions the
+          // controller's own `moveXZ` already resolved as legal, so no
+          // collision is skipped. `moveSpeed` is scaled with it so the walk
+          // cycle slows to match instead of sliding.
+          //
+          // Not while mounted: `tickMount` owns the rider's position there, and
+          // an animal does not walk slower because the person on it is holding
+          // a shield.
+          const bx = controller.pos[0];
+          const bz = controller.pos[2];
           controller.update(SIM_DT, orbitCam.yaw, faceYaw);
+          if (blocking() && mountedEntityId === null) {
+            controller.pos[0] = bx + (controller.pos[0] - bx) * BLOCK_MOVE_MUL;
+            controller.pos[2] = bz + (controller.pos[2] - bz) * BLOCK_MOVE_MUL;
+            controller.moveSpeed *= BLOCK_MOVE_MUL;
+          }
         }
+      }
+      // The guard's own bookkeeping, once per SIM step so it freezes with the
+      // clock. Dropping it here rather than hooking three separate transitions
+      // (death, fly mode, the shield leaving the hotbar) keeps the rule in one
+      // place and makes it idempotent. A panel is NOT one of them — see
+      // `blocking()`.
+      if (!vitals.alive || flyMode || shieldTier() === null) dropGuard(guard);
+      // Eased so the arm swings up over ~0.12 s rather than teleporting. The
+      // GAMEPLAY guard is `guard.down` and is instant — the visual lag must
+      // never gate the mechanic, or the parry window would start before the
+      // shield looked like it existed.
+      {
+        const target = blocking() ? 1 : 0;
+        guardBlend += (target - guardBlend) * Math.min(1, SIM_DT / 0.12);
+        if (Math.abs(guardBlend - target) < 0.004) guardBlend = target;
       }
       // Walk cycle: phase advances with distance, amplitude eases in/out.
       walkPhase += controller.moveSpeed * SIM_DT * 1.6;
@@ -10211,6 +10698,11 @@ async function boot() {
         body: armorTierOf(inventory.armor.body?.id),
         legs: armorTierOf(inventory.armor.legs?.id),
       },
+      // From the HOTBAR, not an equip slot — the same query the damage path
+      // uses, so what is drawn on the arm is always the shield that would
+      // actually stop the next blow. Two separate lookups here would be a way
+      // for the picture and the mechanic to disagree.
+      shield: shieldTier() ?? undefined,
     };
     // An archer looks where the arrow is going. Unmounted the controller yaw
     // already tracks the camera; MOUNTED it tracks the animal's body, so a
@@ -10232,7 +10724,7 @@ async function boot() {
     }
     const charVerts = buildCharacterMesh(custom, {
       yaw: meshYaw, walkPhase, walkAmp: effectiveWalkAmp, attackT,
-      aim: aimNow, seat: seatBlend,
+      aim: aimNow, seat: seatBlend, block: guardBlend,
     }, held, charOptions, playerMeshScratch);
     const playerVerts = fitCharacterMesh(charVerts);
     renderer.device.queue.writeBuffer(player.vertexBuffer, 0, playerVerts);

@@ -163,6 +163,48 @@ setEq('barely-off-centre does not', stickToMoveKeys(0, -0.3), []);
   const firm = mapPad(padOf([0, 0, 0, 0], [], { [BUTTON.RT]: 0.8 }), 1 / 60);
   eq('trigger at 0.8 → attack', firm.intent.attack, true);
 }
+// ─── RB: block in gameplay, page in a panel ─────────────────────────────────
+{
+  // RB was the last unclaimed gameplay button on the pad — polled and
+  // edge-tracked, but consumed only inside the `ui &&` branch of poll(). It is
+  // the shield now, and `mapPad` is where the context split lives.
+  const rb = mapPad(padOf([0, 0, 0, 0], [BUTTON.RB]), 1 / 60);
+  eq('gameplay: RB raises the shield', rb.intent.block, true);
+  eq('...and does not attack', rb.intent.attack, false);
+  setEq('...and holds no movement key', rb.intent.heldKeys, []);
+
+  const rbUi = mapPad(padOf([0, 0, 0, 0], [BUTTON.RB]), 1 / 60, DEFAULT_CONFIG, true);
+  eq('panel: RB does not block (it is still the crafting page)', rbUi.intent.block, false);
+  eq('panel: RB is still tracked for its page edge', rbUi.buttons[BUTTON.RB], true);
+
+  eq('nothing pressed → no block',
+    mapPad(padOf([0, 0, 0, 0]), 1 / 60).intent.block, false);
+
+  // Block and attack are separate BUTTONS as well as separate intents. The
+  // gameplay rule that you cannot swing behind a raised shield lives in
+  // main.ts; what must be true here is that the pad can express both states
+  // independently, including both at once — an input layer that could not
+  // would make the rule untestable and unrelaxable.
+  const both = mapPad(padOf([0, 0, 0, 0], [BUTTON.RB, BUTTON.RT]), 1 / 60);
+  eq('RB+RT: block is held', both.intent.block, true);
+  eq('RB+RT: attack is held too (the exclusion is a sim rule, not an input one)',
+    both.intent.attack, true);
+
+  // Analog threshold, same as the triggers: a bumper is digital on every pad
+  // the standard mapping describes, but `isDown` reads `value` too and a pad
+  // reporting 0.3 must not raise a shield.
+  eq('RB at 0.3 → no block',
+    mapPad(padOf([0, 0, 0, 0], [], { [BUTTON.RB]: 0.3 }), 1 / 60).intent.block, false);
+  eq('RB at 0.8 → block',
+    mapPad(padOf([0, 0, 0, 0], [], { [BUTTON.RB]: 0.8 }), 1 / 60).intent.block, true);
+
+  // LT is lock-on and LB is voice; neither may be caught by the block test, or
+  // aiming at something (or talking to it) would put the shield up.
+  eq('LT does not block',
+    mapPad(padOf([0, 0, 0, 0], [BUTTON.LT]), 1 / 60).intent.block, false);
+  eq('LB does not block',
+    mapPad(padOf([0, 0, 0, 0], [BUTTON.LB]), 1 / 60).intent.block, false);
+}
 {
   const l3 = mapPad(padOf([0, -1, 0, 0], [BUTTON.L3]), 1 / 60).intent.heldKeys;
   setEq('L3 while walking → sprint', l3, ['KeyW', 'ShiftLeft']);

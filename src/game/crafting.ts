@@ -131,6 +131,26 @@ export const RECIPES: readonly Recipe[] = [
   { output: 'dragonscale_chest', count: 1, inputs: [['dragon_scale', 6], ['iron_ingot', 2], ['leather', 2]], station: 'forge', category: 'armor' },
   { output: 'dragonscale_legs',  count: 1, inputs: [['dragon_scale', 4], ['iron_ingot', 1], ['leather', 1]], station: 'forge', category: 'armor' },
 
+  // ---- shields (combat/shields.ts) ----------------------------------------
+  //
+  // The one ladder in this game whose bottom rung is reachable on day one: the
+  // wooden shield is planks and thread, both hand-craftable from a log and some
+  // flax, because a defence you cannot get until you find a forge is a defence
+  // that arrives after the fights it was for. Every rung above it is a forge
+  // recipe, and each keeps a wooden core (planks) — these are faced boards, not
+  // solid plate, which is also why the wooden one still burns (`fuel` on the
+  // item def) and the others do not.
+  //
+  // Filed under `armor` because that is where a player looks for a shield, and
+  // `test-crafting.mts` knows shields are the one armour-category output that
+  // is carried rather than worn.
+  { output: 'wood_shield',        count: 1, inputs: [['planks', 4], ['thread', 2]],                            station: 'hand',  category: 'armor' },
+  { output: 'bronze_shield',      count: 1, inputs: [['bronze_ingot', 3], ['planks', 2], ['leather', 1]],      station: 'forge', category: 'armor' },
+  { output: 'iron_shield',        count: 1, inputs: [['iron_ingot', 4], ['planks', 2], ['leather', 1]],        station: 'forge', category: 'armor' },
+  // Five scales — one wyvern will not do it, and a dragon barely will. The
+  // iron is the boss and the rim banding; the leather is the arm strap.
+  { output: 'dragonscale_shield', count: 1, inputs: [['dragon_scale', 5], ['iron_ingot', 2], ['leather', 2]],  station: 'forge', category: 'armor' },
+
   // ---- food (fire + pot) --------------------------------------------------
   { output: 'meat_cooked',   count: 1, inputs: [['meat_raw', 1]],                                      station: 'fire',            category: 'food' },
   { output: 'hearty_stew',   count: 1, inputs: [['meat_raw', 2], ['mushroom', 1]],                     station: 'fire', needsPot: true, category: 'food' },

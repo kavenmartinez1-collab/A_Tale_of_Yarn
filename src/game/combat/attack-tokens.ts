@@ -461,6 +461,36 @@ export class MeleeTokenPool {
     if (c.holdS > FOLLOW_THROUGH_S) c.holdS = FOLLOW_THROUGH_S;
   }
 
+  /**
+   * Hand the token back RIGHT NOW — the holder has been taken out of the fight
+   * mid-turn. Parry stagger is the only caller (see `combat/shields.ts`).
+   *
+   * Without this, a parried enemy keeps its token for the whole
+   * `FOLLOW_THROUGH_S` (or `TOKEN_MAX_HOLD_S`) it was granted while standing
+   * there doing nothing, and against a pit of one or two tokens that is the
+   * entire pack going quiet for the duration of the stagger. The reward for a
+   * good parry would have been *less* to fight, which is backwards: what a
+   * parry should buy is an opening against THAT enemy while the rotation keeps
+   * turning behind it.
+   *
+   * It is not strictly load-bearing — a staggered enemy stops calling
+   * `requestSwing`, so `INTENT_TTL_S` would drop it 0.35 s later and free the
+   * token anyway. That 0.35 s of dead air is exactly the hitch this removes,
+   * and relying on a timeout to do a thing you can simply say is how the
+   * timeout ends up load-bearing by accident.
+   *
+   * Deliberately does NOT reset `waitedS`: the parried enemy has HAD its turn,
+   * and letting a stagger promote it back to the front of the queue would mean
+   * the enemy you just punished is the one that swings at you next.
+   */
+  releaseToken(id: string): void {
+    const c = this.contenders.get(id);
+    if (c === undefined || c.holdS <= 0) return;
+    c.holdS = 0;
+    this.held--;
+    if (this.held < 0) this.held = 0;
+  }
+
   mayLand(species: Species): boolean {
     if (isExempt(species)) return true;
     if (this.sinceLandS < LANDING_FLOOR_S) { this.deniedByRate++; return false; }

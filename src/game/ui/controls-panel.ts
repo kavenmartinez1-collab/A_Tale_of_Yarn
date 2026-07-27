@@ -42,8 +42,19 @@
  *
  * Bindings the old panel had RIGHT and are repeated here unchanged: lock-on is
  * `Z` and middle-click and LT; target cycling is Tab / Shift+Tab and a
- * right-stick flick; sprint is Shift and L3. There is no block, parry, dodge or
- * roll binding anywhere in the game, so none is listed.
+ * right-stick flick; sprint is Shift and L3.
+ *
+ * ## The right button now depends on what you are carrying
+ *
+ * There is a block and a parry as of the shield wave, and the right button is
+ * where they live — which is where the pet stay/follow toggle already lived.
+ * The button is conditional (shield in the hotbar wins) and the pet toggle
+ * moved to `T`, so BOTH meanings are listed, in that order, and the pet row
+ * says `T` rather than right-click. A player with no shield sees no change in
+ * behaviour; a player with one needs to be told where the toggle went, and this
+ * table is the only place they will look. (`main.ts` RMB handler.)
+ *
+ * Dodging and rolling still do not exist, so neither is listed.
  *
  * DETERMINISM: pure DOM construction, no clocks, no randomness.
  * RELEASE SAFE: reads no `__gameDebug`.
@@ -67,6 +78,7 @@ const KEYBOARD: Binding[] = [
   ['Mouse', 'Look around'],
   ['Wheel', 'Pull the camera in and out'],
   ['Left-click', 'Gather, use, swing. With a bow: hold to draw, let go to loose'],
+  ['Right-click', 'Hold up your shield. Raise it just as a blow lands to turn it'],
   ['Z  ·  Middle-click', 'Lock on to what you are facing. Again to let go'],
   ['Tab', 'While locked on: the next one along (Shift+Tab for the last)'],
   ['E', 'Interact — talk, enter, mount, loot, drink, eat, sleep'],
@@ -74,7 +86,7 @@ const KEYBOARD: Binding[] = [
   ['1 – 5', 'Choose what is in your hand. A torch burns while it is chosen'],
   ['X', 'With a bow: swap flint arrows for Tintreach'],
   ['P', 'Drop what you are holding (Shift for the whole stack)'],
-  ['Right-click', 'Tell your animal to stay, or to follow'],
+  ['T', 'Tell your animal to stay, or to follow (right-click too, with no shield)'],
   // One row, because they are one idea — what the animal under you does — and
   // because listing them apart implies G works on a horse. It does not.
   ['F  ·  G', "Your mount's breath (or a stomp)  ·  its bite, on dragons and wyverns"],
@@ -90,6 +102,20 @@ const KEYBOARD: Binding[] = [
 /** Mounted play has one rule people get wrong; it earns a line of its own. */
 const MOUNTED_NOTE = 'On a mount, left-click is still YOUR weapon or bow. '
   + 'F and G are the animal’s.';
+
+/**
+ * The shield, which is three rules and no amount of key-chip will carry them.
+ *
+ * Every one of these is something a player will otherwise learn by dying:
+ * that the shield only covers the front, that timing beats holding, and that
+ * you cannot swing while it is up.
+ */
+const SHIELD_NOTE = 'A shield sits in your pack, not your hand — hold it up and '
+  + 'you still keep your weapon. It only covers what is in front of you, it will '
+  + 'not stop a dragon’s breath outright (better ones turn more of it), '
+  + 'and you cannot swing while it is raised. Arrows to the face bounce off. '
+  + 'Raising it at the last moment turns a blow aside for nothing and leaves '
+  + 'whatever swung reeling.';
 
 /** The pause screen's own keys, which no help panel has ever listed. */
 const CHART: Binding[] = [
@@ -114,7 +140,7 @@ const PAD: Binding[] = [
   ['X', 'Crafting  ·  in your pack: drop one from the highlighted slot'],
   ['Y', 'Your pack'],
   ['LB', 'Hold to speak aloud to a villager'],
-  ['RB', 'Next page, in crafting'],
+  ['RB', 'Hold up your shield  ·  in crafting: next page'],
   ['LT', 'Lock on, and again to let go  ·  on the pause screen: zoom out'],
   ['RT', 'Attack — hold to draw a bow  ·  on the pause screen: zoom in'],
   ['L3', 'Sprint'],
@@ -211,6 +237,7 @@ export function buildControlsContent(): HTMLElement {
   left.appendChild(heading('Keyboard and mouse', true));
   for (const b of KEYBOARD) left.appendChild(bindingRow(b));
   left.appendChild(note(MOUNTED_NOTE));
+  left.appendChild(note(SHIELD_NOTE));
 
   const right = column();
   right.appendChild(heading('Controller', true));

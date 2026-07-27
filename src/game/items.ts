@@ -17,7 +17,15 @@
  * `effectClass` — timed effect applied on consumption (potions / dishes).
  */
 
-export type ItemKind = 'weapon' | 'tool' | 'material' | 'consumable' | 'loot' | 'armor' | 'container';
+/**
+ * `shield` is its own kind rather than `armor` because a shield is never WORN.
+ * Armour lives in the three equip slots and applies its defence passively; a
+ * shield sits in the hotbar beside your weapon and only does anything while you
+ * hold the block input. Calling it armour would have put it in the equip UI,
+ * where it would have been a fourth passive defence rating and not a shield at
+ * all. See `combat/shields.ts`.
+ */
+export type ItemKind = 'weapon' | 'tool' | 'material' | 'consumable' | 'loot' | 'armor' | 'container' | 'shield';
 export type HeldKind = 'sword' | 'axe' | 'pickaxe' | 'bow' | 'staff' | 'torch';
 export type ToolKind = 'axe' | 'pickaxe';
 export type ArmorSlot = 'head' | 'body' | 'legs';
@@ -180,6 +188,29 @@ export const ITEM_DEFS = {
   bronze_sword: { name: 'Bronze Sword',  kind: 'weapon',  color: [0.72, 0.50, 0.28], stack: 1,  held: 'sword' },
   spear:        { name: 'Spear',         kind: 'weapon',  color: [0.60, 0.45, 0.25], stack: 1,  held: 'staff' },
   composite_bow:{ name: 'Composite Bow', kind: 'weapon',  color: [0.42, 0.30, 0.18], stack: 1,  held: 'bow'  },
+
+  // --- Shields (combat/shields.ts owns the stat ladder) ---------------------
+  //
+  // Four tiers, carried in the hotbar rather than worn: a shield costs you a
+  // slot a torch or a quiver would otherwise have, and buys a guard that
+  // coexists with whatever is in your hand. The stat ladder — stamina per
+  // block, and how much fire it turns — lives in `combat/shields.ts` beside the
+  // parry rules, NOT here, because it is a relation between the four of them
+  // and a table split across two files is a table that drifts.
+  //
+  // No `held` archetype: `held` is the RIGHT hand, and a shield is on the left
+  // arm. `character-mesh.ts` draws it off `CharacterOptions.shield`.
+  wood_shield:        { name: 'Wooden Shield',      kind: 'shield', color: [0.52, 0.38, 0.22], stack: 1, fuel: 60 },
+  bronze_shield:      { name: 'Bronze Shield',      kind: 'shield', color: [0.72, 0.50, 0.28], stack: 1 },
+  iron_shield:        { name: 'Iron Shield',        kind: 'shield', color: [0.66, 0.68, 0.72], stack: 1 },
+  /**
+   * The payoff tier. Its colour is the BOSS palette — the black hide and
+   * oxblood horn of `creature-parts.ts` — deliberately NOT the emerald of
+   * `dragonscale_helm`. The armour set is scale from any dragon; a shield that
+   * turns dragon fire reads as having been cut from something far worse, and
+   * putting it in the King's own black-and-red is the cheapest way to say so.
+   */
+  dragonscale_shield: { name: 'Dragonscale Shield', kind: 'shield', color: [0.22, 0.06, 0.07], stack: 1, warmth: 0.2 },
 
   // --- Armor: fiber tier (defense 1/1/1, warmth 0.1) -----------------------
   fiber_hood:     { name: 'Fiber Hood',     kind: 'armor', color: [0.55, 0.60, 0.40], stack: 1, warmth: 0.1, armor: { slot: 'head', defense: 1 } },
