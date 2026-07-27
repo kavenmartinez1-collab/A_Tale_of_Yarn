@@ -330,6 +330,47 @@ if (shipModels.length === 0 && !SKIP_MODELS) {
   console.log('      NO MODELS VENDORED — run `npx tsx scripts/fetch-weights.mts` first.');
 }
 
+/**
+ * Voices that must reach the depot, with the file that proves it is the model
+ * and not an empty directory.
+ *
+ * WHY THIS IS A HARD FAILURE AND NOT A WARNING. The selection rule above is
+ * "any directory whose name contains `--`" — it does not know what a voice is,
+ * so a voice that was never fetched, or renamed, or half-copied, produces a
+ * depot that builds cleanly, launches cleanly, and is silently mute for half
+ * the cast. The female voice is the fresh instance of that risk: every woman in
+ * the game synthesizes on ljspeech, and if it is absent the failure surfaces as
+ * an NPC who simply never speaks — indistinguishable, to a player, from speech
+ * being switched off.
+ *
+ * The lexicon is listed because both voices share the copy in joe's directory
+ * (see tts-worker.ts), so joe going missing would take the women's speech down
+ * too even though their own model was present.
+ */
+const REQUIRED_MODELS = [
+  ['rhasspy--piper-en-us-joe-medium', 'en_US-joe-medium.onnx',
+    'male villager voices'],
+  ['rhasspy--piper-en-us-joe-medium', 'lexicon-en-us.txt',
+    'the shared G2P lexicon — BOTH voices phonemize through it'],
+  ['rhasspy--piper-en-us-ljspeech-medium', 'en_US-ljspeech-medium.onnx',
+    'female villager voices'],
+];
+if (!SKIP_MODELS) {
+  const missingModels = REQUIRED_MODELS.filter(
+    ([dir, file]) => !fs.existsSync(path.join(OUT, 'resources', 'models', dir, file)),
+  );
+  for (const [dir, file, why] of missingModels) {
+    console.error(`      MISSING  models/${dir}/${file} — ${why}`);
+  }
+  if (missingModels.length) {
+    console.error('\npack-steam: refusing to build a depot whose villagers cannot speak.');
+    console.error('            run `npx tsx scripts/fetch-weights.mts` and pack again.\n');
+    process.exit(1);
+  }
+  console.log(`      required voice files present: `
+    + `${REQUIRED_MODELS.length}/${REQUIRED_MODELS.length}`);
+}
+
 // steam_appid.txt must sit next to the executable: the Steam API looks for it
 // in the working directory when a game is launched outside the client.
 fs.copyFileSync(path.join(REPO, 'app', 'steam', 'steam_appid.txt'),

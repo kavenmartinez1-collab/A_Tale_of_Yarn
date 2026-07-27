@@ -543,6 +543,30 @@ if (!SKIP_CHAT && !RELEASE && boot.debugPresent && chat?.changed && VOICE_FIXTUR
 {
   console.log('\n─── 4c. villager voices ───');
 
+  // BOTH voices must be in the depot, checked as bytes on disk before any
+  // browser work. The runtime probe below exercises one utterance in one
+  // voice; it cannot tell you the other model shipped, and a depot missing the
+  // female voice looks exactly like a depot where the women have nothing to
+  // say. `pack-steam.mjs` refuses to build without these, so a failure here
+  // means the depot was assembled by something else or pruned afterwards.
+  //
+  // The lexicon is checked too: both voices phonemize through the single copy
+  // in joe's directory, so losing it silences everyone, not just the men.
+  const DEPOT_MODELS = path.join(DEPOT, 'resources', 'models');
+  const VOICE_FILES = [
+    ['rhasspy--piper-en-us-joe-medium/en_US-joe-medium.onnx', 'male villagers', 40],
+    ['rhasspy--piper-en-us-ljspeech-medium/en_US-ljspeech-medium.onnx', 'female villagers', 40],
+    ['rhasspy--piper-en-us-joe-medium/lexicon-en-us.txt', 'shared G2P lexicon', 1],
+  ];
+  for (const [rel, why, minMB] of VOICE_FILES) {
+    const abs = path.join(DEPOT_MODELS, ...rel.split('/'));
+    const mb = fs.existsSync(abs) ? fs.statSync(abs).size / (1024 * 1024) : 0;
+    ok(`depot ships the voice for ${why}`, mb >= minMB,
+      fs.existsSync(abs)
+        ? `${rel} is ${mb.toFixed(1)} MB, expected >= ${minMB} MB`
+        : `${rel} is ABSENT from the depot`);
+  }
+
   const spoken = chat?.reply ?? 'The well is dry again, friend.';
   const t0 = Date.now();
   const probe = await page.evaluate(async (text) => {

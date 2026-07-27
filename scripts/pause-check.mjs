@@ -28,6 +28,12 @@ const browser = await chromium.launch({
 });
 const page = await browser.newPage({ viewport: { width: 1000, height: 620 } });
 
+// Cut vite's HMR socket before anything loads. Other agents edit this repo
+// while harnesses run, and every save pushes a full-page reload that wipes
+// window globals mid-measurement — this harness died twice that way while
+// every newer one survived, because they carry exactly this line.
+await page.routeWebSocket(/:5173\//, () => { /* swallow HMR */ });
+
 const errors = [];
 page.on('pageerror', (e) => errors.push(`PAGEERROR ${e.message.slice(0, 180)}`));
 page.on('console', (m) => {

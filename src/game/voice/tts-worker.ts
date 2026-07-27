@@ -1,5 +1,6 @@
 /**
- * Villager voices — piper VITS (en_US-joe-medium) on ORT wasm/SIMD, off-thread.
+ * Villager voices — piper VITS (en_US-joe-medium for men, en_US-ljspeech-medium
+ * for women) on ORT wasm/SIMD, off-thread.
  *
  * WHY A WORKER, AND WHY NOT THE GPU. Identical reasoning to `stt-worker.ts`,
  * and it is structural rather than a preference: WebGPU v1 gives one queue per
@@ -29,9 +30,9 @@ import { ort, ortInfo } from './ort-bootstrap';
 import { parseLexicon, textToIds, type Lexicon, type PhonemeIdMap } from '../../audio/g2p-en';
 
 /**
- * Repo id, resolving to models/rhasspy--piper-en-us-joe-medium in both servers.
+ * Repo ids, resolving to models/rhasspy--piper-en-us-*-medium in both servers.
  *
- * Both halves of this odd-looking string are load-bearing, and both were
+ * Both halves of these odd-looking strings are load-bearing, and both were
  * arrived at by testing rather than by reading:
  *
  *  - The `local/` prefix is what the DEV server (`server/dev-server.ts`)
@@ -43,10 +44,35 @@ import { parseLexicon, textToIds, type Lexicon, type PhonemeIdMap } from '../../
  *    Without it the voice is simply absent from the packaged game.
  *
  * The packaged loopback server (`app/steam/local-server.cjs`) accepts both
- * forms, so this one id works in dev, in a `vite preview`, and in the depot.
+ * forms, so these ids work in dev, in a `vite preview`, and in the depot.
+ *
+ * TWO MODELS, BECAUSE ONE CANNOT DO BOTH GENDERS. Pitch-resampling a male
+ * voice up does not make it female — the formants ride along and it becomes a
+ * fast small man. `voice-out.ts` explains the full reasoning at `BANDS`.
  */
-const REPO = 'local/rhasspy--piper-en-us-joe-medium';
-const BASE = `/api/hf-cache/${REPO}`;
+type ModelId = 'male' | 'female';
+
+const VOICES: Record<ModelId, { repo: string; base: string }> = {
+  male: { repo: 'local/rhasspy--piper-en-us-joe-medium', base: 'en_US-joe-medium' },
+  female: { repo: 'local/rhasspy--piper-en-us-ljspeech-medium', base: 'en_US-ljspeech-medium' },
+};
+
+/**
+ * The G2P lexicon is a property of the LANGUAGE, not of the voice: it maps
+ * English words to IPA, and both models consume the same IPA through their own
+ * `phoneme_id_map`. It is fetched once and shared.
+ *
+ * It lives in joe's directory because that is where `scripts/build-lexicon.mts`
+ * writes it and where `scripts/test-g2p-en.mts` reads it; duplicating 2.8 MB
+ * into the second voice's directory would cost depot bytes to say the same
+ * thing twice. `steam-pack-check.mjs` asserts both directories ship, so the
+ * dependency cannot rot silently.
+ *
+ * Verified before relying on it: ljspeech's `phoneme_id_map` is a strict
+ * SUPERSET of joe's (157 vs 151 entries) and assigns the same id to all 151
+ * shared phonemes, so identical lexicon output drives both models correctly.
+ */
+const LEXICON_URL = `/api/hf-cache/${VOICES.male.repo}/resolve/main/lexicon-en-us.txt`;
 
 export interface TtsVoiceParams {
   /** VITS noise_scale — timbre variation. Model default 0.667. */
@@ -57,21 +83,23 @@ export interface TtsVoiceParams {
   noiseW: number;
   /**
    * Resample ratio applied after synthesis: >1 raises pitch, <1 lowers it.
-   * The voice is single-speaker (config has no `num_speakers`), so this is the
-   * only pitch axis available. `lengthScale` is pre-compensated by the caller
-   * so the line keeps its intended duration.
+   * Each model is single-speaker (config has no `num_speakers`), so this is
+   * the only pitch axis available WITHIN a model. `lengthScale` is
+   * pre-compensated by the caller so the line keeps its intended duration.
    */
   pitch: number;
+  /** Which vendored model to synthesize on. */
+  model: ModelId;
 }
 
 type Req =
-  | { type: 'load' }
+  | { type: 'load'; model?: ModelId }
   | { type: 'synth'; id: number; text: string; voice: TtsVoiceParams }
   | { type: 'cancel'; upTo: number };
 
 type Res =
-  | { type: 'ready'; loadMs: number; threads: number; crossOriginIsolated: boolean;
-      sampleRate: number; lexiconEntries: number }
+  | { type: 'ready'; model: ModelId; loadMs: number; threads: number;
+      crossOriginIsolated: boolean; sampleRate: number; lexiconEntries: number }
   | { type: 'audio'; id: number; pcm: Float32Array; sampleRate: number; ms: number }
   | { type: 'error'; id?: number; message: string };
 
@@ -81,11 +109,21 @@ const post = (m: Res, transfer?: Transferable[]) =>
 interface Loaded {
   sess: InstanceType<typeof ort.InferenceSession>;
   idMap: PhonemeIdMap;
-  lex: Lexicon;
   sampleRate: number;
 }
 
-let ready: Promise<Loaded> | null = null;
+/**
+ * One entry per model, created on first use.
+ *
+ * LAZY PER MODEL, deliberately. Loading both at the first spoken line would
+ * double the cold-start cost for a player who then only ever talks to one
+ * villager. A conversation warms exactly the model that NPC needs; the other
+ * is not fetched until somebody of the other gender speaks.
+ */
+const sessions = new Map<ModelId, Promise<Loaded>>();
+
+/** The lexicon is shared by both models — fetched and parsed once. */
+let lexicon: Promise<Lexicon> | null = null;
 
 /**
  * Ids at or below this are abandoned. Synthesis is not interruptible mid-run
@@ -95,38 +133,59 @@ let ready: Promise<Loaded> | null = null;
  */
 let cancelledUpTo = -1;
 
-async function load(): Promise<Loaded> {
-  const t0 = performance.now();
+function loadLexicon(): Promise<Lexicon> {
+  return (lexicon ??= (async () => {
+    const resp = await fetch(LEXICON_URL);
+    if (!resp.ok) throw new Error(`[tts] lexicon: HTTP ${resp.status}`);
+    return parseLexicon(await resp.text());
+  })());
+}
 
-  const cfgResp = await fetch(`${BASE}/raw/main/en_US-joe-medium.onnx.json`);
-  if (!cfgResp.ok) throw new Error(`[tts] voice config: HTTP ${cfgResp.status}`);
-  const cfg = await cfgResp.json();
-  const idMap = cfg.phoneme_id_map as PhonemeIdMap;
-  if (!idMap) throw new Error('[tts] voice config missing phoneme_id_map');
-  const sampleRate: number = cfg.audio?.sample_rate ?? 22050;
+function load(model: ModelId): Promise<Loaded> {
+  const existing = sessions.get(model);
+  if (existing) return existing;
 
-  const lexResp = await fetch(`${BASE}/resolve/main/lexicon-en-us.txt`);
-  if (!lexResp.ok) throw new Error(`[tts] lexicon: HTTP ${lexResp.status}`);
-  const lex = parseLexicon(await lexResp.text());
+  const p = (async (): Promise<Loaded> => {
+    const t0 = performance.now();
+    const { repo, base } = VOICES[model];
+    const BASE = `/api/hf-cache/${repo}`;
 
-  const modelResp = await fetch(`${BASE}/resolve/main/en_US-joe-medium.onnx`);
-  if (!modelResp.ok) throw new Error(`[tts] voice model: HTTP ${modelResp.status}`);
-  const bytes = new Uint8Array(await modelResp.arrayBuffer());
+    const cfgResp = await fetch(`${BASE}/raw/main/${base}.onnx.json`);
+    if (!cfgResp.ok) throw new Error(`[tts] ${model} voice config: HTTP ${cfgResp.status}`);
+    const cfg = await cfgResp.json();
+    const idMap = cfg.phoneme_id_map as PhonemeIdMap;
+    if (!idMap) throw new Error(`[tts] ${model} voice config missing phoneme_id_map`);
+    const sampleRate: number = cfg.audio?.sample_rate ?? 22050;
 
-  const sess = await ort.InferenceSession.create(bytes, {
-    executionProviders: ['wasm'],
-    graphOptimizationLevel: 'all',
-  });
+    const lex = await loadLexicon();
 
-  post({
-    type: 'ready',
-    loadMs: performance.now() - t0,
-    threads: ortInfo.threads,
-    crossOriginIsolated: ortInfo.crossOriginIsolated,
-    sampleRate,
-    lexiconEntries: lex.size,
-  });
-  return { sess, idMap, lex, sampleRate };
+    const modelResp = await fetch(`${BASE}/resolve/main/${base}.onnx`);
+    if (!modelResp.ok) throw new Error(`[tts] ${model} voice model: HTTP ${modelResp.status}`);
+    const bytes = new Uint8Array(await modelResp.arrayBuffer());
+
+    const sess = await ort.InferenceSession.create(bytes, {
+      executionProviders: ['wasm'],
+      graphOptimizationLevel: 'all',
+    });
+
+    post({
+      type: 'ready',
+      model,
+      loadMs: performance.now() - t0,
+      threads: ortInfo.threads,
+      crossOriginIsolated: ortInfo.crossOriginIsolated,
+      sampleRate,
+      lexiconEntries: lex.size,
+    });
+    return { sess, idMap, sampleRate };
+  })();
+
+  // A failed load must not be cached as a permanent failure: the next attempt
+  // should be allowed to retry (a transient 5xx from the loopback server on a
+  // cold depot is exactly the case this protects).
+  p.catch(() => { if (sessions.get(model) === p) sessions.delete(model); });
+  sessions.set(model, p);
+  return p;
 }
 
 /**
@@ -152,7 +211,8 @@ function resample(src: Float32Array, ratio: number): Float32Array {
 }
 
 async function synth(id: number, text: string, voice: TtsVoiceParams): Promise<void> {
-  const { sess, idMap, lex, sampleRate } = await (ready ??= load());
+  const model: ModelId = voice.model === 'female' ? 'female' : 'male';
+  const [{ sess, idMap, sampleRate }, lex] = await Promise.all([load(model), loadLexicon()]);
   if (id <= cancelledUpTo) return; // abandoned while the model was loading
 
   const ids = textToIds(text, lex, idMap);
@@ -185,8 +245,9 @@ let chain: Promise<void> = Promise.resolve();
 self.onmessage = (ev: MessageEvent<Req>) => {
   const msg = ev.data;
   if (msg.type === 'load') {
+    const model: ModelId = msg.model === 'female' ? 'female' : 'male';
     chain = chain.then(async () => {
-      try { await (ready ??= load()); }
+      try { await load(model); }
       catch (err) { post({ type: 'error', message: String((err as Error)?.message ?? err) }); }
     });
     return;
