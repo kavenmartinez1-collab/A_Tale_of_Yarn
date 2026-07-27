@@ -29,7 +29,8 @@
     "play:evict": "node scripts/settlement-evict-check.mjs",
     "play:torch": "node scripts/torch-check.mjs",
     "test:e2e": "playwright test",
-    "test:e2e:headed": "playwright test --headed"
+    "test:e2e:headed": "playwright test --headed",
+    "play:controller": "node scripts/controller-ui-check.mjs"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.8.1",

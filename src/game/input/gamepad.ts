@@ -32,6 +32,8 @@
  * supplies the frame delta; this module reads nothing but the pad.
  */
 
+import type { UiAction } from './ui-focus';
+
 /**
  * Standard-mapping button indices.
  * https://w3c.github.io/gamepad/#remapping — the layout every XInput pad,
@@ -109,6 +111,18 @@ export function applyDeadzone(x: number, y: number, deadzone: number): { x: numb
 const MOVE_THRESHOLD = 0.35;
 
 /**
+ * Threshold for the stick acting as a MENU cursor. Deliberately far above
+ * MOVE_THRESHOLD: walking a step too far costs nothing, but a worn stick
+ * resting at 0.4 that quietly steps the focus ring off "Save" and onto
+ * "Delete" between the player looking down and pressing A is a lost save.
+ */
+const NAV_THRESHOLD = 0.6;
+
+/** Repeat rates for held menu navigation, in seconds. */
+const NAV_FIRST_DELAY = 0.34;
+const NAV_REPEAT = 0.13;
+
+/**
  * Left stick → the `e.code` values `PlayerController` reads.
  *
  * Discrete keys lose nothing today: controller.ts:87-96 normalises the input
@@ -128,6 +142,41 @@ export function stickToMoveKeys(x: number, y: number): string[] {
   return keys;
 }
 
+/**
+ * Focus-cursor direction for this poll, as a cardinal step.
+ *
+ * `allowStick` is false while the focused control wants the left stick as an
+ * analog axis — the map pane. The d-pad still moves the ring in that case,
+ * which is what lets the player leave the chart again.
+ *
+ * Diagonals are collapsed to horizontal. A menu has no diagonal neighbours, so
+ * a d-pad pressed between two detents must pick one answer rather than fire
+ * two moves and land somewhere the player did not aim.
+ */
+export function navDirection(
+  pad: PadSnapshot,
+  cfg: GamepadConfig = DEFAULT_CONFIG,
+  allowStick = true,
+): { dx: number; dy: number } {
+  let dx = 0;
+  let dy = 0;
+  if (isDown(pad, BUTTON.DPAD_LEFT, cfg.triggerThreshold)) dx -= 1;
+  if (isDown(pad, BUTTON.DPAD_RIGHT, cfg.triggerThreshold)) dx += 1;
+  if (isDown(pad, BUTTON.DPAD_UP, cfg.triggerThreshold)) dy -= 1;
+  if (isDown(pad, BUTTON.DPAD_DOWN, cfg.triggerThreshold)) dy += 1;
+  if (dx === 0 && dy === 0 && allowStick) {
+    const [lx = 0, ly = 0] = pad.axes;
+    const s = applyDeadzone(lx, ly, cfg.deadzone);
+    if (Math.abs(s.x) >= Math.abs(s.y)) {
+      if (Math.abs(s.x) > NAV_THRESHOLD) dx = Math.sign(s.x);
+    } else if (Math.abs(s.y) > NAV_THRESHOLD) {
+      dy = Math.sign(s.y);
+    }
+  }
+  if (dx !== 0 && dy !== 0) dy = 0;
+  return { dx, dy };
+}
+
 /** What one poll of a pad means, in the game's own vocabulary. */
 export interface PadIntent {
   /** `e.code` values that should be held this frame. */
@@ -136,6 +185,10 @@ export interface PadIntent {
   look: { dx: number; dy: number };
   /** True while the attack input is held (right trigger). */
   attack: boolean;
+  /** Focus-cursor step for this poll — UI context only, else (0, 0). */
+  nav: { dx: number; dy: number };
+  /** Left stick post-dead-zone, for the map pane's analog pan. */
+  stick: { x: number; y: number };
 }
 
 /** Digital state of every mapped button, for edge detection between polls. */
@@ -153,30 +206,43 @@ function isDown(pad: PadSnapshot, index: number, threshold: number): boolean {
  * Map one poll of a pad to an intent, plus the button state for the next poll.
  *
  * `dtSec` scales the look delta so camera speed does not depend on frame rate.
+ *
+ * `uiMode` is the context switch, and it is the whole reason this function
+ * takes a flag rather than growing a second copy. With a panel open the pad
+ * stops being a body and becomes a cursor: no walking, no jumping, no
+ * sprinting, no swinging — the player is reading a menu and none of those are
+ * things they asked for. Two bindings deliberately survive the switch, because
+ * both are about leaving the menu rather than acting in the world: Start
+ * (Escape) and LB (push-to-talk, which is the entire point of the chat panel).
  */
 export function mapPad(
   pad: PadSnapshot,
   dtSec: number,
   cfg: GamepadConfig = DEFAULT_CONFIG,
+  uiMode = false,
+  /** False while the focused control claims the left stick (the map pane). */
+  navFromStick = true,
 ): { intent: PadIntent; buttons: ButtonState } {
   const [lx = 0, ly = 0, rx = 0, ry = 0] = pad.axes;
 
   const move = applyDeadzone(lx, ly, cfg.deadzone);
   const look = applyDeadzone(rx, ry, cfg.deadzone);
 
-  const heldKeys = new Set(stickToMoveKeys(move.x, move.y));
-  // D-pad mirrors the left stick so menus and precise nudges both work.
-  if (isDown(pad, BUTTON.DPAD_UP, cfg.triggerThreshold)) heldKeys.add('KeyW');
-  if (isDown(pad, BUTTON.DPAD_DOWN, cfg.triggerThreshold)) heldKeys.add('KeyS');
-  if (isDown(pad, BUTTON.DPAD_LEFT, cfg.triggerThreshold)) heldKeys.add('KeyA');
-  if (isDown(pad, BUTTON.DPAD_RIGHT, cfg.triggerThreshold)) heldKeys.add('KeyD');
+  const heldKeys = new Set<string>(uiMode ? [] : stickToMoveKeys(move.x, move.y));
 
-  // Sprint on L3 or the left trigger — the two places every player's thumb
-  // already looks for it. Jump on B: the brief specifies A for interact, and a
-  // movement layer with no jump cannot clear a fence.
-  if (isDown(pad, BUTTON.L3, cfg.triggerThreshold)
-    || isDown(pad, BUTTON.LT, cfg.triggerThreshold)) heldKeys.add('ShiftLeft');
-  if (isDown(pad, BUTTON.B, cfg.triggerThreshold)) heldKeys.add('Space');
+  // The d-pad NO LONGER mirrors the left stick. Mirroring made it a second,
+  // worse way to walk while the two things a d-pad is actually for — picking
+  // an item and picking a menu entry — had no binding at all. In gameplay
+  // left/right now step the hotbar (an edge, handled in poll()); in a panel
+  // all four move the focus ring.
+  if (!uiMode) {
+    // Sprint on L3 or the left trigger — the two places every player's thumb
+    // already looks for it. Jump on B: the brief specifies A for interact, and
+    // a movement layer with no jump cannot clear a fence.
+    if (isDown(pad, BUTTON.L3, cfg.triggerThreshold)
+      || isDown(pad, BUTTON.LT, cfg.triggerThreshold)) heldKeys.add('ShiftLeft');
+    if (isDown(pad, BUTTON.B, cfg.triggerThreshold)) heldKeys.add('Space');
+  }
 
   // Push-to-talk on LB, mapped to the same V the keyboard uses. Voice input
   // (src/game/voice) listens for KeyV on `window` and nowhere else, so the pad
@@ -199,11 +265,17 @@ export function mapPad(
   return {
     intent: {
       heldKeys,
-      look: {
+      // The camera holds still behind a panel. main.ts's look hook already
+      // refuses while `panels.isOpen`; zeroing it here also covers the death
+      // card, which is not a panel and where a stick knocked by a startled
+      // hand used to swing the camera under the "You Died" text.
+      look: uiMode ? { dx: 0, dy: 0 } : {
         dx: look.x * cfg.lookSpeed * dtSec,
         dy: look.y * cfg.lookSpeed * dtSec * sign,
       },
-      attack: isDown(pad, BUTTON.RT, cfg.triggerThreshold),
+      attack: !uiMode && isDown(pad, BUTTON.RT, cfg.triggerThreshold),
+      nav: uiMode ? navDirection(pad, cfg, navFromStick) : { dx: 0, dy: 0 },
+      stick: move,
     },
     buttons: {
       [BUTTON.A]: isDown(pad, BUTTON.A, cfg.triggerThreshold),
@@ -212,7 +284,16 @@ export function mapPad(
       [BUTTON.Y]: isDown(pad, BUTTON.Y, cfg.triggerThreshold),
       [BUTTON.START]: isDown(pad, BUTTON.START, cfg.triggerThreshold),
       [BUTTON.BACK]: isDown(pad, BUTTON.BACK, cfg.triggerThreshold),
+      [BUTTON.RB]: isDown(pad, BUTTON.RB, cfg.triggerThreshold),
+      [BUTTON.R3]: isDown(pad, BUTTON.R3, cfg.triggerThreshold),
+      [BUTTON.LT]: isDown(pad, BUTTON.LT, cfg.triggerThreshold),
       [BUTTON.RT]: isDown(pad, BUTTON.RT, cfg.triggerThreshold),
+      // The d-pad needs edge detection now that it is not a held movement key:
+      // one press must step the hotbar by one, not by one per frame.
+      [BUTTON.DPAD_UP]: isDown(pad, BUTTON.DPAD_UP, cfg.triggerThreshold),
+      [BUTTON.DPAD_DOWN]: isDown(pad, BUTTON.DPAD_DOWN, cfg.triggerThreshold),
+      [BUTTON.DPAD_LEFT]: isDown(pad, BUTTON.DPAD_LEFT, cfg.triggerThreshold),
+      [BUTTON.DPAD_RIGHT]: isDown(pad, BUTTON.DPAD_RIGHT, cfg.triggerThreshold),
     },
   };
 }
@@ -242,18 +323,47 @@ export function releasedEdges(prev: ButtonState, next: ButtonState): number[] {
 export interface GamepadHooks {
   /** Camera look. Same units and sign as a pointer-locked `mousemove`. */
   onLook: (dx: number, dy: number) => void;
+  /**
+   * True while a DOM panel or overlay owns the pad. Everything below is the
+   * panel half of the context switch and is only consulted when this is true.
+   */
+  uiActive?: () => boolean;
+  /** True when the focused control claims the left stick (the map pane). */
+  uiAnalog?: () => boolean;
+  /**
+   * One UI intent. See ui-focus.ts for what each one means. Returns whether
+   * the panel consumed it — only X ever declines, so it can keep its gameplay
+   * meaning when the ring is not on something droppable.
+   */
+  onUi?: (a: UiAction) => boolean;
+  /** Gameplay d-pad left/right: step the active hotbar slot by `dir`. */
+  onHotbar?: (dir: number) => void;
 }
 
 /**
  * Polls the first connected standard-mapping pad and drives the game.
  *
  * Synthesises the events the game already listens for, so nothing downstream
- * needs to know a pad exists:
- *   held sticks/d-pad/L3/B → `keydown`/`keyup` with the matching `e.code`
+ * needs to know a pad exists. GAMEPLAY:
+ *   held stick/L3/LT/B     → `keydown`/`keyup` with the matching `e.code`
  *   A                      → `keydown`/`keyup` `KeyE`   (the interact chain)
  *   LB                     → `keydown`/`keyup` `KeyV`   (push-to-talk)
  *   Start                  → `keydown` `Escape`         (pause)
  *   right trigger          → `mousedown`/`mouseup` button 0 (attack, bow draw)
+ *   d-pad left/right       → `onHotbar(±1)`             (active item)
+ *   X                      → `keydown` `KeyB`           (crafting)
+ *
+ * PANEL (`hooks.uiActive()`), where the pad becomes a cursor:
+ *   d-pad / left stick     → `onUi({kind:'nav'})`, repeat-rated
+ *   A                      → `KeyE` first (voice confirm), then activate
+ *   B                      → `onUi({kind:'back'})`       (close, NOT jump)
+ *   X                      → `onUi({kind:'secondary'})`  (drop, in the pack)
+ *   RB                     → `onUi({kind:'tab'})`        (crafting pages)
+ *   triggers               → `onUi({kind:'zoom'})`       (the chart)
+ *   LB, Start              → unchanged; both are ways OUT of the panel
+ *
+ * BOTH: Y → `KeyI` (inventory), Back → `KeyH` (controls), R3 → `KeyC`
+ * (character), so the toggle that opens a panel is the one that closes it.
  *
  * Does nothing at all — not even an allocation past the first — when no pad is
  * connected, so this is safe to call unconditionally from the frame loop.
@@ -267,6 +377,10 @@ export class GamepadInput {
   private attackHeld = false;
   /** Index of the pad we are following, or -1. */
   private padIndex = -1;
+  /** Focus-cursor direction currently held, and time to the next repeat. */
+  private navDx = 0;
+  private navDy = 0;
+  private navTimer = 0;
 
   /** True when a pad has been seen this session — for the HUD/glyph work. */
   get connected(): boolean { return this.padIndex >= 0; }
@@ -299,6 +413,9 @@ export class GamepadInput {
       this.attackHeld = false;
     }
     this.buttons = {};
+    this.navDx = 0;
+    this.navDy = 0;
+    this.navTimer = 0;
   }
 
   /**
@@ -312,7 +429,9 @@ export class GamepadInput {
     const pad = this.pick();
     if (pad === null) { if (this.held.size) this.releaseAll(); return; }
 
-    const { intent, buttons } = mapPad(pad, dtSec, this.cfg);
+    const ui = hooks.uiActive?.() === true;
+    const analog = ui && hooks.uiAnalog?.() === true;
+    const { intent, buttons } = mapPad(pad, dtSec, this.cfg, ui, !analog);
 
     // Keys: diff against what we are already holding so each transition fires
     // exactly one event. `PlayerController` keys off `keydown`/`keyup` pairs
@@ -332,19 +451,114 @@ export class GamepadInput {
     // Edge-triggered buttons.
     for (const b of pressedEdges(this.buttons, buttons)) {
       if (b === BUTTON.A) {
-        window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyE', bubbles: true }));
+        // A always dispatches KeyE on `window` FIRST, in both contexts, and
+        // this ordering is load-bearing rather than incidental.
+        //
+        // voice-input.ts:224 tells a pad's A from a typed "e" by the event's
+        // target: the pad's is `window`, a keyboard's is the focused input.
+        // That is how "hold LB, speak, press A to send" works, and routing A
+        // straight to the focus ring instead would have broken it silently —
+        // the ring would have clicked Send only when Send happened to be
+        // focused, and done something else entirely when it was not.
+        //
+        // So the panel case is a FALL-THROUGH, not a replacement: dispatch the
+        // key, and treat the panel activation as what happens when nobody
+        // claimed it. `preventDefault` is the claim, which is why these events
+        // became cancelable (they were not, so voice's preventDefault was
+        // talking to a no-op and only worked by accident of ordering).
+        const ev = new KeyboardEvent('keydown',
+          { code: 'KeyE', bubbles: true, cancelable: true });
+        window.dispatchEvent(ev);
+        if (ui && !ev.defaultPrevented) hooks.onUi?.({ kind: 'activate' });
       } else if (b === BUTTON.START) {
-        window.dispatchEvent(new KeyboardEvent('keydown', { code: 'Escape', bubbles: true }));
+        window.dispatchEvent(new KeyboardEvent('keydown',
+          { code: 'Escape', bubbles: true, cancelable: true }));
+      } else if (b === BUTTON.Y) {
+        // The panels a pad could not previously even OPEN. Y and Back are the
+        // buttons gameplay was not using, and each is a plain synthesis of the
+        // key the game already binds — so opening the inventory from a pad
+        // needed no game-side wiring at all, only a binding nobody had made.
+        // This was half the original complaint: "no moving the cursor …
+        // select, inventory, active item, craft".
+        //
+        // Deliberately NOT gated on context: main.ts handles I/H above its
+        // `if (panels.isOpen) return` gate, so the same press that opens the
+        // inventory closes it again, and swaps straight from crafting to
+        // inventory without a trip through B. That is what a toggle should do.
+        window.dispatchEvent(new KeyboardEvent('keydown',
+          { code: 'KeyI', bubbles: true, cancelable: true }));
+      } else if (b === BUTTON.BACK) {
+        window.dispatchEvent(new KeyboardEvent('keydown',
+          { code: 'KeyH', bubbles: true, cancelable: true }));
+      } else if (b === BUTTON.R3) {
+        // The character sheet, on the last free button. Not a natural home for
+        // it — but the alternative was the one panel in the game with no pad
+        // route at all, which is the exact complaint this work exists to
+        // answer, and "fully navigable once you find a keyboard" is not an
+        // answer. The help panel (Back) is where a player learns it.
+        window.dispatchEvent(new KeyboardEvent('keydown',
+          { code: 'KeyC', bubbles: true, cancelable: true }));
+      } else if (b === BUTTON.X) {
+        // X is the secondary verb for whatever is on screen: drop the stack
+        // when the ring is on a pack slot, otherwise open (or close) the
+        // crafting bench. The panel gets first refusal and declines everywhere
+        // except an inventory slot, so X stays a working toggle — otherwise
+        // the button that opened crafting could not close it and the player
+        // had to learn a second one.
+        const claimed = ui && hooks.onUi?.({ kind: 'secondary' }) === true;
+        if (!claimed) {
+          window.dispatchEvent(new KeyboardEvent('keydown',
+            { code: 'KeyB', bubbles: true, cancelable: true }));
+        }
+      } else if (ui && b === BUTTON.B) {
+        hooks.onUi?.({ kind: 'back' });
+      } else if (ui && b === BUTTON.RB) {
+        hooks.onUi?.({ kind: 'tab', dir: 1 });
+      } else if (ui && (b === BUTTON.LT || b === BUTTON.RT)) {
+        hooks.onUi?.({ kind: 'zoom', dir: b === BUTTON.RT ? -1 : 1 });
+      } else if (!ui && b === BUTTON.DPAD_LEFT) {
+        hooks.onHotbar?.(-1);
+      } else if (!ui && b === BUTTON.DPAD_RIGHT) {
+        hooks.onHotbar?.(1);
       }
     }
     for (const b of releasedEdges(this.buttons, buttons)) {
       if (b === BUTTON.A) {
-        window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyE', bubbles: true }));
+        window.dispatchEvent(new KeyboardEvent('keyup',
+          { code: 'KeyE', bubbles: true, cancelable: true }));
       } else if (b === BUTTON.START) {
-        window.dispatchEvent(new KeyboardEvent('keyup', { code: 'Escape', bubbles: true }));
+        window.dispatchEvent(new KeyboardEvent('keyup',
+          { code: 'Escape', bubbles: true, cancelable: true }));
       }
     }
     this.buttons = buttons;
+
+    // Focus cursor: fire once on the press, then repeat while held. Both
+    // constants are wall-clock seconds off the caller's frame delta, so the
+    // ring walks a list at the same rate on a 30 fps handheld as on a 144 Hz
+    // desktop — and it keeps ticking while the sim clock is paused, which is
+    // precisely when every one of these panels is open.
+    if (intent.nav.dx !== this.navDx || intent.nav.dy !== this.navDy) {
+      this.navDx = intent.nav.dx;
+      this.navDy = intent.nav.dy;
+      this.navTimer = NAV_FIRST_DELAY;
+      if (this.navDx !== 0 || this.navDy !== 0) {
+        hooks.onUi?.({ kind: 'nav', dx: this.navDx, dy: this.navDy });
+      }
+    } else if (this.navDx !== 0 || this.navDy !== 0) {
+      this.navTimer -= dtSec;
+      // `while`, not `if`: one long frame (an alt-tab, a shader compile) must
+      // not swallow a repeat and make a held direction feel like it stalled.
+      while (this.navTimer <= 0) {
+        hooks.onUi?.({ kind: 'nav', dx: this.navDx, dy: this.navDy });
+        this.navTimer += NAV_REPEAT;
+      }
+    }
+
+    // The map pane takes the left stick as an analog axis while it is focused.
+    if (analog && (intent.stick.x !== 0 || intent.stick.y !== 0)) {
+      hooks.onUi?.({ kind: 'pan', dx: intent.stick.x, dy: intent.stick.y });
+    }
 
     // Attack is press-and-hold, not an edge: a bow draws while the trigger is
     // down and looses on release (main.ts:9224/9234).
