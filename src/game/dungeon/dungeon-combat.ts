@@ -63,7 +63,8 @@
 import { cellLineOfSight } from '../interior-los';
 import type { EntityState } from '../entities/entity-manager';
 import { CombatIndex, stepAnimal, type RangedShot } from '../entities/animal-ai';
-import { SPECIES_DEFS } from '../entities/entity-types';
+import { MeleeTokenPool } from '../combat/attack-tokens';
+import { SPECIES_DEFS, type Species } from '../entities/entity-types';
 import type { Vec3 } from '../math';
 import { mulberry32 } from '../mesh-utils';
 import type { DungeonEnemy } from './dungeon-enemies';
@@ -131,27 +132,30 @@ const LOS_MAX_DIST = 20;
 const LOS_REFRESH_S = 0.15;
 
 /**
- * Minimum SIM seconds between two blows LANDING on the player, dungeon-wide.
+ * WHERE THE 0.8 s GRACE WINDOW WENT.
  *
- * The difficulty lever, and the one that matters most. The player has 20 max HP
- * and a skeleton hits for 5, so four connected blows is a death — but nothing
- * anywhere staggered them. Enemies are clamped to their spawn room and cannot
- * path, so what a room actually does is bunch every body it holds against the
- * edge nearest you and swing on independent cooldowns. Seven skeletons in a
- * deep hall could therefore deal 35 damage inside a single frame, and the first
- * frame the player was in reach was the last frame they were alive. There was
- * no window in which retreating was a decision rather than a coin toss.
+ * This module used to own `PLAYER_HIT_GRACE_S = 0.8` — the minimum sim seconds
+ * between two blows landing on the player — because seven skeletons swinging on
+ * independent cooldowns could deal 35 damage inside one frame against 20 max HP,
+ * and the first frame you were in reach was the last frame you were alive.
  *
- * 0.8 s bounds incoming damage to roughly one blow per swing instead of one per
- * ENEMY per swing, without weakening any individual hit — a skeleton still
- * takes a quarter of your health and the boss still takes nearly half. It is
- * below every cadence in the roster (goblin 1.2 s, skeleton 1.45 s, boss 1.9 s)
- * so a duel is completely unchanged; it only ever bites when a crowd overlaps,
- * which is exactly the case that was unfair.
+ * That reasoning was right and the number survives unchanged. What was wrong was
+ * the address. The defect it patched — nothing anywhere coordinates a pack — was
+ * never a dungeon problem; the dungeon was just the only room crowded enough to
+ * make it fatal. Six wolves in the overworld had the identical flaw and no cap at
+ * all.
  *
- * Counted in `dtS`, never wall time, so it does not tick while paused.
+ * It now lives in `combat/attack-tokens.ts` as `LANDING_FLOOR_S`, applies in both
+ * places, and sits beside the concurrency limit that is the real fix. The two are
+ * NOT redundant and neither replaces the other: tokens bound how many enemies may
+ * swing at once, the floor bounds how fast blows may land. Two tokens against
+ * goblins (1.2 s cadence) is a landed blow every 0.6 s — faster than this window
+ * ever allowed — so deleting the floor when tokens arrived would have made
+ * dungeons harder while making them look calmer.
+ *
+ * `blockedByGrace` below is still counted and still asserted by
+ * `test-dungeon-combat.mts`; it is now sourced from the pool.
  */
-const PLAYER_HIT_GRACE_S = 0.8;
 
 /**
  * Private per-enemy line-of-sight cache.
@@ -185,24 +189,45 @@ export interface DungeonTickCtx {
 }
 
 /**
- * Per-dungeon combat state: the shared mob-vs-mob index and the player's
- * damage grace timer.
+ * Per-dungeon combat state: the shared mob-vs-mob index and the melee
+ * turn-taking pool for this dungeon's enemies.
  *
- * One of these lives on the resident dungeon and is thrown away with it, so
- * the grace window cannot leak across a delve.
+ * LIFETIME. One of these is held by `DungeonManager` for the manager's whole
+ * life, not per delve — which contradicted this comment for as long as the
+ * comment has existed, and quietly leaked `hitGrace` and both counters across
+ * every dungeon the player entered. `reset()` now exists and `exit()` calls it,
+ * so the claim is true rather than aspirational.
  */
 export class DungeonCombat {
   /** Shared per-tick combat index, rebuilt once for the whole dungeon. */
   readonly index = new CombatIndex();
 
-  /** Sim seconds remaining before the player may be hit again. */
-  private hitGrace = 0;
+  /**
+   * Melee turn-taking for this dungeon. Its own instance rather than one
+   * shared with the overworld: `tickEntities` returns early underground, so
+   * the two enemy sets are disjoint and never contend for the same tokens.
+   */
+  readonly tokens = new MeleeTokenPool();
 
   /** Blows suppressed because a wall was in the way. Diagnostics only. */
   blockedByWall = 0;
 
-  /** Blows suppressed because they landed inside the grace window. */
-  blockedByGrace = 0;
+  /**
+   * Blows suppressed because they arrived inside the landing floor.
+   *
+   * Sourced from the pool, which owns the floor now. Kept under the old name
+   * because it is what `test-dungeon-combat.mts` asserts on, and that
+   * assertion's job — proving the crowd really was trying to land more, so the
+   * rate ceiling is not passing vacuously — is unchanged by where the timer
+   * lives.
+   */
+  get blockedByGrace(): number { return this.tokens.deniedByRate; }
+
+  /** Swings never thrown because every attack token was taken. */
+  get blockedByToken(): number { return this.tokens.deniedByToken; }
+
+  /** Most enemies ever committed to a swing at once. See `peakHeld`. */
+  get peakAttackers(): number { return this.tokens.peakHeld; }
 
   /**
    * Advance every live enemy by `dtS` sim seconds.
@@ -221,7 +246,9 @@ export class DungeonCombat {
     ctx: DungeonTickCtx,
   ): void {
     const { layout, origin } = ctx;
-    if (this.hitGrace > 0) this.hitGrace -= dtS;
+    // Once per tick, before any enemy is stepped — the same contract the
+    // combat index below has.
+    this.tokens.advance(dtS);
 
     // Grid-local player position. `cellLineOfSight` works in the same metres
     // `dungeon-mesh` draws with, where cell (i, j) spans [i, i+1] x [j, j+1].
@@ -281,9 +308,13 @@ export class DungeonCombat {
         moveXZ,
         speciesDef: def,
         onAttackPlayer: (damage: number) => {
-          this._hitPlayer(damage, seesNow, ctx);
+          // `false`: the landing floor was already consulted in `engage`,
+          // before the swing was allowed out. Consulting it twice would eat
+          // every second blow.
+          this._hitPlayer(damage, seesNow, ctx, null);
         },
         combat: this.index,
+        tokens: this.tokens,
         onAttackEntity: (targetId: string, damage: number) => {
           // Same rule in the other direction. Two enemies in the same room
           // always have sight of each other — a room is a solid rect of floor —
@@ -298,9 +329,13 @@ export class DungeonCombat {
             // than no shot at all.
             if (!seesNow()) { this.blockedByWall++; return; }
             ctx.onRangedAttack?.(e, shot);
-            // The arrow still flies inside the grace window — it reads as a
-            // near miss — but it does not land.
-            this._hitPlayer(shot.damage, () => true, ctx);
+            // The arrow still flies inside the landing floor — it reads as a
+            // near miss — but it does not land. `true` because ranged never
+            // passes through the token gate: an archer holds its distance and
+            // its cadence is already sparse, so it is not part of the
+            // shoulder-to-shoulder problem tokens exist to solve. The floor is
+            // therefore still this call's own job.
+            this._hitPlayer(shot.damage, () => true, ctx, e.species);
             return;
           }
           if (shot.kind === 'entity' && shot.id !== undefined) {
@@ -316,14 +351,40 @@ export class DungeonCombat {
     }
   }
 
-  /** Apply a blow to the player, if the wall and the grace window both allow. */
+  /**
+   * Apply a blow to the player, if the wall — and, for callers that have not
+   * already asked, the pool's landing floor — both allow.
+   *
+   * `rateGate` null means the caller consulted `MeleeArbiter.mayLand` itself
+   * before committing the swing (melee does); otherwise it is the attacker's
+   * species, which the floor needs in order to let bosses through.
+   *
+   * Note the ordering consequence for melee: the floor is consulted in
+   * `engage`, so a blow that then turns out to be wall-blocked has already
+   * stamped the floor. That costs the enemies a fraction of a second of
+   * pressure they would otherwise have had, which is the direction an error
+   * here should point.
+   */
   private _hitPlayer(
     damage: number, seesNow: () => boolean, ctx: DungeonTickCtx,
+    rateGate: Species | null,
   ): void {
     if (!seesNow()) { this.blockedByWall++; return; }
-    if (this.hitGrace > 0) { this.blockedByGrace++; return; }
-    this.hitGrace = PLAYER_HIT_GRACE_S;
+    if (rateGate !== null && !this.tokens.mayLand(rateGate)) return;
     ctx.onAttackPlayer(damage);
+  }
+
+  /**
+   * Forget everything about the delve just left.
+   *
+   * Called from `DungeonManager.exit()`. Without it the token pool would carry
+   * contenders that no longer exist into the next dungeon, and the diagnostic
+   * counters would accumulate for the whole session — which is exactly what
+   * the old `hitGrace` and its counters silently did.
+   */
+  reset(): void {
+    this.tokens.reset();
+    this.blockedByWall = 0;
   }
 
   /** Cached line of sight from `e` to the player. */

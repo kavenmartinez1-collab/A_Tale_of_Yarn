@@ -60,8 +60,20 @@ export class PlayerController {
     window.addEventListener('blur', () => this.keys.clear());
   }
 
-  /** Advance one fixed timestep. cameraYaw orients WASD input. */
-  update(dt: number, cameraYaw: number) {
+  /**
+   * Advance one fixed timestep. `cameraYaw` orients WASD input.
+   *
+   * `faceYaw` overrides which way the BODY points, without touching where it
+   * moves — that is Z-targeting: strafing round a locked enemy has to keep the
+   * doll's front toward the enemy, and the default rule (face your direction
+   * of travel) would show it your shoulder for the whole circle. Null keeps
+   * the default, which is what every caller did before lock-on existed.
+   *
+   * Movement itself needs no lock-on special case: input is already rotated by
+   * the camera yaw, and while locked the camera is framed on the target, so
+   * W already closes and A/D already strafe around it.
+   */
+  update(dt: number, cameraYaw: number, faceYaw: number | null = null) {
     // Camera-relative move input.
     let ix = 0;
     let iz = 0;
@@ -97,10 +109,13 @@ export class PlayerController {
       [this.pos[0], this.pos[2]] =
         this.world.moveXZ(this.pos[0], this.pos[2], dx * dt, dz * dt, RADIUS);
       // Mesh forward is (sin yaw, -cos yaw) — atan2(dx, -dz) faces movement.
-      this.yaw = Math.atan2(dx, -dz);
+      this.yaw = faceYaw ?? Math.atan2(dx, -dz);
       this.moveSpeed = speed;
     } else {
       this.moveSpeed = 0;
+      // Facing is held even while standing still, or a locked player who stops
+      // moving keeps whatever heading their last step left them on.
+      if (faceYaw !== null) this.yaw = faceYaw;
     }
 
     // Swimming takes precedence: touching the sea bed mid-stroke should still

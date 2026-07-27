@@ -166,8 +166,28 @@ setEq('barely-off-centre does not', stickToMoveKeys(0, -0.3), []);
 {
   const l3 = mapPad(padOf([0, -1, 0, 0], [BUTTON.L3]), 1 / 60).intent.heldKeys;
   setEq('L3 while walking → sprint', l3, ['KeyW', 'ShiftLeft']);
+  // LT USED to sprint alongside L3. It is Z-targeting now (poll() turns its
+  // press edge into a KeyZ), and a trigger that both locked on and sprinted
+  // would have made every lock-on a sprint — backwards, since locking on is
+  // what you press in order to stand and fight.
   const lt = mapPad(padOf([0, -1, 0, 0], [BUTTON.LT]), 1 / 60).intent.heldKeys;
-  setEq('left trigger also sprints', lt, ['KeyW', 'ShiftLeft']);
+  setEq('left trigger no longer sprints (it is lock-on now)', lt, ['KeyW']);
+  ok('...and L3 is still the sprint binding',
+    mapPad(padOf([0, -1, 0, 0], [BUTTON.L3]), 1 / 60).intent.heldKeys.has('ShiftLeft'));
+  eq('LT is tracked for its edge in gameplay, or lock-on never fires',
+    mapPad(padOf([0, 0, 0, 0], [BUTTON.LT]), 1 / 60).buttons[BUTTON.LT], true);
+  // An analog trigger only half pulled must not lock on, exactly as it must
+  // not attack.
+  eq('LT at 0.3 is not a lock-on press',
+    mapPad(padOf([0, 0, 0, 0], [], { [BUTTON.LT]: 0.3 }), 1 / 60).buttons[BUTTON.LT],
+    false);
+  eq('LT at 0.8 is', 
+    mapPad(padOf([0, 0, 0, 0], [], { [BUTTON.LT]: 0.8 }), 1 / 60).buttons[BUTTON.LT],
+    true);
+  // The panel context is unchanged: LT there is the chart zoom, and must still
+  // not sprint or hold anything.
+  const ltUi = mapPad(padOf([0, -1, 0, 0], [BUTTON.LT]), 1 / 60, DEFAULT_CONFIG, true);
+  setEq('panel: LT still holds nothing', ltUi.intent.heldKeys, []);
 }
 {
   const jump = mapPad(padOf([0, 0, 0, 0], [BUTTON.B]), 1 / 60).intent.heldKeys;
