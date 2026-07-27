@@ -400,6 +400,18 @@ function resolveSnapshot(repo: string): LocalModelDir | null {
     const snapDir = path.join(HF_CACHE_DIR, dirName, 'snapshots', hash);
     if (fs.existsSync(snapDir)) return { dir: snapDir };
   } catch {}
+
+  // Flat vendored layout: models/<org>--<repo>/, which is what
+  // scripts/fetch-weights.mts writes and what the packaged build serves
+  // (app/steam/local-server.cjs:74). Without this the dev server resolves
+  // `Xenova/whisper-base.en` only if it happens to be in the user's HF cache,
+  // so push-to-talk would 404 under `npm run dev` while working perfectly in
+  // the depot — the worst kind of divergence to debug.
+  const flat = repo.replace(/\//g, '--');
+  for (const base of PROJECT_MODELS_DIRS) {
+    const modelDir = path.join(base, flat);
+    if (fs.existsSync(modelDir)) return { dir: modelDir };
+  }
   return null;
 }
 

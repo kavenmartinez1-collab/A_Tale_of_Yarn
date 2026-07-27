@@ -101,6 +101,7 @@ import {
 import {
   buildNpcChatPanel, onNpcChatClosed, loadStockMap, saveStockMap,
   chatState, npcGoldFromMap, isNpcModelKey, preloadNpcChat, warmNpcApproach,
+  voiceInput,
   type StockMap,
 } from './ui/npc-chat-panel';
 import {
@@ -479,6 +480,19 @@ declare global {
       teleportToNearestNpc(): boolean;
       /** Inject an NPC reply directly (drives the trade pipeline without LLM timing). */
       injectNpcReply(text: string): void;
+      /**
+       * Push-to-talk state, and the leg timings of the last utterance.
+       *
+       * The state and the transcript are both readable from the DOM (the
+       * indicator's label, and `#npc-chat-input`), and the harness asserts
+       * against those on purpose — they are what the player sees. This exists
+       * for the one thing the DOM does not carry: where the milliseconds went.
+       */
+      voiceDebug(): {
+        state: string;
+        awaitingConfirm: boolean;
+        captureMs: number; transcribeMs: number; encodeMs: number;
+      } | null;
       // Phase M — crime / bounty / jail
       /** Regional bounty; regionId defaults to nearest settlement's stable id. */
       bounty(regionId?: string): number;
@@ -6259,6 +6273,22 @@ async function boot() {
     // Phase L2 NPC chat hooks
     chatOpen: () => chatState().open,
     lastNpcReply: () => chatState().lastReply,
+    // Push-to-talk. Null whenever no chat panel is open, because the voice
+    // controller lives and dies with the panel (npc-chat-panel.ts) — which is
+    // itself the assertion that voice cannot be recording outside a
+    // conversation.
+    voiceDebug: () => {
+      const v = voiceInput();
+      if (!v) return null;
+      const t = v.lastTimings;
+      return {
+        state: v.current,
+        awaitingConfirm: v.awaitingConfirm,
+        captureMs: t?.captureMs ?? -1,
+        transcribeMs: t?.transcribeMs ?? -1,
+        encodeMs: t?.encodeMs ?? -1,
+      };
+    },
     teleportToNearestNpc: () => {
       if (npcRuntimes.length === 0) return false;
       const px = controller.pos[0];

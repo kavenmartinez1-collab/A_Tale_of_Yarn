@@ -176,6 +176,37 @@ setEq('barely-off-centre does not', stickToMoveKeys(0, -0.3), []);
   setEq('d-pad mirrors the left stick', dpad, ['KeyA']);
 }
 {
+  // Push-to-talk on LB → the same KeyV the keyboard uses, so src/game/voice
+  // needs no pad-specific path. HELD, not edged: poll()'s set-diff is what
+  // guarantees the matching keyup, and a missed keyup here means a microphone
+  // that never closes.
+  const lb = mapPad(padOf([0, 0, 0, 0], [BUTTON.LB]), 1 / 60);
+  setEq('LB → KeyV (push-to-talk)', lb.intent.heldKeys, ['KeyV']);
+  eq('LB does not attack', lb.intent.attack, false);
+
+  // Talking while walking has to keep working — a player backing away from a
+  // wolf mid-sentence should not stop doing either.
+  const walkTalk = mapPad(padOf([0, -1, 0, 0], [BUTTON.LB]), 1 / 60).intent.heldKeys;
+  setEq('LB while walking → both', walkTalk, ['KeyW', 'KeyV']);
+
+  // LT and LB are adjacent and both are on the left hand. Sprint must not
+  // open the microphone, and push-to-talk must not make the player run.
+  const lt = mapPad(padOf([0, 0, 0, 0], [BUTTON.LT]), 1 / 60).intent.heldKeys;
+  ok('left trigger does not open the mic', !lt.has('KeyV'));
+  ok('LB does not sprint', !lb.intent.heldKeys.has('ShiftLeft'));
+
+  // Released → the key must leave the set, which is what produces the keyup.
+  const released = mapPad(padOf([0, 0, 0, 0], []), 1 / 60).intent.heldKeys;
+  ok('releasing LB drops KeyV', !released.has('KeyV'));
+
+  // Analog half-pull: LB is digital on every standard pad, but isDown() reads
+  // `value` too, so pin the threshold behaviour the same way RT is pinned.
+  const half = mapPad(padOf([0, 0, 0, 0], [], { [BUTTON.LB]: 0.3 }), 1 / 60).intent.heldKeys;
+  ok('LB at 0.3 does not open the mic', !half.has('KeyV'));
+  const most = mapPad(padOf([0, 0, 0, 0], [], { [BUTTON.LB]: 0.8 }), 1 / 60).intent.heldKeys;
+  ok('LB at 0.8 opens the mic', most.has('KeyV'));
+}
+{
   // A is interact and must NOT leak into the held-key set — it is edge
   // triggered, because main.ts's KeyE chain fires once per press.
   const a = mapPad(padOf([0, 0, 0, 0], [BUTTON.A]), 1 / 60);

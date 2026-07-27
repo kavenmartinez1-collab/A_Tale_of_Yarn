@@ -75,6 +75,58 @@ const SHIP: Want[] = [
     from: 'Qwen/Qwen3-8B',
     why: 'chat template + special tokens, same source as the tokenizer',
   },
+
+  // ---- Voice input (push-to-talk STT) --------------------------------------
+  //
+  // Xenova/whisper-base.en rather than the onnx-community mirror of the same
+  // graphs: Xenova declares apache-2.0 on the repo card and onnx-community
+  // declares no licence at all. The bytes may well be identical; the paperwork
+  // is not, and this build ships to Valve. OpenAI's original whisper weights
+  // are MIT (see THIRD_PARTY_NOTICES.md).
+  //
+  // base.en, not tiny.en. tiny.en is 35 MB smaller, but the entire point of
+  // voice input here is that the player says "Tintreach" and "Castle Vhaeron"
+  // to an NPC — proper nouns are the workload, and that is precisely where
+  // tiny.en falls apart (measured in scripts/test-voice-accuracy.mts).
+  //
+  // `_quantized` is the int8 suffix transformers.js picks for dtype 'q8',
+  // which is already its default on the wasm backend — naming the files here
+  // means the vendored set and the requested set cannot drift.
+  {
+    repo: 'Xenova/whisper-base.en',
+    file: 'onnx/encoder_model_quantized.onnx',
+    why: 'STT encoder — int8, runs on ORT wasm/SIMD on the CPU, never the GPU queue',
+  },
+  {
+    repo: 'Xenova/whisper-base.en',
+    file: 'onnx/decoder_model_merged_quantized.onnx',
+    why: 'STT decoder — the *merged* graph is the one transformers.js asks for (models.js:1158)',
+  },
+  {
+    repo: 'Xenova/whisper-base.en',
+    file: 'config.json',
+    why: 'model architecture — WhisperForConditionalGeneration needs it before any session opens',
+  },
+  {
+    repo: 'Xenova/whisper-base.en',
+    file: 'generation_config.json',
+    why: 'decoder start token, suppress lists, EOS — greedy decoding is wrong without it',
+  },
+  {
+    repo: 'Xenova/whisper-base.en',
+    file: 'preprocessor_config.json',
+    why: 'log-mel frontend parameters (80 bins, 16 kHz, 30 s window) for WhisperFeatureExtractor',
+  },
+  {
+    repo: 'Xenova/whisper-base.en',
+    file: 'tokenizer.json',
+    why: 'detokenisation, and the vocabulary the proper-noun prompt bias is tokenised against',
+  },
+  {
+    repo: 'Xenova/whisper-base.en',
+    file: 'tokenizer_config.json',
+    why: 'special-token map — <|startofprev|> is how the vocabulary bias is injected',
+  },
 ];
 
 /**
@@ -132,6 +184,11 @@ async function download(want: Want, destDir: string): Promise<{ bytes: number; s
   const srcFile = want.fromFile ?? want.file;
   const dest = path.join(destDir, want.file);
   const part = `${dest}.part`;
+
+  // `file` may carry a sub-path — the ONNX repos keep their graphs under
+  // `onnx/`, and transformers.js requests them at exactly that path. The
+  // caller only mkdir'd the repo directory, so make the leaf's parent too.
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
 
   const want_ = await remoteSize(srcRepo, srcFile);
 

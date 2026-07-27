@@ -92,17 +92,33 @@ if (!fs.existsSync(path.join(DIST, 'game.html'))) {
 
 // ─── 2. Prune dist/ to the game path ─────────────────────────────────────────
 //
-// docs/PORTING.md §1.6/§2.9(6): dist/ is 24 MB, of which 21 MB is the ONNX
-// runtime and ~380 KB is eSpeak NG — both on the index.html playground path,
-// neither reachable from game.html. Dropping them is worth more than the bytes:
-// eSpeak is GPL-3.0, and Valve's rules say an application containing
-// third-party open-source code incompatible with the Steamworks SDK must not be
-// distributed via Steam.
+// docs/PORTING.md §1.6/§2.9(6): eSpeak NG (~380 KB) is on the index.html
+// playground path and not reachable from game.html. Dropping it is worth more
+// than the bytes: eSpeak is GPL-3.0, and Valve's rules say an application
+// containing third-party open-source code incompatible with the Steamworks SDK
+// must not be distributed via Steam.
 //
 // Rather than maintain a denylist that silently rots when a chunk is renamed,
 // walk the actual ES-module import graph out of game.html and ship its closure.
-// If the walk under-collects, the game fails to boot and the offline harness
-// (scripts/steam-pack-check.mjs) catches it on the very next run.
+//
+// ⚠️ THE WALK USED TO MISS A WHOLE CLASS OF REFERENCE, and the old comment here
+// asserted the opposite. Vite emits `new URL()` asset and worker references
+// WITHOUT the `./` prefix that the pattern required:
+//
+//     new URL(""+new URL("stt-worker-CIVBwWtu.js",import.meta.url).href, …)
+//
+// so every worker chunk and every `?url` asset fell out of the closure
+// silently. That is the worst possible failure shape, because a dropped worker
+// or `.wasm` does not break the boot — it breaks lazily, the first time a
+// player uses the feature, long after the harness has gone green. It is also
+// why the 21 MB ONNX runtime appeared to be "correctly excluded" when in fact
+// it was reachable from a shipped chunk and merely invisible: the exclusion was
+// an accident that happened to be the outcome we wanted.
+//
+// The prefix is optional now, and the results are intersected with what is
+// actually on disk in assets/ so the looser pattern cannot invent files. And
+// because a graph walk can still be fooled, REQUIRED_ASSETS below states the
+// non-negotiables outright and fails the pack if any is missing.
 
 console.log('[2/6] pruning dist to the game.html module closure');
 
@@ -115,10 +131,15 @@ for (const m of entryHtml.matchAll(/(?:src|href)="\.\/([^"]+)"/g)) {
   if (m[1].endsWith('.js')) queue.push(m[1]);
 }
 
-// Vite emits relative specifiers between chunks: `from"./x.js"`, `import"./x.js"`,
-// `import("./x.js")`, and `new URL("./x.wasm",import.meta.url)`. One pattern
-// covers all of them because they all end in a quoted "./name.ext".
-const REF = /["']\.\/([\w.-]+\.(?:js|css|wasm|json|data))["']/g;
+// Every inter-chunk reference Vite emits ends in a quoted filename: `from
+// "./x.js"`, `import("./x.js")`, `new URL("x.wasm",import.meta.url)`,
+// `new Worker(new URL("x.js",import.meta.url))`. The `./` is optional — see
+// above. Matching bare filenames is deliberately loose, so `onDisk` gates it.
+// `m?js` is not decoration: ONNX Runtime's emscripten glue is an `.mjs`, and
+// `\.js` does not match `.mjs` (there is no dot before the `js`). Missing it
+// costs a 404 whose only symptom is `no available backend found`.
+const REF = /["'](?:\.\/)?([\w.-]+\.(?:m?js|css|wasm|json|data))["']/g;
+const onDisk = new Set(fs.readdirSync(path.join(DIST, 'assets')));
 
 while (queue.length) {
   const rel = queue.pop();
@@ -126,11 +147,71 @@ while (queue.length) {
   if (!fs.existsSync(file)) continue;
   const src = fs.readFileSync(file, 'utf8');
   for (const m of src.matchAll(REF)) {
+    if (!onDisk.has(m[1])) continue; // a quoted string that is not an emitted asset
     const next = `assets/${m[1]}`;
     if (keep.has(next)) continue;
     keep.add(next);
     if (next.endsWith('.js')) queue.push(next);
   }
+}
+
+// ─── 2b. Assets the depot is not allowed to be missing ───────────────────────
+//
+// The walk above is inference. This is assertion. Each entry is a
+// {pattern, why} the packaged game genuinely cannot run without, and a miss
+// stops the pack rather than shipping a depot that fails in the player's hands.
+//
+// Note what is NOT here: eSpeak. It stays excluded, and the check below proves
+// it is still absent rather than merely unmentioned.
+const REQUIRED_ASSETS = [
+  { pattern: /^assets\/game-[\w-]+\.js$/, why: 'the game entry chunk' },
+  {
+    pattern: /^assets\/stt-worker-[\w-]+\.js$/,
+    why: 'push-to-talk speech recognition worker — referenced only through '
+      + '`new Worker(new URL(...))`, the exact form the walk used to drop',
+  },
+  {
+    pattern: /^assets\/ort-wasm-simd-threaded-[\w-]+\.wasm$/,
+    why: 'ONNX Runtime (WASM-only build, 11.1 MB) — the STT worker\'s engine, '
+      + 'reached via a `?url` import that emits no `./` prefix',
+  },
+  {
+    pattern: /^assets\/ort-wasm-simd-threaded-[\w-]+\.mjs$/,
+    why: 'the emscripten glue that instantiates that binary. Without it ORT '
+      + 'reports only `no available backend found`, and the `.mjs` extension is '
+      + 'a second trap — the reference scan has to spell it `m?js`',
+  },
+];
+
+/** Assets that must NOT ship, with the reason, asserted after the walk. */
+const FORBIDDEN_ASSETS = [
+  {
+    pattern: /espeak/i,
+    why: 'eSpeak NG is GPL-3.0 and incompatible with the Steamworks SDK',
+  },
+  {
+    pattern: /ort-wasm-simd-threaded\.jsep/i,
+    why: 'the WebGPU/JSEP ONNX build (21.6 MB) — vite.config.ts aliases '
+      + 'onnxruntime-web to its wasm-only entry so this should not exist at all',
+  },
+];
+
+{
+  const kept = [...keep];
+  const missing = REQUIRED_ASSETS.filter((r) => !kept.some((k) => r.pattern.test(k)));
+  const present = FORBIDDEN_ASSETS.filter((r) => kept.some((k) => r.pattern.test(k)));
+  for (const r of missing) {
+    console.error(`      MISSING REQUIRED ASSET  ${r.pattern}\n        ${r.why}`);
+  }
+  for (const r of present) {
+    console.error(`      FORBIDDEN ASSET PRESENT ${r.pattern}\n        ${r.why}`);
+  }
+  if (missing.length || present.length) {
+    console.error('\npack-steam: refusing to build a depot that would fail in the player\'s hands.');
+    process.exit(1);
+  }
+  console.log(`      required assets present: ${REQUIRED_ASSETS.length}/${REQUIRED_ASSETS.length}`
+    + `, forbidden absent: ${FORBIDDEN_ASSETS.length}/${FORBIDDEN_ASSETS.length}`);
 }
 
 const PRUNED = path.join(TMP, 'dist');

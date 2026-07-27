@@ -178,6 +178,23 @@ export function mapPad(
     || isDown(pad, BUTTON.LT, cfg.triggerThreshold)) heldKeys.add('ShiftLeft');
   if (isDown(pad, BUTTON.B, cfg.triggerThreshold)) heldKeys.add('Space');
 
+  // Push-to-talk on LB, mapped to the same V the keyboard uses. Voice input
+  // (src/game/voice) listens for KeyV on `window` and nowhere else, so the pad
+  // needs no hook of its own — this is the "synthesise the events the game
+  // already listens for" rule paying off again.
+  //
+  // It is deliberately a HELD key rather than an edge. The set-diff in poll()
+  // then guarantees the matching keyup: a pad yanked out mid-sentence, or
+  // `enabled` going false, runs releaseAll() and the microphone closes. An
+  // edge-triggered latch would leave it open, and an open mic nobody asked for
+  // is the one failure this feature must never have.
+  //
+  // LB because it is free (A interact, B jump, LT/L3 sprint, RT attack, Start
+  // pause), it is a shoulder — reachable without leaving the sticks mid-
+  // conversation — and it is where a decade of voice chat has trained people
+  // to expect it.
+  if (isDown(pad, BUTTON.LB, cfg.triggerThreshold)) heldKeys.add('KeyV');
+
   const sign = cfg.invertY ? -1 : 1;
   return {
     intent: {
@@ -234,6 +251,7 @@ export interface GamepadHooks {
  * needs to know a pad exists:
  *   held sticks/d-pad/L3/B → `keydown`/`keyup` with the matching `e.code`
  *   A                      → `keydown`/`keyup` `KeyE`   (the interact chain)
+ *   LB                     → `keydown`/`keyup` `KeyV`   (push-to-talk)
  *   Start                  → `keydown` `Escape`         (pause)
  *   right trigger          → `mousedown`/`mouseup` button 0 (attack, bow draw)
  *
