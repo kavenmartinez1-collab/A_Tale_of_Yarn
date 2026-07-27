@@ -114,6 +114,29 @@ function createLocalServer({ distDir, modelsDir, log = () => {} }) {
       return res.end('Misdirected Request');
     }
 
+    // Cross-origin isolation, on every response.
+    //
+    // This is what makes `crossOriginIsolated` true, which is what makes
+    // SharedArrayBuffer available, which is what lets ONNX Runtime run the
+    // speech-recognition worker on more than one thread. Without it Whisper is
+    // pinned to a single core no matter how many the machine has. Measured in
+    // the packaged app on a 16-core desktop, same fixture utterance, warm:
+    //
+    //     crossOriginIsolated=false   1 thread    3.27 s
+    //     crossOriginIsolated=true    4 threads   1.63 s
+    //
+    // On a Steam Deck that difference is the feature feeling usable or not.
+    // Beat 4b of scripts/steam-pack-check.mjs re-measures it every run.
+    //
+    // The dev server has sent exactly these two headers since the MoE expert
+    // workers needed them (vite.config.ts:49-53), so the game is already known
+    // to run under them — this closes the gap between dev and the depot rather
+    // than opening a new risk. `credentialless` rather than `require-corp` for
+    // the same reason it was chosen there: it does not demand CORP headers on
+    // subresources. Everything here is same-origin loopback in any case.
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
+
     let pathname;
     try {
       pathname = decodeURIComponent(new URL(req.url, `http://${expected}`).pathname);

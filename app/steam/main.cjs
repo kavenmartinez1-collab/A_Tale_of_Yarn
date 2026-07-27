@@ -97,6 +97,58 @@ function installNetworkAudit(localOrigin) {
   });
 }
 
+// ─── Permissions ─────────────────────────────────────────────────────────────
+//
+// Electron's DEFAULT is to grant every permission a renderer asks for, with no
+// prompt. That was survivable while the game asked for nothing; push-to-talk
+// asks for the microphone, so the default is now a real answer to a real
+// question and it is the wrong one — it would also hand out the camera,
+// geolocation, notifications and the rest to any code that ended up running in
+// this window, including a 1.7B model's output rendered into the DOM.
+//
+// So: deny by default, allow `media` — audio only — and only for our own
+// loopback origin. There is nothing else in this app that legitimately needs a
+// device.
+//
+// Both handlers are installed on purpose. `setPermissionRequestHandler` covers
+// the asking path (`getUserMedia`), `setPermissionCheckHandler` the synchronous
+// query path (`navigator.permissions.query`, and Chromium's own internal
+// checks); with only the first, `enumerateDevices` reports empty labels and
+// some capture paths fail before ever raising a request.
+
+function installPermissions(localOrigin) {
+  const sameOrigin = (url) => {
+    if (!url) return false;
+    try { return new URL(url).origin === localOrigin; } catch { return false; }
+  };
+
+  session.defaultSession.setPermissionRequestHandler((wc, permission, callback, details) => {
+    // `requestingUrl` is absent on some internal requests; fall back to the
+    // frame's own URL rather than trusting an empty string.
+    const origin = details?.requestingUrl || wc?.getURL();
+    const ok = permission === 'media'
+      && sameOrigin(origin)
+      // `mediaTypes` is absent for a plain getUserMedia({audio:true}) on some
+      // Electron versions, so an omitted list is treated as audio-only. A list
+      // that names video is refused: nothing here wants a camera.
+      && !(details?.mediaTypes ?? []).includes('video');
+    console.log(`[perm] ${ok ? 'GRANT' : 'DENY '} ${permission}`
+      + `${details?.mediaTypes ? ` [${details.mediaTypes}]` : ''} ← ${origin || 'unknown'}`);
+    callback(ok);
+  });
+
+  session.defaultSession.setPermissionCheckHandler((_wc, permission, requestingOrigin, details) => {
+    if (permission !== 'media') return false;
+    if (!sameOrigin(requestingOrigin)) return false;
+    return details?.mediaType !== 'video';
+  });
+
+  // Device-level gate for `navigator.mediaDevices.selectAudioOutput` and
+  // friends. Nothing in the game calls them; refuse rather than inherit a
+  // default that may change between Electron majors.
+  session.defaultSession.setDevicePermissionHandler(() => false);
+}
+
 // ─── Window ──────────────────────────────────────────────────────────────────
 
 let win = null;
@@ -210,6 +262,7 @@ app.whenReady().then(async () => {
   console.log(`[server] serving dist=${distDir} models=${modelsDir} on ${serverHandle.origin}`);
 
   installNetworkAudit(serverHandle.origin);
+  installPermissions(serverHandle.origin);
   installIpc();
 
   // Steam init is deliberately after the server and before the window: it must

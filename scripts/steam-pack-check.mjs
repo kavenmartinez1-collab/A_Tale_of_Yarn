@@ -68,9 +68,42 @@ console.log(`depot: ${DEPOT}\n`);
 const mainLog = [];
 const consoleLog = [];
 
+// ─── The fake microphone ─────────────────────────────────────────────────────
+//
+// Beat 4b needs a microphone in a headless CI-shaped run, so Chromium is given
+// a WAV to play in place of one. The file is a fixture from
+// scripts/gen-voice-fixture.mts — synthesised offline through the vendored
+// Piper voice, deterministic, 16 kHz mono 16-bit, which is both what Chromium
+// requires here and what Whisper's frontend wants.
+//
+// `--use-fake-ui-for-media-stream` is POINTEDLY ABSENT. It would auto-accept
+// the permission prompt and skip app/steam/main.cjs's permission handler
+// entirely, so the beat would keep passing on a build that had no microphone
+// permission handling at all. Granting is left to the app, and beat 4b asserts
+// that the app is what granted it.
+const VOICE_FIXTURE_DIR = path.join(REPO, 'scripts', 'voice_fixture');
+let VOICE_FIXTURE = null;
+{
+  const mf = path.join(VOICE_FIXTURE_DIR, 'manifest.json');
+  if (fs.existsSync(mf)) {
+    const all = JSON.parse(fs.readFileSync(mf, 'utf8')).utterances ?? [];
+    // A game-vocabulary utterance on purpose: proper nouns are the workload
+    // this feature exists for, so the offline proof should exercise one.
+    VOICE_FIXTURE = all.find((u) => /greenholm/i.test(u.text)) ?? all[0] ?? null;
+  }
+}
+if (!VOICE_FIXTURE && !CONTROL && !RELEASE) {
+  console.log('  note: no voice fixture — push-to-talk beat will be skipped.');
+  console.log('        generate it with: npx tsx scripts/gen-voice-fixture.mts\n');
+}
+
 const app = await _electron.launch({
   executablePath: EXE,
   cwd: DEPOT,
+  args: VOICE_FIXTURE ? [
+    '--use-fake-device-for-media-stream',
+    `--use-file-for-fake-audio-capture=${path.join(VOICE_FIXTURE_DIR, VOICE_FIXTURE.file)}`,
+  ] : [],
   env: {
     ...process.env,
     YARN_BLOCK_EXTERNAL: '1',
@@ -345,6 +378,159 @@ if (!SKIP_CHAT && !RELEASE && boot.debugPresent) {
       console.log(`  · chat history tail : ${JSON.stringify(chat.text ?? '')}`);
     }
   }
+}
+
+// ─── 4b. Push-to-talk: a real utterance, from a fake microphone ──────────────
+//
+// The claim under test is the whole feature end to end: hold the key, Chromium
+// feeds a synthesised WAV in place of a microphone, Whisper runs on ORT wasm in
+// a worker inside the packaged app, and the transcript lands in the SAME chat
+// input a keyboard types into — with no external request at any point (beat 6
+// audits that, and it audits this run too, which is the real reason this beat
+// lives here rather than in its own harness).
+//
+// Two things make this beat mean something rather than merely pass:
+//
+//   1. IT IS NOT GIVEN A FREE PERMISSION GRANT. Chromium's
+//      `--use-fake-ui-for-media-stream` would auto-accept the prompt and
+//      bypass main.cjs's `setPermissionRequestHandler` entirely — the test
+//      would then pass on a build with no permission handling at all. It is
+//      deliberately NOT passed, so the only thing that can grant the
+//      microphone here is our own handler, and `[perm] GRANT media` in the
+//      main-process log is the evidence.
+//   2. IT ASSERTS THE CONTENT, not just that something arrived. The fixture
+//      utterance is known, so a wrong transcript fails. A beat that only
+//      checked "the box is non-empty" would pass on Whisper's silence
+//      hallucination (" you"), which is exactly the failure this has to catch.
+//
+// Skipped in CONTROL (no weights) and in RELEASE (no `__gameDebug` to read the
+// leg timings from, and beat 4 does not open a panel there either).
+
+let voice = null;
+if (!SKIP_CHAT && !RELEASE && boot.debugPresent && chat?.changed && VOICE_FIXTURE) {
+  console.log('\n─── 4b. push-to-talk ───');
+
+  // Which utterance the fake device is playing — chosen in the launch args at
+  // the top of this file, read back here so the assertion cannot drift from it.
+  const expected = VOICE_FIXTURE.text;
+  console.log(`  · fake mic plays: ${JSON.stringify(expected)}`);
+
+  voice = await page.evaluate(async (holdMs) => {
+    const input = document.getElementById('npc-chat-input');
+    if (!input) return { error: 'no chat input — panel closed?' };
+    input.value = '';
+
+    const t0 = performance.now();
+    // Exactly what the player does, and exactly what gamepad.ts synthesises
+    // for LB: a KeyV keydown on `window`, held, then a keyup. Nothing here
+    // reaches into the voice module's internals.
+    window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyV', bubbles: true }));
+    await new Promise((r) => setTimeout(r, holdMs));
+    window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyV', bubbles: true }));
+
+    // Frames across the transcription window. The whole justification for the
+    // worker is that the world keeps running while Whisper thinks, so measure
+    // it rather than assert it: a main-thread implementation would show a
+    // second-plus hole here, and the longest gap between rAF callbacks is what
+    // a player would actually feel.
+    const relAt = performance.now();
+    const framesAtRelease = window.__gameStats?.frameCount ?? 0;
+    let worstGapMs = 0;
+    let lastTick = relAt;
+    let rafId = 0;
+    const sample = () => {
+      const now = performance.now();
+      worstGapMs = Math.max(worstGapMs, now - lastTick);
+      lastTick = now;
+      rafId = requestAnimationFrame(sample);
+    };
+    rafId = requestAnimationFrame(sample);
+
+    // Wait for the transcript to land in the box.
+    const deadline = performance.now() + 60_000;
+    let transcript = '';
+    let lastState = '';
+    while (performance.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+      const d = window.__gameDebug?.voiceDebug?.() ?? null;
+      if (d) lastState = d.state;
+      if (input.value.trim().length > 0) { transcript = input.value.trim(); break; }
+      if (d && d.state === 'error') break;
+    }
+    cancelAnimationFrame(rafId);
+    const sinceRelease = performance.now() - relAt;
+    const framesSinceRelease = (window.__gameStats?.frameCount ?? 0) - framesAtRelease;
+    const d = window.__gameDebug?.voiceDebug?.() ?? null;
+    return {
+      transcript,
+      // The indicator's label carries the human-readable reason on failure.
+      // Reading it here means a red beat says WHY without a second run.
+      label: document.querySelector('#npc-voice .label')?.textContent ?? '',
+      fpsDuring: sinceRelease > 0 ? (framesSinceRelease * 1000) / sinceRelease : 0,
+      worstGapMs: Math.round(worstGapMs),
+      totalMs: Math.round(performance.now() - t0),
+      state: d?.state ?? lastState,
+      awaitingConfirm: d?.awaitingConfirm ?? false,
+      captureMs: d?.captureMs ?? -1,
+      transcribeMs: d?.transcribeMs ?? -1,
+      encodeMs: d?.encodeMs ?? -1,
+    };
+  }, Math.round(VOICE_FIXTURE.durationSec * 1000) + 400);
+
+  if (voice.error) {
+    ok('push-to-talk produced a transcript', false, voice.error);
+  } else if (voice.state === 'error' || voice.transcript === '') {
+    ok('push-to-talk produced a transcript', false,
+      `state=${voice.state} indicator=${JSON.stringify(voice.label)}`);
+    for (const l of consoleLog.filter((l) =>
+      /voice|worker|onnx|ort|wasm|whisper|transformers|Failed|Error/i.test(l)).slice(-12)) {
+      console.log(`  · console: ${l.slice(0, 300)}`);
+    }
+  } else {
+    const norm = (s) => s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+    const ref = norm(expected);
+    const got = norm(voice.transcript);
+    const hits = ref.filter((w) => got.includes(w)).length;
+    const overlap = ref.length ? hits / ref.length : 0;
+
+    console.log(`  · transcript: ${JSON.stringify(voice.transcript)}`);
+    console.log(`  · hold→transcript ${voice.totalMs} ms`
+      + ` (capture ${voice.captureMs} ms, transcribe ${voice.transcribeMs} ms`
+      + `, of which mel+encode ${voice.encodeMs} ms)`);
+
+    ok('push-to-talk produced a transcript', voice.transcript.length > 0, `state=${voice.state}`);
+    // Word overlap, not equality: the fixture is synthesised speech through a
+    // quantised model, so a perfect match is not the bar (it happens to hit
+    // 8/8 today). 0.6 sits well clear of both ends — every failure seen while
+    // building this beat, including the empty transcript a broken ORT path
+    // produces and Whisper's " you" hallucination on silence, scores 0/8.
+    ok('the transcript is THIS utterance, not merely non-empty', overlap >= 0.6,
+      `word overlap ${hits}/${ref.length}`);
+    ok('transcript is waiting for confirmation, not auto-sent', voice.awaitingConfirm === true,
+      'release fills the box; the player confirms — see src/game/voice/voice-input.ts');
+    ok('transcription completed within 5 s', voice.transcribeMs > 0 && voice.transcribeMs < 5000,
+      `${voice.transcribeMs} ms`);
+
+    // The worker's entire justification. 30 fps is a deliberately loose floor —
+    // the point is to catch a regression that moves inference onto the main
+    // thread, which would read as single digits and a gap of seconds, not to
+    // police normal frame-rate variation.
+    console.log(`  · during transcription: ${voice.fpsDuring.toFixed(1)} fps`
+      + `, worst frame gap ${voice.worstGapMs} ms`);
+    ok('the world keeps rendering while Whisper runs', voice.fpsDuring > 30,
+      `${voice.fpsDuring.toFixed(1)} fps`);
+    ok('no multi-frame stall on the main thread', voice.worstGapMs < 250,
+      `worst gap ${voice.worstGapMs} ms`);
+  }
+
+  // The microphone was granted by OUR handler, not by a Chromium auto-accept.
+  const perms = mainLog.join('').split(/\r?\n/).filter((l) => l.includes('[perm]'));
+  for (const line of perms.slice(0, 4)) console.log(`  · ${line.trim()}`);
+  ok('microphone granted by the app\'s own permission handler',
+    perms.some((l) => /\[perm\] GRANT media/.test(l)),
+    perms.length ? `${perms.length} permission decision(s) logged` : 'no [perm] lines at all');
+  ok('no permission other than media was granted',
+    !perms.some((l) => /GRANT/.test(l) && !/GRANT media/.test(l)));
 }
 
 // ─── 5. Frames still advancing, measured after everything above ──────────────

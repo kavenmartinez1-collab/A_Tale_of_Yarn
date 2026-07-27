@@ -31,6 +31,8 @@ import { countItem, removeItem, addItem, saveInventory } from '../inventory';
 import { itemDef, type GameItemId } from '../items';
 import { itemIcon } from './item-icons';
 import type { PanelManager } from './panel-manager';
+import { VoiceInput } from '../voice/voice-input';
+import { RecordingIndicator } from '../voice/recording-indicator';
 import {
   getOrCreateMemory, addFact, adjustDisposition, saveMemoryMap,
   dispositionTone, detectThreat, REFUSE_CHAT_BELOW, type MemoryMap,
@@ -663,6 +665,17 @@ const _state: NpcChatState = {
 };
 
 export function chatState(): Readonly<NpcChatState> { return _state; }
+
+/**
+ * The panel's push-to-talk controller, held at module level for the same
+ * reason `_state` is: `onNpcChatClosed()` is a free function and needs to
+ * reach it to release the microphone. Nulled there too — a panel closed
+ * mid-sentence must not leave the capture indicator lit.
+ */
+let _voice: VoiceInput | null = null;
+
+/** The live voice controller, or null when no chat panel is open. */
+export function voiceInput(): VoiceInput | null { return _voice; }
 
 // ---------------------------------------------------------------------------
 // LLM transport — reuses same createGGUFInferenceSession as Director
@@ -1320,6 +1333,11 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
   inputRow.appendChild(sendBtn);
   chatCol.appendChild(inputRow);
 
+  // Push-to-talk. Sits between the input row and the hint because it reports
+  // on the input row: the mic fills that box and nothing else.
+  const voiceUi = new RecordingIndicator();
+  chatCol.appendChild(voiceUi.el);
+
   const hint = document.createElement('div');
   hint.className = 'hint';
   // AI disclosure. EU AI Act Article 50(1) (applicable 2 August 2026) requires
@@ -1327,7 +1345,8 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
   // obvious from context. A talking villager in a fantasy game is arguably
   // obvious, but "arguably" is not a compliance position, and the line costs
   // nothing. See docs/AI_MODEL_LICENSING.md.
-  hint.textContent = 'Enter to send  ·  Esc to close  ·  replies are AI-generated';
+  hint.textContent =
+    'Hold V to speak  ·  Enter to send  ·  Esc to close  ·  replies are AI-generated';
   chatCol.appendChild(hint);
 
   const tradeCol = document.createElement('div');
@@ -2029,6 +2048,35 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
     }
   });
 
+  // ---- Push-to-talk -------------------------------------------------------
+  //
+  // Voice fills `input` and then stops. It calls the SAME sendMessage as the
+  // Send button, so a spoken sentence is screened by `screenPlayerInput`,
+  // enters `history`, and reaches the model by exactly one path — the one
+  // above. There is deliberately no second route in.
+  //
+  // The panel is torn down and rebuilt per conversation, so a previous
+  // controller must be released before this one replaces it; the STT worker
+  // itself survives (VoiceInput.dispose keeps it) so the second NPC does not
+  // pay the model load again.
+  _voice?.dispose();
+  _voice = new VoiceInput({
+    input,
+    submit: () => { void sendMessage(input.value); },
+    // Recording is allowed only while THIS panel is the open one and it is
+    // accepting input. `input.disabled` is true for the whole LLM turn, which
+    // is also exactly when a second utterance would have nowhere to go.
+    canCapture: () => _state.open && _state.npcId === npcId && !input.disabled,
+    context: () => ({
+      npcName: persona.name,
+      settlement: settlementName,
+      neighbors: (persona.neighbors ?? []).map((n) => n.name),
+    }),
+    onState: (state, detail) => voiceUi.set(state, detail),
+  });
+  // Load the model while the player reads the greeting — see VoiceInput.warm.
+  _voice.warm();
+
 
   // ---- Opening greeting ---------------------------------------------------
 
@@ -2113,4 +2161,10 @@ export function onNpcChatClosed(): void {
   _state.npcId = null;
   _state.activeStockKey = null;
   _state.pendingOffer = null;
+  // Releases the microphone and unhooks the key listeners. The STT worker is
+  // kept resident on purpose (VoiceInput.releaseWorker is not called): re-
+  // loading 75 MB of int8 graphs for the next NPC would make voice feel broken
+  // exactly when the player has just learned to use it.
+  _voice?.dispose();
+  _voice = null;
 }

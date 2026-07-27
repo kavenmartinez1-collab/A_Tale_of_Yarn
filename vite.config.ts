@@ -132,6 +132,32 @@ export default defineConfig({
   // a domain root, a GitHub Pages /<repo>/ subpath, or file-served dirs.
   base: './',
   publicDir: 'public',
+  resolve: {
+    // ONNX Runtime, everywhere in this project, is the WASM-only build.
+    //
+    // `@huggingface/transformers` statically imports `onnxruntime-web`, whose
+    // root entry is the full build — WebGPU/JSEP execution providers, and a
+    // 21.6 MB `ort-wasm-simd-threaded.jsep-*.wasm` emitted beside them. Nothing
+    // here wants that. Inference in this game is either the hand-written WebGPU
+    // engine (src/engine) or speech recognition, and speech deliberately stays
+    // on the CPU: WebGPU v1 exposes one queue, the renderer and the NPC LLM
+    // already contend for it, and that contention is the Steam Deck's measured
+    // problem. A repo-wide grep confirms no ORT `InferenceSession` is ever
+    // created outside src/game/voice.
+    //
+    // So point the package at its own `./wasm` subpath export. The jsep binary
+    // then never enters the module graph at all, which is worth more than the
+    // 21.6 MB it saves: "speech cannot reach the GPU" becomes a property of
+    // what was compiled rather than of a runtime flag someone can flip later.
+    // See src/game/voice/ort-bootstrap.ts.
+    //
+    // Array form with an anchored regex, not the object form: an object alias
+    // is a PREFIX replacement, so plain `onnxruntime-web` would also rewrite
+    // `onnxruntime-web/wasm` into `onnxruntime-web/wasm/wasm`.
+    alias: [
+      { find: /^onnxruntime-web$/, replacement: 'onnxruntime-web/wasm' },
+    ],
+  },
   build: {
     outDir: 'dist',
     target: 'esnext',
