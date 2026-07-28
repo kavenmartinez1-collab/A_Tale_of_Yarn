@@ -336,6 +336,95 @@ check('...and the forbidden matcher bites on its licence',
   + 'patterns have drifted and would let it through');
 
 // ---------------------------------------------------------------------------
+// 10. The soundtrack
+// ---------------------------------------------------------------------------
+//
+// Four compositions written and recorded by the developer, vendored into
+// models/music/ and shipped in the depot. They are not third-party material and
+// so are not in `credits` (see the _readme) — but "we own it" is a claim that
+// still has to be RECORDED, because in two years the question "where did this
+// track come from and are we clear to ship it?" will be asked by someone who
+// was not here. The provenance trail that covers every SFX now covers the music.
+//
+// Coverage is taken from src/game/music/songs.ts rather than from the disk. A
+// disk-only scan would pass vacuously on a checkout where the vendoring step
+// has not been run, which is the exact failure this guard exists to prevent.
+
+const music = manifest?.music ?? [];
+const musicPolicy = manifest?.musicPolicy?.allowed ?? [];
+
+check('manifest has a musicPolicy.allowed array', Array.isArray(manifest?.musicPolicy?.allowed));
+check('manifest has a music array', Array.isArray(manifest?.music));
+check('music is not empty', music.length > 0,
+  'the game ships a soundtrack; an empty list means a track lost its provenance '
+  + 'record or the music assets were dropped');
+
+for (const m of music) {
+  const id = m.title ?? m.id ?? '(no title)';
+  check(`track has id: ${id}`, typeof m.id === 'string' && m.id.length > 0);
+  check(`track has file: ${id}`, typeof m.file === 'string' && m.file.length > 0);
+  check(`track has author: ${id}`, typeof m.author === 'string' && m.author.length > 0);
+  check(`track states its rights: ${id}`, typeof m.rights === 'string' && m.rights.length > 0,
+    'a self-owned work still needs the ownership written down');
+  check(`track names its source master: ${id}`,
+    typeof m.source === 'string' && m.source.startsWith('music-src/'),
+    'the master it was vendored from, so the chain back to the original render is auditable');
+  check(`track has licence: ${id}`, typeof m.licence === 'string' && m.licence.length > 0);
+
+  const lic = String(m.licence ?? '');
+  // The forbidden patterns apply here too. They are not expected to fire on the
+  // developer's own work — they are here to catch a THIRD-PARTY track being
+  // added to this list by mistake, where it would bypass the credits vetting.
+  for (const f of FORBIDDEN_AUDIO_LICENCES) {
+    check(`track licence not forbidden (${f.pattern}): ${id}`, !f.pattern.test(lic),
+      `'${lic}' — ${f.why}. A third-party track belongs in 'credits', not here.`);
+  }
+  check(`track licence allowed: ${id}`, musicPolicy.includes(lic),
+    `'${lic}' is not one of: ${musicPolicy.join(', ')}`);
+}
+
+// Coverage both ways against the engine's own catalogue.
+{
+  const songsSrc = readFileSync(
+    path.join(ROOT, 'src', 'game', 'music', 'songs.ts'), 'utf-8');
+  const files = [...songsSrc.matchAll(/^\s*file: '([^']+)',/gm)].map((m) => m[1]);
+  const unique = [...new Set(files)];
+  check('songs.ts names at least one music file', unique.length > 0,
+    'the regex found no `file:` entries — if songs.ts was restructured this '
+    + 'guard is no longer reading it and must be updated');
+
+  for (const f of unique) {
+    check(`track played by the engine is credited: ${f}`,
+      music.some((m) => m.file === `models/music/${f}`),
+      `src/game/music/songs.ts plays models/music/${f} but audio-credits.json has `
+      + 'no music entry for it. Shipping audio without recording where it came '
+      + 'from is exactly what this manifest exists to prevent.');
+  }
+  for (const m of music) {
+    const base = String(m.file).replace(/^models\/music\//, '');
+    check(`credited track is actually played: ${base}`, unique.includes(base),
+      `${m.file} is credited but songs.ts never plays it — delete the entry or `
+      + 'wire the track up');
+  }
+}
+
+// ...and when the vendored files ARE present, the records must point at bytes.
+const MUSIC_DIR = path.join(ROOT, 'models', 'music');
+if (existsSync(MUSIC_DIR)) {
+  for (const m of music) {
+    check(`music file on disk: ${m.id}`, existsSync(path.join(ROOT, m.file)),
+      `${m.file} is credited but absent — run npx tsx scripts/prepare-music.mts`);
+  }
+  const strays = readdirSync(MUSIC_DIR)
+    .filter((f) => AUDIO_EXT.has(path.extname(f).toLowerCase()));
+  for (const f of strays) {
+    check(`vendored track is credited: ${f}`,
+      music.some((m) => m.file === `models/music/${f}`),
+      `models/music/${f} would be packed into the depot with no provenance record`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Self-test of the forbidden patterns
 // ---------------------------------------------------------------------------
 //

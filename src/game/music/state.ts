@@ -198,6 +198,34 @@ function clamp01(v: number): number {
 }
 
 /**
+ * A transient recolouring of the bed, owned by the interlude controller.
+ *
+ * This is how a song handoff is expressed without the game state knowing
+ * anything about it: the interlude asks for the bed to thin (layerScale) and,
+ * one bar before the song enters, to re-voice into the song's key
+ * (tonicMidi + chordRoot + mode). Everything else — the bar quantisation, the
+ * fade shapes, the arranger — is untouched and does not know a song exists.
+ *
+ * It is NOT part of MusicState: the game never sets it, and it must not
+ * participate in `sameState` change detection or every handoff would look like
+ * a region change to the scheduler.
+ */
+export interface BedOverride {
+  /** Multiplies each layer's matrix gain. Absent layers are left alone. */
+  layerScale?: Partial<Record<LayerId, number>>;
+  /** Re-voice the bed to this tonic (the song's, during a handoff). */
+  tonicMidi?: number;
+  /** Force the harmony to a single degree — 0 pins the pad to the tonic. */
+  chordRoot?: number;
+  /**
+   * Force the mode. The pivot uses 'aeolian', which makes padBar's `warm` test
+   * false and so voices root + FIFTH rather than root + third — an open fifth,
+   * which is consonant under a major song and a minor one alike.
+   */
+  mode?: ModeName;
+}
+
+/**
  * Resolve a state into a bar plan. PURE — same inputs, same plan, always.
  *
  * Time of day and weather are deliberately gentle modifiers on top of the
@@ -205,7 +233,7 @@ function clamp01(v: number): number {
  * and lifts the pad; rain pulls back the bright plucks (they would fight the
  * rain-noise bed in audio-engine.ts anyway) and thickens the pad.
  */
-export function planBar(bar: number, state: MusicState): BarPlan {
+export function planBar(bar: number, state: MusicState, override?: BedOverride | null): BarPlan {
   const cfg = REGION_CONFIG[state.region];
   const night = isNight(state.tod);
   const rain = Math.max(0, Math.min(1, state.weather));
@@ -220,6 +248,13 @@ export function planBar(bar: number, state: MusicState): BarPlan {
     tension: clamp01(base.tension + (night ? 0.04 : 0)),
   };
 
+  if (override?.layerScale) {
+    for (const id of LAYERS) {
+      const s = override.layerScale[id];
+      if (s !== undefined) gains[id] = clamp01(gains[id]! * s);
+    }
+  }
+
   // Night drops the melody an octave in the lit, domestic regions — the tune
   // goes from sung to hummed. The wilds are already high; the dungeon is
   // already low; neither moves.
@@ -233,11 +268,11 @@ export function planBar(bar: number, state: MusicState): BarPlan {
     bar,
     region: state.region,
     intensity: state.intensity,
-    mode: cfg.mode,
-    tonicMidi: cfg.tonicMidi,
+    mode: override?.mode ?? cfg.mode,
+    tonicMidi: override?.tonicMidi ?? cfg.tonicMidi,
     bpm,
     secPerBar,
-    chordRoot: cfg.progression[bar % cfg.progression.length]!,
+    chordRoot: override?.chordRoot ?? cfg.progression[bar % cfg.progression.length]!,
     progression: cfg.progression,
     gains,
     melodyOctave: cfg.melodyOctave + nightDrop,

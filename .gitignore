@@ -15,6 +15,13 @@ test-fixtures/vision-gemma4-golden.json
 # repo-local model drop dir — keep the README, ignore the weights
 models/*
 !models/README.md
+# ...but the soundtrack DOES ship from here. These are the developer's own
+# compositions (21 MB, vendored from the gitignored music-src/ masters by
+# `npx tsx scripts/prepare-music.mts`) and the depot cannot be built without
+# them. The re-include must name the DIRECTORY: `models/*` excludes
+# `models/music` itself, and git does not descend into an excluded directory,
+# so a bare `!models/music/**` would never match anything.
+!models/music/
 
 # build + runtime artifacts (standalone repo)
 dist/
@@ -89,3 +96,4 @@ scripts/_*.mts
 dist-steam/
 dist-steam-tmp/
 *.tgz
+music-src/

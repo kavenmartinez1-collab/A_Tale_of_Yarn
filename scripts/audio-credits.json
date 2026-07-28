@@ -32,7 +32,22 @@
     "belongs in the same manifest. They are kept out of 'credits' on purpose:",
     "'credits' is deep-equality-checked against AUDIO_CREDITS in sfx.ts, which",
     "is what the in-game credits panel renders, and a 63 MB ONNX file is not a",
-    "sound effect."
+    "sound effect.",
+    "",
+    "'music' is a THIRD list, on the same principle. It is the soundtrack: four",
+    "compositions written and recorded by the developer, vendored into",
+    "models/music/ from the gitignored music-src/ masters. They are kept out of",
+    "'credits' for two reasons, both hard:",
+    "  1. 'credits' is deep-equality-checked against AUDIO_CREDITS in sfx.ts,",
+    "     which is another agent's file - mirroring music into it would couple",
+    "     the soundtrack to a live edit surface for no benefit;",
+    "  2. policy.allowed is a list of PUBLIC licences for third-party material.",
+    "     The developer's own work is not licensed TO the project at all; they",
+    "     own it outright. Forcing it through an allow-list built to vet",
+    "     strangers' CC terms would be a category error.",
+    "The provenance requirement is met the same way it is for the voices: every",
+    "shipped audio asset has an auditable entry naming its author, its rights",
+    "status and where it came from."
   ],
 
   "policy": {
@@ -63,6 +78,88 @@
   ],
 
   "credits": [],
+
+  "musicPolicy": {
+    "allowed": [
+      "All rights reserved - developer-owned"
+    ],
+    "why": [
+      "The soundtrack is the developer's own work, composed and recorded by",
+      "Kaven Martinez while at college, with full rights retained. There is no",
+      "third-party licence to vet and no attribution obligation to a stranger:",
+      "the project is not licensing this music, it owns it.",
+      "",
+      "So the guard on this list is not a licence allow-list. It checks the",
+      "things that could actually go wrong with self-owned material:",
+      "  - that every entry names an author and states the rights position,",
+      "  - that every file it names is really in models/music/,",
+      "  - that every file in models/music/ is really credited (no orphans),",
+      "  - that the entries agree with src/game/music/songs.ts, so the credits",
+      "    panel and the engine cannot disagree about what is playing, and",
+      "  - that no entry sneaks in under a forbidden licence pattern anyway,",
+      "    which is what would catch a third-party track being added here by",
+      "    mistake instead of to 'credits' where it would be properly vetted."
+    ]
+  },
+
+  "music": [
+    {
+      "id": "500nm",
+      "file": "models/music/500nanometers.mp3",
+      "title": "500 nanometers",
+      "author": "Kaven Martinez",
+      "rights": "self-composed, all rights held by the developer",
+      "licence": "All rights reserved - developer-owned",
+      "source": "music-src/500nanometers.mp3",
+      "role": "overworld interlude, first in the rotation",
+      "key": "F minor",
+      "bpm": 70,
+      "durationS": 220.402,
+      "note": "Vendored bit-exact from the master; the -9.58 dB playback trim is applied at runtime, so the shipped bytes are the developer's own render with no re-encode."
+    },
+    {
+      "id": "ryan",
+      "file": "models/music/ryans-song.mp3",
+      "title": "Ryan's song",
+      "author": "Kaven Martinez",
+      "rights": "self-composed, all rights held by the developer",
+      "licence": "All rights reserved - developer-owned",
+      "source": "music-src/Ryan's song.mp3",
+      "role": "overworld interludes two and three — split at its 74.93 s structural break into segments A and B",
+      "key": "E-flat minor",
+      "bpm": 64,
+      "durationS": 225.937,
+      "note": "Vendored bit-exact from the master; -10.08 dB playback trim applied at runtime."
+    },
+    {
+      "id": "untitled",
+      "file": "models/music/untitled-song.mp3",
+      "title": "Untitled Song",
+      "author": "Kaven Martinez",
+      "rights": "self-composed, all rights held by the developer",
+      "licence": "All rights reserved - developer-owned",
+      "source": "music-src/Untitled Song.mp3",
+      "role": "the dungeon track, looped seamlessly across bars 3 to 29",
+      "key": "C major",
+      "bpm": 115,
+      "durationS": 66.782,
+      "note": "Vendored bit-exact from the master; -11.38 dB playback trim applied at runtime. Loop seam measured at +2.5% RMS deviation with no discontinuity."
+    },
+    {
+      "id": "castle",
+      "file": "models/music/castle-vhaeron.mp3",
+      "title": "Castle Vhaeron",
+      "author": "Kaven Martinez",
+      "rights": "self-composed, all rights held by the developer",
+      "licence": "All rights reserved - developer-owned",
+      "source": "music-src/Project 1 Logic Kaven MartinezWAVE (1).mp3",
+      "role": "Castle Vhaeron's theme",
+      "key": "A / E (fifth-ambiguous)",
+      "bpm": 117.5,
+      "durationS": 76.069,
+      "note": "Currently the raw master, vendored bit-exact; -2.89 dB playback trim applied at runtime. prepare-music.mts prefers music-src/processed/project1-castle.wav the moment an edited version exists, and encodes it once from lossless."
+    }
+  ],
 
   "voiceModelPolicy": {
     "allowed": [

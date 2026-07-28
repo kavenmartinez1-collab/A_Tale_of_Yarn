@@ -567,6 +567,47 @@ if (!SKIP_CHAT && !RELEASE && boot.debugPresent && chat?.changed && VOICE_FIXTUR
         : `${rel} is ABSENT from the depot`);
   }
 
+  // ─── the soundtrack ───
+  //
+  // The developer's own compositions. A missing song is the quietest possible
+  // failure: the procedural engine is designed to cover for a track that will
+  // not load, so the depot builds, launches and plays normally and the only
+  // symptom is that the music they wrote never arrives. Bytes on disk, floors
+  // in MB so a truncated copy fails too, plus a manifest cross-check so the
+  // levels the engine plans against are the levels of the files that shipped.
+  const MUSIC_FILES = [
+    ['music/500nanometers.mp3', 'the first overworld interlude', 8],
+    ['music/ryans-song.mp3', "Ryan's song, both segments", 8],
+    ['music/untitled-song.mp3', 'the looped dungeon track', 2],
+    ['music/castle-vhaeron.mp3', "Castle Vhaeron's theme", 1],
+  ];
+  for (const [rel, why, minMB] of MUSIC_FILES) {
+    const abs = path.join(DEPOT_MODELS, ...rel.split('/'));
+    const mb = fs.existsSync(abs) ? fs.statSync(abs).size / (1024 * 1024) : 0;
+    ok(`depot ships the music for ${why}`, mb >= minMB,
+      fs.existsSync(abs)
+        ? `${rel} is ${mb.toFixed(1)} MB, expected >= ${minMB} MB`
+        : `${rel} is ABSENT from the depot`);
+  }
+  {
+    const abs = path.join(DEPOT_MODELS, 'music', 'manifest.json');
+    let manifest = null;
+    try { manifest = JSON.parse(fs.readFileSync(abs, 'utf8')); } catch { /* absent */ }
+    const entries = manifest?.entries ?? [];
+    ok('depot ships the music manifest', entries.length === MUSIC_FILES.length,
+      `${entries.length} entries, expected ${MUSIC_FILES.length}`);
+    // Every entry must describe a file that actually made it, at its recorded
+    // size — this is what catches a stale manifest paired with fresh audio.
+    const mismatched = entries.filter((e) => {
+      const p = path.join(DEPOT_MODELS, 'music', e.file);
+      return !fs.existsSync(p) || fs.statSync(p).size !== e.bytes;
+    });
+    ok('every manifest entry matches the bytes in the depot', mismatched.length === 0,
+      mismatched.length
+        ? `stale or missing: ${mismatched.map((e) => e.file).join(', ')}`
+        : `${entries.length} files, sizes agree`);
+  }
+
   const spoken = chat?.reply ?? 'The well is dry again, friend.';
   const t0 = Date.now();
   const probe = await page.evaluate(async (text) => {
