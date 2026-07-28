@@ -20,7 +20,7 @@
 
 import { box, capsule, cylinder, sphere } from './mesh-utils';
 import type { PlacedFire } from './fire';
-import type { PlacedTent } from './shelter';
+import { tentBox, type PlacedTent } from './shelter';
 
 // Palette ids fed to buildFireMeshes / buildTentMeshes (dungeon shader palette indices).
 export const PAL_FIRE_STONE = 0;  // stone grey (ring, chimney)
@@ -106,22 +106,36 @@ export function buildTentMeshes(
     const cloth = get(clothPal);
     const pole  = get(PAL_TENT_POLE);
 
+    // Footprint comes from shelter.ts's TENT_BOX, NOT from literals here.
+    // `tentRoofAt` tests the player against exactly these numbers to decide
+    // whether the rain stops, so a tent drawn one size and sheltering another
+    // is a bug the player experiences as rain falling through canvas. One
+    // table, two readers.
+    const b = tentBox(t);
+    const hx = b.hx;          // half-width  (X)
+    const hz = b.hz;          // half-depth  (Z)
+    const ridge = b.h;        // ridge height (Y)
+    // The canvas stops a hand's breadth inside the box on each axis so the
+    // shelter test never fires on a point outside the visible cloth.
+    const wallZ = hz - 0.1;
+    const eave = ridge * 0.94;
+
     // Triangular prism tent body approximated with 3 boxes (flat canvas
     // panels — boxes are the right primitive here, no round shape fits):
     // - Left sloped panel
-    box(cloth, x - 1.2, y,       z - 0.8, x - 0.05, y + 1.6, z + 0.8);
+    box(cloth, x - hx, y,        z - wallZ, x - 0.05, y + eave, z + wallZ);
     // - Right sloped panel (slightly overlapping the left to fill the ridge)
-    box(cloth, x + 0.05, y,      z - 0.8, x + 1.2,  y + 1.6, z + 0.8);
+    box(cloth, x + 0.05, y,      z - wallZ, x + hx,   y + eave, z + wallZ);
     // - Ridge cap
-    box(cloth, x - 0.15, y + 1.4, z - 0.85, x + 0.15, y + 1.7, z + 0.85);
+    box(cloth, x - 0.15, y + eave - 0.2, z - hz, x + 0.15, y + ridge, z + hz);
 
     // Front and back triangular end faces (approximated as tapered boxes)
-    box(cloth, x - 0.8, y, z - 0.9, x + 0.8, y + 0.8, z - 0.80);
-    box(cloth, x - 0.8, y, z + 0.80, x + 0.8, y + 0.8, z + 0.9);
+    box(cloth, x - hx * 0.67, y, z - hz,          x + hx * 0.67, y + ridge * 0.47, z - wallZ);
+    box(cloth, x - hx * 0.67, y, z + wallZ,       x + hx * 0.67, y + ridge * 0.47, z + hz);
 
     // Centre poles (front + back) — round cylinders instead of square posts.
-    cylinder(pole, x, y, z - 0.79, 0.06, 0.04, 1.65, 6, false, true);
-    cylinder(pole, x, y, z + 0.79, 0.06, 0.04, 1.65, 6, false, true);
+    cylinder(pole, x, y, z - wallZ + 0.01, 0.06, 0.04, ridge - 0.05, 6, false, true);
+    cylinder(pole, x, y, z + wallZ - 0.01, 0.06, 0.04, ridge - 0.05, 6, false, true);
   }
 
   return [...buckets.entries()]

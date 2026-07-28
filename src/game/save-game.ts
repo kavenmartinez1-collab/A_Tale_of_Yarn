@@ -51,6 +51,15 @@ export const GAME_STATE_KEYS: readonly string[] = [
   // The Tintreach shot counter: one artifact per save, and the seed every bolt
   // is drawn from, so it has to travel with the slot.
   'artifex-tintreach:v1',
+  // The crafting tree's discovery record — which recipes this save has found
+  // and which it has made. Same argument as the map: loading an old save must
+  // restore the tree that save had, and a New Game must show a virgin one, or
+  // "discovery" is a machine-wide setting rather than a thing you did.
+  'artifex-progress:v1',
+  // Placed looms — the T3 station. Alongside 'artifex-fires:v1' and
+  // 'artifex-tents:v1' for the same reason: a station you built is part of the
+  // save you built it in.
+  'artifex-looms:v1',
 ];
 
 export const SAVE_SLOT_COUNT = 3;

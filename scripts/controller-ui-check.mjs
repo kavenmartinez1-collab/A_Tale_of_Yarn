@@ -681,6 +681,78 @@ await frames(12);
     r.hit ? 'a craftable recipe is reachable from the tabs'
       : 'no craftable recipe on this page to focus (disabled rows are skipped by design)',
     `path: ${r.seen.join(' → ')}`);
+  // ── The tier view, and locked rows ──────────────────────────────────────
+  //
+  // The panel now groups each page by the rung of the progression tree a
+  // recipe sits on, and draws UNDISCOVERED recipes as greyed silhouettes with
+  // their requirement instead of hiding them. That last part matters to the
+  // pad specifically: `ui-focus.ts` SKIPS `disabled` controls by a deliberate
+  // rule, so a locked row rendered as `disabled` would be invisible to the
+  // ring and the player could never read WHY it is locked. Locked rows
+  // therefore carry `.locked` + `aria-disabled` and stay focusable — and must
+  // never craft when A is pressed on them.
+  {
+    // Walk to a page that actually has a locked row. Camp holds the loom tier,
+    // which nothing in the starting pack can open.
+    await page.evaluate(() => {
+      document.querySelector('#crafting-panel .craft-tab[data-category="camp"]')?.click();
+    });
+    await frames(10);
+
+    const layout = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('#crafting-panel .recipe')];
+      const heads = [...document.querySelectorAll('#crafting-panel .tier-head')];
+      const locked = rows.filter((r) => r.dataset.locked === '1');
+      return {
+        tiers: heads.map((h) => h.querySelector('span')?.textContent ?? '?'),
+        counts: heads.map((h) => h.querySelector('.tier-count')?.textContent ?? '?'),
+        rows: rows.length,
+        locked: locked.length,
+        // A locked row must say why, and its button must NOT be `disabled`.
+        sample: locked[0] === undefined ? null : {
+          key: locked[0].dataset.recipe,
+          req: locked[0].querySelector('.r-req')?.textContent ?? '',
+          btnText: locked[0].querySelector('.r-craft')?.textContent ?? '',
+          btnDisabled: locked[0].querySelector('.r-craft')?.disabled ?? null,
+          aria: locked[0].querySelector('.r-craft')?.getAttribute('aria-disabled'),
+        },
+      };
+    });
+    say(layout.tiers.length >= 3, 'the page is grouped into tiers of the tree',
+      `${layout.tiers.join(' / ')}  counts ${layout.counts.join(' ')}`);
+    say(layout.locked > 0, 'undiscovered recipes are DRAWN, not hidden',
+      `${layout.locked} of ${layout.rows} rows on this page are locked`);
+    say(layout.sample !== null && layout.sample.req.length > 0,
+      'and each says what would unlock it',
+      `${layout.sample?.key}: ${JSON.stringify(layout.sample?.req)}`);
+    say(layout.sample !== null && layout.sample.btnDisabled === false
+      && layout.sample.aria === 'true',
+      'a locked row is aria-disabled but NOT `disabled` — so the ring can reach it',
+      `btn="${layout.sample?.btnText}" disabled=${layout.sample?.btnDisabled}`
+      + ` aria-disabled=${layout.sample?.aria}`
+      + ' (ui-focus.ts skips `disabled`, which would make locked rows unreadable)');
+
+    // Drive the ring onto a locked row and press A. Nothing may be crafted.
+    const r = await focusUntil(B.DOWN, (f) => /Locked/.test(f.label), 30);
+    say(r.hit, 'the focus ring lands on a locked recipe',
+      `path: ${r.seen.slice(-6).join(' → ')}`);
+    if (r.hit) {
+      const before = await D(() => window.__gameDebug.progressStats());
+      const invBefore = await D(() => JSON.stringify(window.__gameDebug.inventory()));
+      await tap(B.A);
+      await frames(14);
+      const after = await D(() => window.__gameDebug.progressStats());
+      const invAfter = await D(() => JSON.stringify(window.__gameDebug.inventory()));
+      say(after.crafted === before.crafted && invBefore === invAfter,
+        'and A on it crafts NOTHING — it reads as locked and stays locked',
+        `crafted ${before.crafted} → ${after.crafted}, inventory unchanged=`
+        + `${invBefore === invAfter}`);
+      say(await page.evaluate(() => document.getElementById('crafting-panel') !== null),
+        'and the panel is still open (a dead press, not a dismissal)');
+    }
+    await shot('08b-crafting-tiers-locked');
+  }
+
   await tap(B.X);
   await frames(10);
   const closed = await page.evaluate(() => document.getElementById('crafting-panel') === null);

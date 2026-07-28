@@ -50,7 +50,7 @@ for (const r of RECIPES) {
     r.inputs.length > 0
     && r.inputs.every(([id, n]) => isGameItemId(id) && n >= 1));
   check(`recipe has station: ${r.output}`,
-    ['hand', 'fire', 'forge'].includes(r.station));
+    ['hand', 'fire', 'forge', 'loom'].includes(r.station));
   check(`recipe has category: ${r.output}`,
     ['tools', 'weapons', 'armor', 'food', 'camp'].includes(r.category));
 }

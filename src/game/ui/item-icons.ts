@@ -725,6 +725,59 @@ function drawTent(ctx: Ctx, c: C3): void {
   rrect(ctx, 34, 36, 4, 5, css(WOOD));
 }
 
+/**
+ * A bolt of woven cloth — a folded length with the weave picked out.
+ *
+ * Deliberately not the thread spool: at 32 px the two would be one item, and
+ * the whole point of the loom is that thread and cloth are different things.
+ * Folded selvedge + a cross-hatch reads as fabric where a barrel reads as yarn.
+ */
+function drawCloth(ctx: Ctx, c: C3): void {
+  rrect(ctx, 8, 16, 32, 9, css(c));            // top fold
+  rrect(ctx, 8, 25, 32, 9, css(c, 0.86));      // under fold (shaded)
+  poly(ctx, [[40, 16], [44, 20], [44, 30], [40, 25]], css(c, 0.72)); // rolled end
+  // Weave: warp then weft, one pass each, in the cloth's own colour lightened.
+  ctx.strokeStyle = css(c, 1.18);
+  ctx.lineWidth = 1;
+  for (const x of [14, 20, 26, 32, 38]) {
+    ctx.beginPath();
+    ctx.moveTo(x, 16);
+    ctx.lineTo(x, 34);
+    ctx.stroke();
+  }
+  for (const y of [19, 22, 28, 31]) {
+    ctx.beginPath();
+    ctx.moveTo(8, y);
+    ctx.lineTo(40, y);
+    ctx.stroke();
+  }
+}
+
+/**
+ * The loom, flat-packed: two uprights, a top beam, and the warp strung
+ * between them with the shed opened. The warp threads are cream on wood so
+ * the silhouette says "frame with string in it" at icon size.
+ */
+function drawLoomKit(ctx: Ctx, c: C3): void {
+  rrect(ctx, 8, 10, 32, 5, css(c, 0.85));   // top beam
+  rrect(ctx, 8, 34, 32, 5, css(c, 0.85));   // cloth beam
+  rrect(ctx, 8, 10, 5, 29, css(c));         // left upright
+  rrect(ctx, 35, 10, 5, 29, css(c));        // right upright
+  // Warp threads, alternating front/back of the shed rod.
+  ctx.strokeStyle = css([0.90, 0.87, 0.80]);
+  ctx.lineWidth = 1.5;
+  for (let i = 0; i < 4; i++) {
+    const x = 17 + i * 5;
+    ctx.beginPath();
+    ctx.moveTo(x, 15);
+    ctx.lineTo(x + (i % 2 === 0 ? 2 : -2), 24);
+    ctx.lineTo(x, 34);
+    ctx.stroke();
+  }
+  // Heddle rod — the iron the forge is for.
+  rrect(ctx, 13, 22, 22, 3, css([0.68, 0.70, 0.74]));
+}
+
 /** Cooking pot — dark cauldron shape. */
 function drawCookingPot(ctx: Ctx, c: C3): void {
   // Handles
@@ -981,6 +1034,11 @@ export const ICON_DRAWERS: Record<GameItemId, (ctx: Ctx) => void> = {
   fiber_tent:   (ctx) => { drawTent(ctx, [0.55, 0.60, 0.40]); },
   wool_tent:    (ctx) => { drawTent(ctx, [0.75, 0.72, 0.65]); },
   hide_tent:    (ctx) => { drawTent(ctx, [0.58, 0.42, 0.28]); },
+  canvas_tent:  (ctx) => { drawTent(ctx, [0.80, 0.76, 0.66]); },
+
+  // The loom tier
+  loom_kit:     (ctx) => { drawLoomKit(ctx, [0.60, 0.46, 0.30]); },
+  cloth:        (ctx) => { drawCloth(ctx, [0.86, 0.83, 0.76]); },
 
   // Weapons (Phase E)
   // The two quivers share `drawArrow` and are told apart by tint alone: pale
@@ -1003,6 +1061,11 @@ export const ICON_DRAWERS: Record<GameItemId, (ctx: Ctx) => void> = {
   leather_cap:      (ctx) => { drawArmorHead(ctx, [0.55, 0.38, 0.22]); },
   leather_tunic:    (ctx) => { drawArmorBody(ctx, [0.52, 0.36, 0.20]); },
   leather_leggings: (ctx) => { drawArmorLegs(ctx, [0.50, 0.34, 0.18]); },
+
+  // Armor: quilted tier (the loom's)
+  quilted_hood:     (ctx) => { drawArmorHead(ctx, [0.66, 0.34, 0.30]); },
+  quilted_tunic:    (ctx) => { drawArmorBody(ctx, [0.62, 0.31, 0.28]); },
+  quilted_leggings: (ctx) => { drawArmorLegs(ctx, [0.58, 0.29, 0.26]); },
 
   // Armor: iron tier
   iron_helm:  (ctx) => { drawArmorHead(ctx, [0.68, 0.70, 0.74]); },
