@@ -204,10 +204,69 @@ convention at `main.ts:948`.
 - Safe to call `update()` before the first bar, at any frame rate, with any
   state, including state that changes every frame.
 
-## 7. Verify after wiring
+---
+
+## 7. The soundtrack — the developer's own recordings
+
+Four compositions by Kaven Martinez now play through this engine as decoded
+buffers, on the layer seam `layer.ts` always described. **This needs no wiring
+changes at all** — no new call, no new state field, no `main.ts` edit beyond
+what §1–§5 already describe. It is entirely inside `music.update(state, nowS)`.
+
+### What plays where
+
+| region | what | how |
+|---|---|---|
+| wilds, village | `500nanometers` → `Ryan's song A` → `Ryan's song B`, cycling | an interlude every ~4 min of bed (240 s ± a seeded 40 s jitter) |
+| dungeon | `Untitled Song` | on entry, looped seamlessly (bars 3→29, 1.043 s crossfade) |
+| castle | `Castle Vhaeron` | on entry |
+| interior | nothing — the procedural bed only | |
+
+### Assets
+
+`models/music/` holds the vendored copies (**21.04 MB**, the depot delta),
+produced from the gitignored `music-src/` masters by:
 
 ```
-npx tsx scripts/test-music.mts              # 198 assertions, ~1m45s
-npx tsx scripts/export-music-midi.mts       # 140 .mid stems + README
-npx tsx scripts/render-music-audition.mts   # 17 WAVs + index.html (needs Chrome)
+npx tsx scripts/prepare-music.mts
 ```
+
+They are served over the path both servers already answer —
+`/api/hf-cache/local/music/resolve/main/<file>` — so neither `dev-server.ts`
+nor `app/steam/local-server.cjs` needed a change. `pack-steam.mjs` copies the
+directory explicitly (its `d.includes('--')` rule is about HuggingFace repo ids
+and would have dropped it silently) and refuses to build a depot without it.
+
+Decoding is lazy and non-blocking: `decodeAudioData` per region, on first
+schedule or first entry, cached. **A track that fails to load is never
+scheduled and the procedural bed simply keeps playing** — there is no code path
+where music stops because a file was missing or slow.
+
+### Two things worth knowing if you touch this
+
+**The keys are not what the brief assumed.** Measured: 500nanometers is F
+minor, Ryan's song E-flat minor, Untitled Song C major, Project 1 A/E. They do
+not share a tonic, so the bed's D is unchanged and the pad instead *modulates
+into each song's key* for the handoff, as an open fifth. The full measurement
+and reasoning is in the `KEYS` block at the top of `songs.ts`. Do not "fix"
+this by retuning the engine.
+
+**`duck()` still means speech.** Combat and boss intensity duck the song on a
+separate bus trim (`SONG_DUCK_FLOOR`), so a fight and an NPC talking do not
+fight over the same gain node. Nothing external needs to call it.
+
+---
+
+## 8. Verify after wiring
+
+```
+npx tsx scripts/test-music.mts                 # 290 assertions, ~35 s
+npx tsx scripts/prepare-music.mts              # vendors + measures the soundtrack
+npx tsx scripts/render-music-integration.mts   # 5 demonstration WAVs + index.html
+npx tsx scripts/export-music-midi.mts          # 140 .mid stems + README
+npx tsx scripts/render-music-audition.mts      # 17 WAVs + index.html (needs Chrome)
+```
+
+`render-music-integration` is the one a human should actually listen to:
+`scripts/shots/music-integration/index.html`. Its gates only prove nothing is
+broken — whether the handoffs *flow* is a listening judgement.

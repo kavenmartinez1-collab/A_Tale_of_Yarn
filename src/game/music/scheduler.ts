@@ -29,7 +29,16 @@ import {
   type LayerSource,
   type Onset,
 } from './layer';
-import { DEFAULT_STATE, LAYERS, planBar, sameState, type BarPlan, type LayerId, type MusicState } from './state';
+import {
+  DEFAULT_STATE,
+  LAYERS,
+  planBar,
+  sameState,
+  type BarPlan,
+  type BedOverride,
+  type LayerId,
+  type MusicState,
+} from './state';
 import { makeNoiseBuffer } from './voices';
 
 /** Dispatch window: onsets starting within this are handed to WebAudio. */
@@ -86,6 +95,13 @@ export class MusicScheduler {
   private started = false;
   private nextBar = 0;
   private nextBarTime = 0;
+  /**
+   * The interlude's transient recolouring of the bed. Not part of MusicState
+   * on purpose — see the BedOverride doc in state.ts.
+   */
+  private override: BedOverride | null = null;
+  /** Bar-indexed override commits, mirroring `commits` for state. */
+  private overrideCommits: { bar: number; o: BedOverride | null }[] = [];
   private requested: MusicState = { ...DEFAULT_STATE };
   private commits: { bar: number; state: MusicState }[] = [];
   private readonly _transitions: Transition[] = [];
@@ -140,6 +156,92 @@ export class MusicScheduler {
     return this._barTimes[bar];
   }
 
+  /** The first bar that has not been planned yet, and when it starts. */
+  get upcomingBar(): number {
+    return this.nextBar;
+  }
+
+  get upcomingBarTime(): number {
+    return this.nextBarTime;
+  }
+
+  /**
+   * Downbeat time of any bar — exact for bars already planned, predicted for
+   * bars beyond the horizon by accumulating real bar durations (the same walk
+   * commitTransition uses).
+   *
+   * The interlude places its stages on BAR INDICES and re-reads their times
+   * every frame, so a tempo change between the decision and the handoff moves
+   * the stages with the grid instead of desynchronising them.
+   */
+  predictBarTime(bar: number): number {
+    const known = this._barTimes[bar];
+    if (known !== undefined) return known;
+    let b = this.nextBar;
+    let t = this.nextBarTime;
+    let guard = 0;
+    while (b < bar && guard++ < 4096) {
+      t += planBar(b, this.stateForBar(b), this.override).secPerBar;
+      b++;
+    }
+    return t;
+  }
+
+  /** The first downbeat at or after `t`, as a bar index. */
+  barIndexAtOrAfter(t: number): number {
+    let b = this.nextBar;
+    let time = this.nextBarTime;
+    let guard = 0;
+    while (time < t && guard++ < 4096) {
+      time += planBar(b, this.stateForBar(b), this.override).secPerBar;
+      b++;
+    }
+    return b;
+  }
+
+  /** Bar length under the state in force right now. */
+  get secPerBarNow(): number {
+    return planBar(this.nextBar, this.stateForBar(this.nextBar), this.override).secPerBar;
+  }
+
+  /**
+   * Install the interlude's bed recolouring, taking effect ON BAR `fromBar`,
+   * and ramp every layer to the resulting targets across [t0, t1].
+   *
+   * The commit is bar-indexed for the same reason a state change is: the
+   * pitch-affecting fields (tonic, mode, chordRoot) must change exactly when
+   * the pad's next note is generated, not whenever the interlude happened to
+   * call. Installing them immediately re-voiced the pad up to half a bar early
+   * and the modulation arrived before the fade that was supposed to cover it.
+   *
+   * `t1` is always a bar downbeat supplied by the interlude, so the bed thins
+   * and thickens exactly on the bar line — the same guarantee a state change
+   * gets, reusing the same modelled ramps rather than a second fade system.
+   */
+  setBedOverride(o: BedOverride | null, fromBar: number, t0: number, t1: number): void {
+    this.overrideCommits.push({ bar: fromBar, o });
+    if (this.overrideCommits.length > 8) {
+      this.overrideCommits.splice(0, this.overrideCommits.length - 8);
+    }
+    this.override = o;
+    const plan = planBar(fromBar, this.stateForBar(fromBar), o);
+    for (const id of LAYERS) this.bus.fadeTo(id, plan.gains[id], t0, t1);
+  }
+
+  /** The override in force on a given bar. */
+  overrideForBar(bar: number): BedOverride | null {
+    let o: BedOverride | null = null;
+    for (const c of this.overrideCommits) {
+      if (c.bar <= bar) o = c.o;
+      else break;
+    }
+    return o;
+  }
+
+  get bedOverride(): BedOverride | null {
+    return this.override;
+  }
+
   // ------------------------------------------------------------------ update
 
   update(state: MusicState, nowS: number): void {
@@ -177,7 +279,7 @@ export class MusicScheduler {
 
     // Fade the whole arrangement up across the first bar rather than
     // slamming in at full level.
-    const plan = planBar(0, state);
+    const plan = planBar(0, state, this.override);
     for (const id of LAYERS) {
       this.bus.fadeTo(id, plan.gains[id], this.nextBarTime, this.nextBarTime + plan.secPerBar);
     }
@@ -195,14 +297,14 @@ export class MusicScheduler {
     let t = this.nextBarTime;
     let guard = 0;
     while (t < nowS + MIN_FADE && guard++ < 64) {
-      t += planBar(bar, this.stateForBar(bar)).secPerBar;
+      t += planBar(bar, this.stateForBar(bar), this.override).secPerBar;
       bar++;
     }
 
     this.commits.push({ bar, state: { ...this.requested } });
     if (this.commits.length > 8) this.commits.splice(0, this.commits.length - 8);
 
-    const plan = planBar(bar, this.requested);
+    const plan = planBar(bar, this.requested, this.overrideForBar(bar));
     const fadeStart = Math.max(nowS, t - DESIRED_FADE);
     for (const id of LAYERS) this.bus.fadeTo(id, plan.gains[id], fadeStart, t);
 
@@ -213,7 +315,7 @@ export class MusicScheduler {
   private planNextBar(): void {
     const bar = this.nextBar;
     const barTime = this.nextBarTime;
-    const plan = planBar(bar, this.stateForBar(bar));
+    const plan = planBar(bar, this.stateForBar(bar), this.overrideForBar(bar));
     const notes = arrangeBar(this.seed, plan);
 
     // A layer contributes notes whenever it is audible anywhere in this bar —
@@ -263,7 +365,7 @@ export class MusicScheduler {
 
   private planFor(bar: number): BarPlan {
     if (this.lastPlanned && this.lastPlanned.plan.bar === bar) return this.lastPlanned.plan;
-    return planBar(bar, this.stateForBar(bar));
+    return planBar(bar, this.stateForBar(bar), this.overrideForBar(bar));
   }
 
   /** Latest time any scheduled voice is still sounding — used by renders. */

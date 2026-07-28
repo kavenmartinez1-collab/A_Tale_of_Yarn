@@ -407,6 +407,16 @@ class ShimAudioBuffer {
   }
 }
 
+/**
+ * AudioBufferSource.
+ *
+ * Extended beyond the synth's needs so the SONG side of the engine renders
+ * headlessly too: real stereo (the recordings are stereo, and folding them to
+ * mono would make every level measurement in the render harness a lie), the
+ * three-argument `start(when, offset, duration)` the song player uses to play a
+ * SEGMENT of a file, and linear interpolation between samples so a start offset
+ * that is not an exact sample boundary does not quantise.
+ */
 class ShimAudioBufferSourceNode extends ShimNode {
   buffer: ShimAudioBuffer | null = null;
   readonly playbackRate = new ShimAudioParam(1);
@@ -414,25 +424,28 @@ class ShimAudioBufferSourceNode extends ShimNode {
   private startTime = Infinity;
   private stopTime = Infinity;
   private offset = 0;
+  /** Seconds of the buffer to play from `offset`, or Infinity for all of it. */
+  private duration = Infinity;
 
-  start(when = 0, offset = 0): void {
+  start(when = 0, offset = 0, duration?: number): void {
     this.startTime = when;
     this.offset = offset;
+    if (duration !== undefined) this.duration = duration;
   }
   stop(when = 0): void {
-    this.stopTime = when;
+    this.stopTime = Math.min(this.stopTime, when);
   }
 
   override pullChannels(): number {
-    return 1;
+    return this.buffer?.numberOfChannels ?? 1;
   }
 
   protected process(q: number): void {
-    this.channels = 1;
-    this.ensureOut(1);
-    const out = this.out[0]!;
-    out.fill(0);
     const buf = this.buffer;
+    const nch = buf?.numberOfChannels ?? 1;
+    this.channels = nch;
+    this.ensureOut(nch);
+    for (const ch of this.out) ch.fill(0);
     if (!buf) return;
     if (t0Check(this.stopTime, q, this.ctx.sampleRate)) {
       this.dead = true;
@@ -441,14 +454,31 @@ class ShimAudioBufferSourceNode extends ShimNode {
     const sr = this.ctx.sampleRate;
     const t0 = this.quantumStart(q);
     const dt = 1 / sr;
-    const src = buf.getChannelData(0);
+    // A source that has run past its own duration is finished, exactly as a
+    // real one is — without this the graph never collapses and the render cost
+    // stays quadratic in clip length (see the RETIREMENT note above).
+    if (this.duration !== Infinity && t0 >= this.startTime + this.duration) {
+      this.dead = true;
+      return;
+    }
+    const rate = this.playbackRate.valueAt(t0);
     for (let i = 0; i < QUANTUM; i++) {
       const t = t0 + i * dt;
       if (t < this.startTime || t >= this.stopTime) continue;
-      let pos = (t - this.startTime + this.offset) * sr;
+      const played = (t - this.startTime) * rate;
+      if (played >= this.duration) continue;
+      let pos = (this.offset + played) * buf.sampleRate;
       if (this.loop) pos %= buf.length;
       else if (pos >= buf.length) continue;
-      out[i] = src[Math.floor(pos)] ?? 0;
+      if (pos < 0) continue;
+      const i0 = Math.floor(pos);
+      const frac = pos - i0;
+      for (let c = 0; c < nch; c++) {
+        const src = buf.getChannelData(c);
+        const a = src[i0] ?? 0;
+        const b = src[i0 + 1] ?? a;
+        this.out[c]![i] = a + (b - a) * frac;
+      }
     }
   }
 }

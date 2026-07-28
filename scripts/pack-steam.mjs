@@ -309,12 +309,25 @@ copyDir(appPath, OUT);
 copyDir(PRUNED, path.join(OUT, 'resources', 'dist'));
 
 const MODELS = path.join(REPO, 'models');
+/**
+ * `models/music/` is the SOUNDTRACK, not a weight repo — the developer's own
+ * compositions, vendored by `npx tsx scripts/prepare-music.mts`.
+ *
+ * It has to be named explicitly because the selection rule below is "any
+ * directory whose name contains `--`", which is a rule about HuggingFace repo
+ * ids and knows nothing about music. `models/music` has no `--` in it, so
+ * without this line the depot would build cleanly, launch cleanly, and be
+ * silently missing every song — the same silent-drop failure mode the
+ * REQUIRED_ASSETS list upstairs exists to prevent.
+ */
+const MUSIC_DIR = 'music';
 const shipModels = fs.existsSync(MODELS)
   ? fs.readdirSync(MODELS).filter((d) => {
     // Only the vendored HF-style repos — never the flux2/piper/whisper dirs,
     // which are the playground's and are not on the game path at all.
     const p = path.join(MODELS, d);
-    return fs.statSync(p).isDirectory() && d.includes('--');
+    if (!fs.statSync(p).isDirectory()) return false;
+    return d.includes('--') || d === MUSIC_DIR;
   })
   : [];
 for (const d of SKIP_MODELS ? [] : shipModels) {
@@ -369,6 +382,48 @@ if (!SKIP_MODELS) {
   }
   console.log(`      required voice files present: `
     + `${REQUIRED_MODELS.length}/${REQUIRED_MODELS.length}`);
+}
+
+/**
+ * The soundtrack, asserted the same way and for the same reason.
+ *
+ * These are the developer's OWN recordings. If one fails to reach the depot the
+ * game does not crash and does not go quiet — the procedural engine covers for
+ * it by design (see decode.ts: a song that will not load is simply never
+ * scheduled). That is exactly what makes a silent drop dangerous here: the
+ * build, the launch and the first hour of play all look completely normal, and
+ * the only symptom is that the music the developer wrote never plays.
+ *
+ * Sizes are floors, in MB, so a truncated or zero-length copy fails too.
+ * Sourced from models/music/manifest.json, which prepare-music.mts writes.
+ */
+const REQUIRED_MUSIC = [
+  ['500nanometers.mp3', 'the first overworld interlude', 8],
+  ['ryans-song.mp3', "Ryan's song — overworld interludes two and three", 8],
+  ['untitled-song.mp3', 'the dungeon track, seamlessly looped', 2],
+  ['castle-vhaeron.mp3', "Castle Vhaeron's theme", 1],
+  ['manifest.json', 'the measured levels and durations the engine plans against', 0],
+];
+if (!SKIP_MODELS) {
+  const musicDir = path.join(OUT, 'resources', 'models', MUSIC_DIR);
+  const badMusic = REQUIRED_MUSIC.filter(([file, , minMB]) => {
+    const p = path.join(musicDir, file);
+    if (!fs.existsSync(p)) return true;
+    return fs.statSync(p).size < minMB * 1024 * 1024;
+  });
+  for (const [file, why, minMB] of badMusic) {
+    const p = path.join(musicDir, file);
+    const got = fs.existsSync(p) ? `${(fs.statSync(p).size / 1048576).toFixed(2)} MB` : 'ABSENT';
+    console.error(`      MISSING  models/music/${file} — ${why} (${got}, need >= ${minMB} MB)`);
+  }
+  if (badMusic.length) {
+    console.error('\npack-steam: refusing to build a depot without the developer\'s soundtrack.');
+    console.error('            run `npx tsx scripts/prepare-music.mts` and pack again.\n');
+    process.exit(1);
+  }
+  console.log(`      required music files present: `
+    + `${REQUIRED_MUSIC.length}/${REQUIRED_MUSIC.length} `
+    + `(${fmt(dirSize(musicDir).total)})`);
 }
 
 // steam_appid.txt must sit next to the executable: the Steam API looks for it
