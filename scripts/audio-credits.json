@@ -49,36 +49,50 @@
     "shipped audio asset has an auditable entry naming its author, its rights",
     "status and where it came from."
   ],
-
   "policy": {
     "allowed": [
       "CC0-1.0",
       "CC-BY-4.0"
     ],
     "forbiddenPatterns": [
-      { "pattern": "NC / NonCommercial", "why": "Commercial Steam release. NC forbids it outright." },
-      { "pattern": "SA / ShareAlike", "why": "Copyleft on a derivative in a closed-source build." },
-      { "pattern": "BBC", "why": "BBC Sound Effects are personal/educational/research use only." },
-      { "pattern": "GPL / AGPL", "why": "Incompatible with the Steamworks SDK." },
-      { "pattern": "ND / NoDerivatives", "why": "Any pitch-shift, trim or mix is a derivative." }
+      {
+        "pattern": "NC / NonCommercial",
+        "why": "Commercial Steam release. NC forbids it outright."
+      },
+      {
+        "pattern": "SA / ShareAlike",
+        "why": "Copyleft on a derivative in a closed-source build."
+      },
+      {
+        "pattern": "BBC",
+        "why": "BBC Sound Effects are personal/educational/research use only."
+      },
+      {
+        "pattern": "GPL / AGPL",
+        "why": "Incompatible with the Steamworks SDK."
+      },
+      {
+        "pattern": "ND / NoDerivatives",
+        "why": "Any pitch-shift, trim or mix is a derivative."
+      }
     ],
     "attribution": {
       "CC0-1.0": "No attribution obligation. The entry is recorded anyway so provenance is auditable.",
       "CC-BY-4.0": "Attribution required. The manifest entry IS the attribution and the credits panel renders it."
     }
   },
-
-  "scannedDirs": ["public", "src", "app"],
-
+  "scannedDirs": [
+    "public",
+    "src",
+    "app"
+  ],
   "scanNote": [
     "dist/ is not scanned: it is a build product of the directories above, and",
     "scripts/ is not scanned because everything under it is generated test",
     "fixture or audition evidence (piper_fixture, voice_fixture, whisper_fixture,",
     "shots/audition) - all gitignored, none of it ships."
   ],
-
   "credits": [],
-
   "musicPolicy": {
     "allowed": [
       "All rights reserved - developer-owned"
@@ -101,7 +115,6 @@
       "    mistake instead of to 'credits' where it would be properly vetted."
     ]
   },
-
   "music": [
     {
       "id": "500nm",
@@ -125,7 +138,7 @@
       "rights": "self-composed, all rights held by the developer",
       "licence": "All rights reserved - developer-owned",
       "source": "music-src/Ryan's song.mp3",
-      "role": "overworld interludes two and three — split at its 74.93 s structural break into segments A and B",
+      "role": "overworld interludes two and three \u2014 split at its 74.93 s structural break into segments A and B",
       "key": "E-flat minor",
       "bpm": 64,
       "durationS": 225.937,
@@ -160,7 +173,6 @@
       "note": "Currently the raw master, vendored bit-exact; -2.89 dB playback trim applied at runtime. prepare-music.mts prefers music-src/processed/project1-castle.wav the moment an edited version exists, and encodes it once from lossless."
     }
   ],
-
   "voiceModelPolicy": {
     "allowed": [
       "CC0-1.0",
@@ -179,7 +191,6 @@
       "which is what disqualified the otherwise obvious female candidate."
     ]
   },
-
   "voiceModels": [
     {
       "dir": "models/rhasspy--piper-en-us-joe-medium",
@@ -188,7 +199,7 @@
       "role": "male NPCs and the Evil King",
       "url": "https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/joe/medium",
       "licenceUrl": "https://huggingface.co/rhasspy/piper-voices/raw/main/en/en_US/joe/medium/MODEL_CARD",
-      "author": "rhasspy (Piper) — dataset: OHF-Voice/voice-datasets",
+      "author": "rhasspy (Piper) \u2014 dataset: OHF-Voice/voice-datasets",
       "licence": "CC0-1.0",
       "note": "MODEL_CARD states License: CC0. Dataset https://github.com/OHF-Voice/voice-datasets. Measured natural f0 99.6 Hz."
     },
@@ -199,18 +210,17 @@
       "role": "female NPCs",
       "url": "https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/ljspeech/medium",
       "licenceUrl": "https://keithito.com/LJ-Speech-Dataset/",
-      "author": "Piper voice by Bryce Beattie (https://brycebeattie.com/files/tts/) — dataset: LJ Speech, Linda Johnson via LibriVox",
+      "author": "Piper voice by Bryce Beattie (https://brycebeattie.com/files/tts/) \u2014 dataset: LJ Speech, Linda Johnson via LibriVox",
       "licence": "Public Domain",
       "note": "MODEL_CARD gives dataset https://keithito.com/LJ-Speech-Dataset/ with 'License: public domain'. The dataset page states verbatim: 'This dataset is in the public domain in the US (and most likely other countries as well). There are no restrictions on its use.' Source audio is LibriVox (public domain), text is Project Gutenberg. Measured natural f0 219.2 Hz, so it needs almost no resampling to sit in the female band."
     }
   ],
-
   "voiceModelsRejected": [
     {
       "voice": "en_US-hfc_female-medium",
       "licence": "CC BY-NC-SA 4.0",
       "licenceUrl": "https://huggingface.co/rhasspy/piper-voices/raw/main/en/en_US/hfc_female/medium/MODEL_CARD",
-      "why": "NonCommercial AND ShareAlike. Two independent disqualifications for a paid, closed-source release. This is the voice most guides recommend for 'a female Piper voice' — recorded here so it does not get re-proposed."
+      "why": "NonCommercial AND ShareAlike. Two independent disqualifications for a paid, closed-source release. This is the voice most guides recommend for 'a female Piper voice' \u2014 recorded here so it does not get re-proposed."
     },
     {
       "voice": "en_US-lessac-medium",
@@ -220,7 +230,7 @@
     },
     {
       "voice": "en_US-amy-medium",
-      "licence": "unstated — deferred to https://github.com/MycroftAI/mimic3-voices",
+      "licence": "unstated \u2014 deferred to https://github.com/MycroftAI/mimic3-voices",
       "licenceUrl": "https://huggingface.co/rhasspy/piper-voices/raw/main/en/en_US/amy/medium/MODEL_CARD",
       "why": "The MODEL_CARD names no licence at all, only a repository to go and look in. Unresolved provenance fails the bar by definition."
     },
@@ -228,7 +238,41 @@
       "voice": "en_US-kristin-medium",
       "licence": "Public Domain (LibriVox)",
       "licenceUrl": "https://huggingface.co/rhasspy/piper-voices/raw/main/en/en_US/kristin/medium/MODEL_CARD",
-      "why": "Licence is CLEAN and this was the runner-up, not a rejection on legal grounds. Dropped on acoustics: measured natural f0 148 Hz, so reaching the female band needs a 1.11-1.59x resample — the same formant-dragging that made the single-model design sound like a sped-up man. ljspeech needs ~1.0x."
+      "why": "Licence is CLEAN and this was the runner-up, not a rejection on legal grounds. Dropped on acoustics: measured natural f0 148 Hz, so reaching the female band needs a 1.11-1.59x resample \u2014 the same formant-dragging that made the single-model design sound like a sped-up man. ljspeech needs ~1.0x."
+    }
+  ],
+  "samplesPolicy": {
+    "allowed": [
+      "All rights reserved - developer-owned"
+    ]
+  },
+  "samples": [
+    {
+      "id": "wingbeat_dragon",
+      "file": "models/sfx/wingbeat-dragon.wav",
+      "author": "Kaven Martinez",
+      "rights": "self-recorded, all rights held by the developer",
+      "source": "music-src/Project 1 Logic Kaven MartinezWAVE (1).mp3",
+      "licence": "All rights reserved - developer-owned",
+      "note": "0.92 s wing-whoosh cut from the opening of the master, resampled per creature (dragon 0.58x, wyvern 0.82x, griffin 1.12x) and vendored into models/sfx/ \u2014 playback is triggered by the creature animator's own wing downstroke"
+    },
+    {
+      "id": "wingbeat_wyvern",
+      "file": "models/sfx/wingbeat-wyvern.wav",
+      "author": "Kaven Martinez",
+      "rights": "self-recorded, all rights held by the developer",
+      "source": "music-src/Project 1 Logic Kaven MartinezWAVE (1).mp3",
+      "licence": "All rights reserved - developer-owned",
+      "note": "0.92 s wing-whoosh cut from the opening of the master, resampled per creature (dragon 0.58x, wyvern 0.82x, griffin 1.12x) and vendored into models/sfx/ \u2014 playback is triggered by the creature animator's own wing downstroke"
+    },
+    {
+      "id": "wingbeat_griffin",
+      "file": "models/sfx/wingbeat-griffin.wav",
+      "author": "Kaven Martinez",
+      "rights": "self-recorded, all rights held by the developer",
+      "source": "music-src/Project 1 Logic Kaven MartinezWAVE (1).mp3",
+      "licence": "All rights reserved - developer-owned",
+      "note": "0.92 s wing-whoosh cut from the opening of the master, resampled per creature (dragon 0.58x, wyvern 0.82x, griffin 1.12x) and vendored into models/sfx/ \u2014 playback is triggered by the creature animator's own wing downstroke"
     }
   ]
 }

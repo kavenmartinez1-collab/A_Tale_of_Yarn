@@ -107,6 +107,20 @@ export class EntityRenderer {
   private readonly anim = new CreatureAnimRegistry();
 
   /**
+   * Fired once per wing DOWNSTROKE of any winged creature, with its distance
+   * to the player — the audible half of the exact beat the mesh draws this
+   * frame. It is derived from `pose.flapPhase`, the animator's own integrated
+   * wing clock, and from nothing else. Gait phase is the wrong clock twice
+   * over: `walkPhase` advances at `speed * 1.6` on a moving creature — three
+   * wraps a second on a ridden mount, a machine-gun the moment the player
+   * holds a movement key — while the wings the player is LOOKING AT keep the
+   * animator's own 2-3 s cycle, glides slowing it and climbs quickening it.
+   */
+  onWingbeat: ((species: EntityState['species'], dist: number) => void) | null = null;
+  /** floor((flapPhase - pi) / 2pi) per entity id — downstroke edge detector. */
+  private readonly wingbeatK = new Map<string, number>();
+
+  /**
    * Scratch for the object uniform. Previously this was
    * `new Float32Array([...])` per entity per frame: 30 allocations every frame,
    * 1800 a second, all four floats long and all immediately garbage.
@@ -307,6 +321,21 @@ export class EntityRenderer {
       const frame = driver.update(e, simTime, dist, groundY);
       const pose = frame.pose;
 
+      // Wingbeat: the sound of THIS pose. Builders draw wing raise as
+      // base + sin(flapPhase) * flapAmp, so the downstroke sweeps fastest at
+      // flapPhase = pi (mod 2pi). Amplitude gates it: ground idle stirs the
+      // wings at FlapAmp 0.30 and a glide holds ~0.12 — neither displaces
+      // air. Powered flight and takeoff run 0.46-0.95.
+      if (this.onWingbeat !== null
+        && pose.flapPhase !== undefined && (pose.flapAmp ?? 0) > 0.4) {
+        const k = Math.floor((pose.flapPhase - Math.PI) / (Math.PI * 2));
+        const prevK = this.wingbeatK.get(e.id);
+        this.wingbeatK.set(e.id, k);
+        // A forward step of any size fires once. The animator's 1e4 float
+        // precision re-wrap steps k BACK by ~1591; it must stay silent.
+        if (prevK !== undefined && k > prevK) this.onWingbeat(e.species, dist);
+      }
+
       // --- animation LOD ---------------------------------------------------
       //
       // How often this creature's MESH is rebuilt. Its position, its animator
@@ -414,6 +443,14 @@ export class EntityRenderer {
       });
     }
 
+    // Sweep wingbeat phase memory on the animator registry's own cadence.
+    if (this.frameNo % 300 === 0 && this.wingbeatK.size > 0) {
+      const live = new Set<string>();
+      for (const v of visible) live.add(v.e.id);
+      for (const id of this.wingbeatK.keys()) {
+        if (!live.has(id)) this.wingbeatK.delete(id);
+      }
+    }
     this.anim.endFrame();
     cost.ms = performance.now() - costT0;
     return draws;

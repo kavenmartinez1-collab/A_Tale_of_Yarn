@@ -425,6 +425,86 @@ if (existsSync(MUSIC_DIR)) {
 }
 
 // ---------------------------------------------------------------------------
+// 11. Recorded gameplay samples
+// ---------------------------------------------------------------------------
+//
+// The wingbeats are CUT FROM the developer's own master (the same "Project 1
+// Logic" the castle theme is edited from), so like the soundtrack they are
+// self-owned rather than third-party — and like the soundtrack, "we own it"
+// still has to be recorded. models/ is unreachable by the walk above and the
+// files ship in the depot; without this section they would be exactly the
+// unaudited audio this guard exists to catch.
+//
+// Coverage is taken from src/game/audio/samples.ts, the manifest the engine
+// actually plays from, not from the disk — a checkout where prepare-music has
+// not run must still fail if a sample loses its provenance record.
+
+const samples = manifest?.samples ?? [];
+const samplesPolicy = manifest?.samplesPolicy?.allowed ?? [];
+
+check('manifest has a samplesPolicy.allowed array', Array.isArray(manifest?.samplesPolicy?.allowed));
+check('manifest has a samples array', Array.isArray(manifest?.samples));
+check('samples is not empty', samples.length > 0,
+  'the game plays recorded wingbeats; an empty list means a sample lost its '
+  + 'provenance record or the sample bank was dropped');
+
+for (const m of samples) {
+  const id = m.id ?? '(no id)';
+  check(`sample has file: ${id}`, typeof m.file === 'string' && m.file.length > 0);
+  check(`sample has author: ${id}`, typeof m.author === 'string' && m.author.length > 0);
+  check(`sample states its rights: ${id}`, typeof m.rights === 'string' && m.rights.length > 0);
+  check(`sample names its source master: ${id}`,
+    typeof m.source === 'string' && m.source.startsWith('music-src/'),
+    'the master it was cut from, so the chain back to the original recording is auditable');
+  check(`sample has licence: ${id}`, typeof m.licence === 'string' && m.licence.length > 0);
+  const lic = String(m.licence ?? '');
+  for (const f of FORBIDDEN_AUDIO_LICENCES) {
+    check(`sample licence not forbidden (${f.pattern}): ${id}`, !f.pattern.test(lic),
+      `'${lic}' — ${f.why}. A third-party sample belongs in 'credits', not here.`);
+  }
+  check(`sample licence allowed: ${id}`, samplesPolicy.includes(lic),
+    `'${lic}' is not one of: ${samplesPolicy.join(', ')}`);
+}
+
+// Coverage both ways against the engine's own sample manifest.
+{
+  const src = readFileSync(
+    path.join(ROOT, 'src', 'game', 'audio', 'samples.ts'), 'utf-8');
+  const files = [...src.matchAll(/file: '([^']+)'/g)].map((m) => m[1]);
+  const unique = [...new Set(files)];
+  check('samples.ts names at least one sample file', unique.length > 0,
+    'the regex found no `file:` entries — if samples.ts was restructured this '
+    + 'guard is no longer reading it and must be updated');
+  for (const f of unique) {
+    check(`sample played by the engine is credited: ${f}`,
+      samples.some((m) => m.file === `models/sfx/${f}`),
+      `src/game/audio/samples.ts plays models/sfx/${f} with no provenance record`);
+  }
+  for (const m of samples) {
+    const base = String(m.file).replace(/^models\/sfx\//, '');
+    check(`credited sample is actually played: ${base}`, unique.includes(base),
+      `${m.file} is credited but samples.ts never plays it — delete the entry or `
+      + 'wire the sample up');
+  }
+}
+
+// ...and when the vendored files ARE present, the records must point at bytes.
+const SFX_DIR = path.join(ROOT, 'models', 'sfx');
+if (existsSync(SFX_DIR)) {
+  for (const m of samples) {
+    check(`sample file on disk: ${m.id}`, existsSync(path.join(ROOT, m.file)),
+      `${m.file} is credited but absent`);
+  }
+  const strays = readdirSync(SFX_DIR)
+    .filter((f) => AUDIO_EXT.has(path.extname(f).toLowerCase()));
+  for (const f of strays) {
+    check(`vendored sample is credited: ${f}`,
+      samples.some((m) => m.file === `models/sfx/${f}`),
+      `models/sfx/${f} would be packed into the depot with no provenance record`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Self-test of the forbidden patterns
 // ---------------------------------------------------------------------------
 //

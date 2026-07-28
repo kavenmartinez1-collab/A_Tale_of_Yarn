@@ -30,7 +30,10 @@ fs.mkdirSync(outDir, { recursive: true });
 
 const browser = await chromium.launch({
   channel: 'chrome', headless: true,
-  args: ['--enable-unsafe-webgpu', '--use-angle=d3d11'],
+  // The autoplay flag lets the AudioContext run without a user gesture, so
+  // the wingbeat-sample counter below counts what would really have sounded.
+  args: ['--enable-unsafe-webgpu', '--use-angle=d3d11',
+    '--autoplay-policy=no-user-gesture-required'],
 });
 const page = await browser.newPage({ viewport: { width: 1100, height: 620 } });
 
@@ -218,7 +221,11 @@ const mountedNow = await D(() => window.__gameDebug.mounted());
 if (mountedNow === null) {
   note('BUG', 'could not remount for the flight test', 'aborting phase 3');
 } else {
-  // Climb.
+  // Climb — and count wingbeats while we do. The beat rides the animator's
+  // wing clock (EntityRenderer.onWingbeat), so a powered climb must produce a
+  // stately few, not a machine-gun: the old walkPhase-keyed trigger fired
+  // three times a second the moment the player held a movement key.
+  const wb0 = await D(() => window.__gameDebug.sampleEvents('wingbeat_wyvern'));
   await page.keyboard.down('Space');
   await page.waitForTimeout(3500);
   await page.keyboard.up('Space');
@@ -229,6 +236,18 @@ if (mountedNow === null) {
     return { pos: p, ground: d.heightAt(p[0], p[2]), mounted: d.mounted(), hp: d.vitals().hp };
   });
   const alt = air.pos[1] - air.ground;
+  const wb1 = await D(() => window.__gameDebug.sampleEvents('wingbeat_wyvern'));
+  const beats = wb1 - wb0;
+  process.stdout.write(`       wingbeats voiced during 3.8 s of powered climb: ${beats}\n`);
+  if (beats < 1) {
+    note('BUG', 'a climbing wyvern makes no wing sound',
+      `${beats} sample events — trigger, serving path or decode is broken`);
+  } else if (beats > 8) {
+    note('BUG', 'wingbeat sound machine-guns in flight',
+      `${beats} events in 3.8 s against a ~0.6 Hz visible flap`);
+  } else {
+    note('ok', `wingbeats at a stately cadence (${beats} in 3.8 s)`);
+  }
   process.stdout.write(`       altitude after 3.5 s of climb: ${alt.toFixed(1)} m\n`);
   if (alt < 3) {
     note('BUG', 'holding Space on a flier barely climbs', `${alt.toFixed(1)} m in 3.5 s`);
@@ -276,6 +295,20 @@ if (mountedNow === null) {
 
   // Where did the wyvern go?
   await page.waitForTimeout(6000);   // give the landing lerp a fair chance
+  // Grounded silence: its wings fold (idle FlapAmp 0.30 sits under the 0.4
+  // gate), so a settled wyvern must stop beating. One straggler is allowed
+  // for a landing flap still in flight when the window opened.
+  {
+    const g0 = await D(() => window.__gameDebug.sampleEvents('wingbeat_wyvern'));
+    await page.waitForTimeout(3000);
+    const g1 = await D(() => window.__gameDebug.sampleEvents('wingbeat_wyvern'));
+    if (g1 - g0 > 1) {
+      note('BUG', 'a grounded wyvern keeps making wingbeat sounds',
+        `${g1 - g0} events in 3 s while landed`);
+    } else {
+      note('ok', `grounded wyvern is silent (${g1 - g0} events in 3 s)`);
+    }
+  }
   const flier = await D(() => {
     const d = window.__gameDebug;
     const w = d.entities().find((e) => e.id === window.__probeId);

@@ -96,6 +96,7 @@ import {
   type SfxName, type SfxRecipe, type OscLayer, type NoiseLayer,
   type NoiseColor, type AmbienceBedName, type AmbienceBedLayer,
 } from './sfx';
+import { SAMPLE_BASE, SAMPLE_DEFS, type SampleName } from './samples';
 
 import { mulberry32 } from '../mesh-utils';
 
@@ -678,6 +679,73 @@ export class GameAudio {
     this.eventCount.set(name, event + 1);
 
     this.synthesizeSfx(recipe, finalGain, sfxSeed(name, event, SFX_VARIANT[name] ?? 0));
+  }
+
+  // ----------------------------------------------------------
+  // Recorded samples (samples.ts) — the developer's own recordings.
+  // Same discipline as recipes: throttle, distance rolloff, shared voice
+  // budget, deterministic (name, event)-seeded jitter. Decoded lazily.
+  // ----------------------------------------------------------
+
+  private sampleBuffers: Map<SampleName, AudioBuffer> = new Map();
+  private sampleLoading: Set<SampleName> = new Set();
+  private sampleEventCount: Map<SampleName, number> = new Map();
+  private sampleLastMs: Map<SampleName, number> = new Map();
+
+  /** Events that actually sounded, per sample — the harness instrument. */
+  sampleEvents(name: SampleName): number {
+    return this.sampleEventCount.get(name) ?? 0;
+  }
+
+  playSample(name: SampleName, opts?: PlayOptions): void {
+    if (!this.ctx || !this.masterGain) return;
+    const def = SAMPLE_DEFS[name];
+    if (!def) return;
+
+    const now = performance.now();
+    const last = this.sampleLastMs.get(name) ?? -1e9;
+    if (now - last < def.throttleMs) return;
+
+    if (this.activeVoices >= MAX_VOICES) return;
+
+    const intensity = opts?.intensity ?? 1;
+    const finalGain = intensity * def.gain * distanceGain(opts?.dist ?? 0, def.maxDist);
+    if (finalGain <= 0.001) return;
+
+    const buf = this.sampleBuffers.get(name);
+    if (!buf) {
+      // First request: start the fetch, drop this event. A wingbeat that
+      // arrives one flap late is atmosphere; a stall waiting on I/O is a bug.
+      if (!this.sampleLoading.has(name)) {
+        this.sampleLoading.add(name);
+        fetch(SAMPLE_BASE + def.file)
+          .then((r) => r.arrayBuffer())
+          .then((ab) => this.ctx!.decodeAudioData(ab))
+          .then((decoded) => { this.sampleBuffers.set(name, decoded); })
+          .catch(() => { this.sampleLoading.delete(name); });
+      }
+      return;
+    }
+
+    this.sampleLastMs.set(name, now);
+    const event = this.sampleEventCount.get(name) ?? 0;
+    this.sampleEventCount.set(name, event + 1);
+
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    // Deterministic per-event jitter: (name, n) numbers real events, exactly
+    // the recipe rule, so a reproduction plays the same pitches in order.
+    const r = mulberry32(sfxSeed(name as unknown as SfxName, event, 0))();
+    src.playbackRate.value = 1 + (r * 2 - 1) * def.jitter;
+
+    const g = this.ctx.createGain();
+    g.gain.value = finalGain;
+    src.connect(g);
+    g.connect(this.buses.sfx ?? this.masterGain);
+
+    this.activeVoices++;
+    src.onended = () => { this.activeVoices = Math.max(0, this.activeVoices - 1); };
+    src.start();
   }
 
   // ----------------------------------------------------------

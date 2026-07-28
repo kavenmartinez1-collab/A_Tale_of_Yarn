@@ -486,20 +486,24 @@ export const SFX_RECIPES: Record<SfxName, SfxRecipe> = {
   /**
    * TINTREACH — the artifact lightning bow. The game's signature effect.
    *
-   * This used to borrow the weather `thunder`, which is a distant rolling
-   * sound and therefore exactly wrong for something that happens at the end of
-   * your own arm. The bolt is a hitscan: it is AT the mark on the frame it is
-   * loosed, so the sound has to arrive with no travel time and no roll-in.
+   * Second redesign, from a playtest verdict: the first version sustained
+   * narrow 5.2/8 kHz bands with a PERIODIC 10 Hz flicker through the burn
+   * window, and a steady pitched sizzle is the sound of a laser beam, not of
+   * lightning. What lightning sounds like is THUNDER — so this is the weather
+   * `thunder` recipe's anatomy (brown rumble, mid tear, sub swell) detonated
+   * at arm's length: instant crack, no roll-in, and a tail that RUMBLES
+   * instead of sizzling. Nothing in it is periodic.
    *
-   * The three stages are the ones `tintreach.ts` already draws, to the
-   * millisecond, so the ear and the eye agree:
+   * The visual sync points survive from `tintreach.ts`, to the millisecond:
    *
-   *   STRIKE_S = 0.055  the crack. Layers 1-3, all ending at 0.055.
-   *   BURN_S   = 0.34   the seam sizzles and re-strikes at RESTRIKE_HZ = 10.
-   *                     Layers 4-5 carry a 10 Hz flicker at depth 0.45 —
-   *                     the identical 0.55..1.0 band `boltIntensity` uses.
-   *   LIFE_S   = 1.10   the roll-off. Layers 6-7 end exactly here, so the
-   *                     sound dies on the frame the seam does.
+   *   STRIKE_S = 0.055  the crack: layers 1-2 and the snap osc all end here.
+   *   BURN_S   = 0.34   the close-range tearing rip ends with the seam's burn.
+   *   LIFE_S   = 1.10   the rolling decay dies on the frame the seam does.
+   *
+   * The rumble and the sub tail run past LIFE_S to 1.8 s, deliberately: the
+   * flash is over before the air is. Thunder outlasting the light is the one
+   * cue every human already knows, and cutting the reverberation dead at the
+   * seam's last frame is what made the old tail feel synthetic.
    *
    * `maxDist` is 220 m: this is lightning, and the whole valley hears it.
    */
@@ -510,66 +514,72 @@ export const SFX_RECIPES: Record<SfxName, SfxRecipe> = {
       //    instantaneous edge as a linear ramp gets without a click.
       {
         color: 'white',
-        highpass: 2600,
+        highpass: 1800,
         envelope: [0.0008, 0.006, 0.048],
         gain: 0.29,
       },
       // 2. Body under the crack, so it lands as a blow rather than a hiss.
       {
         color: 'white',
-        bandpass: { freq: 1400, Q: 0.8 },
-        envelope: [0.001, 0.008, 0.046],
+        bandpass: { freq: 900, Q: 0.8 },
+        envelope: [0.001, 0.01, 0.044],
         gain: 0.16,
       },
-      // 4. The sizzling seam. Starts as the crack ends, runs to BURN_S.
+      // 4. The tear. Wideband mid noise falling away through the burn window
+      //    — close thunder's ripping-canvas edge. Aperiodic on purpose; the
+      //    10 Hz flicker this replaces is what read as a beam.
       {
         color: 'white',
-        bandpass: { freq: 5200, Q: 2.4 },
-        envelope: [0.055, 0.10, 0.185],
-        gain: 0.16,
-        flickerHz: 10,
-        flickerDepth: 0.45,
+        lowpass: 1400,
+        envelope: [0.008, 0.092, 0.24],
+        gain: 0.12,
       },
-      // 5. Ozone hiss on top of the seam, same re-strike clock.
+      // 5. The rumble: the weather thunder's main brown layer, faster attack
+      //    because the strike is overhead, running past the seam to 1.8 s.
       {
-        color: 'white',
-        bandpass: { freq: 8000, Q: 1.6 },
-        envelope: [0.05, 0.12, 0.17],
-        gain: 0.07,
-        flickerHz: 10,
-        flickerDepth: 0.45,
+        color: 'brown',
+        lowpass: 320,
+        envelope: [0.05, 0.26, 1.49],
+        gain: 0.26,
       },
       // 6. The rolling decay. Ends at LIFE_S exactly.
       {
         color: 'brown',
         lowpass: 220,
-        envelope: [0.02, 0.20, 0.88],
-        gain: 0.30,
+        envelope: [0.05, 0.2, 0.85],
+        gain: 0.20,
       },
     ],
     osc: [
-      // 3. The snap transient inside the crack window. These three crack layers
-      // are gain-budgeted together: at their first values (0.55/0.30/0.14) the
-      // offline render peaked at +1.37 dBFS with 12 hard-clipped samples, so
-      // they are scaled to land the whole bolt just under -1 dBFS — the
-      // loudest thing in the game and still not clipping at volume 1.0.
+      // 3. The snap transient inside the crack window. Crack layers 1-3 are
+      // gain-budgeted together — the loudest thing in the game and still
+      // under -1 dBFS at volume 1.0 (measured by test-audio's peak scan).
       {
         type: 'square',
-        freq: 2200,
-        freqEnd: 620,
+        freq: 1800,
+        freqEnd: 520,
         envelope: [0.0005, 0.004, 0.05],
-        gain: 0.07,
+        gain: 0.06,
       },
       // 7. The low body of the discharge, falling away with the tail.
       {
         type: 'sine',
         freq: 88,
         freqEnd: 34,
-        envelope: [0.01, 0.18, 0.86],
-        gain: 0.22,
+        envelope: [0.03, 0.18, 0.84],
+        gain: 0.16,
+      },
+      // 8. The sub swell under the rumble — thunder's 50 Hz floor an octave
+      // of menace below anything else in the mix, out to the full tail.
+      {
+        type: 'sine',
+        freq: 48,
+        freqEnd: 28,
+        envelope: [0.05, 0.35, 1.4],
+        gain: 0.16,
       },
     ],
-    duration: 1.10,
+    duration: 1.8,
     throttleMs: 220,
     maxDist: 220,
   },

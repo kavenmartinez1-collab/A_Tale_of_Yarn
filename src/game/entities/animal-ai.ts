@@ -692,10 +692,13 @@ function engage(
     //
     // Holding the swing clock at a full cadence is NOT cosmetic. `creature-
     // anim.ts` starts the windup when `stateTimer` counts down to the move's
-    // `contactT`, and `stepAnimal` enters 'aggro' with that timer at zero — so
-    // a blocked creature whose clock never moved would satisfy that test on
-    // every single frame and stand under the parapet swinging at the ceiling
-    // for as long as the player cared to watch.
+    // `contactT`, and after a landed blow the clock sits wherever the fight
+    // left it — so a blocked creature whose clock had already run down would
+    // satisfy that test on every single frame and stand under the parapet
+    // swinging at the ceiling for as long as the player cared to watch.
+    // (Aggro ENTRY parks the clock the same way — see `stepAnimal` and
+    // `onEntityDamaged` — so the first blow of a fight winds up on screen
+    // instead of landing on the tick the fight started.)
     e.stateTimer = attackCadence(def);
     if (dist > 0.001) e.yaw = Math.atan2(dx / dist, -(dz / dist));
     e.y = isWater ? -0.5 : ctx.heightAt(e.x, e.z);
@@ -862,7 +865,12 @@ export function stepAnimal(
       if ((e.mode === 'idle' || e.mode === 'graze' || e.mode === 'wander')
           && provoked) {
         e.mode = 'aggro';
-        e.stateTimer = 0;
+        // Park the swing clock a FULL cadence out, exactly as the circling /
+        // denied / blocked branches in `engage` do. Entering aggro inside
+        // reach with a zeroed clock landed the first blow on the same sim
+        // tick, with no windup for `creature-anim.ts` to play — an enemy the
+        // player walks up to must still tell before it hits.
+        e.stateTimer = attackCadence(speciesDef);
       }
     } else {
       // Non-aggro species: flee when player close.
@@ -1179,7 +1187,12 @@ export function onEntityDamaged(e: EntityState, from?: DamageSource): void {
     if (def.aggro && e.owned !== true) {
       abandonHunt(cs, 0);
       e.mode = 'aggro';
-      e.stateTimer = 0;
+      // A full cadence out, never zero. Zero meant the riposte landed on the
+      // SAME TICK as the blow that provoked it — "I attack the boss and I
+      // hurt myself" — because anyone close enough to land a sword (3.2 m)
+      // stands inside a boss's 4.1 m reach. The counter still comes; now it
+      // winds up on screen first, which is also what makes it parryable.
+      e.stateTimer = attackCadence(def);
     } else if (e.owned !== true) {
       e.mode = 'flee';
       e.fleeTimer = FLEE_DURATION_S;

@@ -589,6 +589,23 @@ if (!SKIP_CHAT && !RELEASE && boot.debugPresent && chat?.changed && VOICE_FIXTUR
         ? `${rel} is ${mb.toFixed(1)} MB, expected >= ${minMB} MB`
         : `${rel} is ABSENT from the depot`);
   }
+
+  // Recorded gameplay samples ride the same depot path as the music: the
+  // wingbeats, cut from the same master as the castle theme. A separate list
+  // because the music manifest's entry count is asserted against MUSIC_FILES.
+  const SFX_FILES = [
+    ['sfx/wingbeat-dragon.wav', 'the dragon wingbeat sample', 0.12],
+    ['sfx/wingbeat-wyvern.wav', 'the wyvern wingbeat sample', 0.08],
+    ['sfx/wingbeat-griffin.wav', 'the griffin wingbeat sample', 0.06],
+  ];
+  for (const [rel, why, minMB] of SFX_FILES) {
+    const abs = path.join(DEPOT_MODELS, ...rel.split('/'));
+    const mb = fs.existsSync(abs) ? fs.statSync(abs).size / (1024 * 1024) : 0;
+    ok(`depot ships the wingbeat: ${why}`, mb >= minMB,
+      fs.existsSync(abs)
+        ? `${rel} is ${mb.toFixed(1)} MB, expected >= ${minMB} MB`
+        : `${rel} is ABSENT from the depot`);
+  }
   {
     const abs = path.join(DEPOT_MODELS, 'music', 'manifest.json');
     let manifest = null;
@@ -652,7 +669,19 @@ if (!SKIP_CHAT && !RELEASE && boot.debugPresent && chat?.changed && VOICE_FIXTUR
 
   // The voice came out of the depot, not off a CDN. §6 asserts zero external
   // requests for the whole run, which covers the model fetch above too.
-  const served = await page.evaluate(() => window.steamBridge?.serverStats?.() ?? null);
+  //
+  // POLLED, not snapshotted. The GGUF streams lazily behind the first real
+  // generation, and on a cold file cache the watchdog's fallback reply lands
+  // while the model is still paging in — a snapshot taken at that moment read
+  // 1.9 MB and failed a PROVENANCE check over a LATENCY problem (the server
+  // log showed 240 MB of ranges seconds later). Provenance is the claim:
+  // wait for the stream to clear the bar before judging where it came from.
+  let served = null;
+  for (let i = 0; i < 45; i++) {
+    served = await page.evaluate(() => window.steamBridge?.serverStats?.() ?? null);
+    if ((served?.bytesServed ?? 0) > 40 * 1024 * 1024) break;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
   ok('the voice model was served by the local depot server',
     (served?.bytesServed ?? 0) > 40 * 1024 * 1024,
     `${(((served?.bytesServed ?? 0)) / (1024 * 1024)).toFixed(1)} MB served locally,`
