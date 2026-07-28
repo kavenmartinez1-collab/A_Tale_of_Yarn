@@ -63,7 +63,7 @@ import {
   loadFires, saveFires,
   addBurningTree, tickBurningTrees, getBurningTrees,
   BUSH_BURN_S, FIRE_IGNITE_RADIUS, TORCH_IGNITE_RADIUS,
-  FIRE_SPREAD_RADIUS, FIRE_SPREAD_CHANCE,
+  FIRE_SPREAD_RADIUS, FIRE_SPREAD_CHANCE, CRAFT_FIRE_RADIUS,
   BREATH_RANGE,
   type PlacedFire,
 } from './fire';
@@ -76,11 +76,21 @@ import {
   type ScheduledStrike,
 } from './lightning';
 import {
-  createTent, tentTierAt, canopyAt,
+  createTent, tentTierAt, canopyAt, tentAt, tentRoofAt, tentBox, shelterTier,
   loadTents, saveTents,
-  type PlacedTent,
+  type PlacedTent, type TentShape,
 } from './shelter';
 import { buildFireMeshes, buildTentMeshes } from './fire-mesh';
+import {
+  createLoom, nearLoom, loadLooms, saveLooms, CRAFT_LOOM_RADIUS,
+  type PlacedLoom,
+} from './loom';
+import { buildLoomMeshes } from './loom-mesh';
+import { recipeByKey, RECIPES } from './crafting';
+import {
+  loadProgress, saveProgress, observeInventory, noteCraft,
+  type ProgressState,
+} from './progression/unlocks';
 import { emitWorldFire } from './render/fire-fx';
 import { emitParrySpark, PARRY_SPARK_S } from './render/parry-fx';
 import {
@@ -417,11 +427,29 @@ declare global {
       };
       // Phase H
       placeFire(x: number, z: number, lit?: boolean): string;
-      placeTent(x: number, z: number, tier?: 1 | 2 | 3): string;
+      placeTent(x: number, z: number, tier?: 1 | 2 | 3,
+        shape?: import('./shelter').TentShape): string;
       fires(): import('./fire').PlacedFire[];
       tents(): import('./shelter').PlacedTent[];
       nearCampfire(): boolean;
       nearForgeDebug(): boolean;
+      // The loom (T3 station) and the crafting tree.
+      placeLoom(x: number, z: number, yaw?: number): string;
+      looms(): import('./loom').PlacedLoom[];
+      nearLoomDebug(): boolean;
+      /** True when the player is inside a placed tent's canvas. */
+      tentRoofedHere(): boolean;
+      /** The shelter tier feeding the vitals warmth model here (0..3). */
+      shelterTierHere(): 0 | 1 | 2 | 3;
+      /** Upgrade the nearest lit campfire to a forge. Returns its id, or null. */
+      upgradeNearestFire(): string | null;
+      /** Discovery counts, for a harness to diff a played tree against a fresh one. */
+      progressStats(): {
+        unlocked: number; crafted: number; seen: number; total: number;
+        locked: string[];
+      };
+      /** True when this recipe key has been discovered. */
+      recipeUnlocked(key: string): boolean;
       // Phase I
       triggerStrike(dx: number, dz: number, forceOutcome?: 'death' | 'survivor'): void;
       burningTrees(): import('./fire').BurningTree[];
@@ -1747,15 +1775,20 @@ async function boot() {
     return true;
   }
 
-  // Placed fires and tents: loaded from localStorage, rebuilt into GPU draws when changed.
+  // Placed fires, tents and looms: loaded from localStorage, rebuilt into GPU
+  // draws when changed. Three registries rather than one "placeables" list
+  // because the three have nothing in common beyond a position — see loom.ts.
   const fires: PlacedFire[] = loadFires();
   const tents: PlacedTent[] = loadTents();
-  // GPU draw batches for fires and tents (rebuilt on placement/change).
+  const looms: PlacedLoom[] = loadLooms();
+  // GPU draw batches for fires, tents and looms (rebuilt on placement/change).
   let fireDraws: import('./renderer').DungeonDraw[] = [];
   let tentDraws: import('./renderer').DungeonDraw[] = [];
-  // GPU buffers for fires/tents (destroyed + recreated on rebuild).
+  let loomDraws: import('./renderer').DungeonDraw[] = [];
+  // GPU buffers for fires/tents/looms (destroyed + recreated on rebuild).
   let fireGpuBuffers: GPUBuffer[] = [];
   let tentGpuBuffers: GPUBuffer[] = [];
+  let loomGpuBuffers: GPUBuffer[] = [];
   // Shared zeroed lights buffer for fire/tent draws (surface mode needs group 2).
   let fireZeroLights: GPUBuffer | null = null;
   let fireZeroLightsBindGroup: GPUBindGroup | null = null;
@@ -1898,9 +1931,41 @@ async function boot() {
     }
   }
 
-  // Initial build for any fires/tents loaded from persistence.
+  /**
+   * Rebuild GPU draw batches for all looms. A copy of rebuildFireDraws with
+   * the builder swapped — same palette-batched surface path, same 24 B stride,
+   * same zeroed lights bind group, so the loom needed no renderer change.
+   */
+  function rebuildLoomDraws(): void {
+    for (const b of loomGpuBuffers) b.destroy();
+    loomGpuBuffers = [];
+    loomDraws = [];
+    const batches = buildLoomMeshes(looms);
+    const lg = getFireLightsBindGroup();
+    for (const { palette, verts } of batches) {
+      if (verts.length === 0) continue;
+      const vb = renderer.device.createBuffer({
+        label: `loom-pal${palette}`,
+        size: verts.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      });
+      renderer.device.queue.writeBuffer(vb, 0, verts);
+      const { bindGroup, shadowBindGroup } = renderer.createObjectBindGroup(0, 0, 0, 100 + palette);
+      loomDraws.push({
+        draw: {
+          vertexBuffer: vb, indexBuffer: null,
+          count: verts.length / (STRIDE_PROP / 4), bindGroup, shadowBindGroup,
+        },
+        lightsBindGroup: lg,
+      });
+      loomGpuBuffers.push(vb);
+    }
+  }
+
+  // Initial build for any fires/tents/looms loaded from persistence.
   rebuildFireDraws();
   rebuildTentDraws();
+  rebuildLoomDraws();
   // Periodically rebuild fire draws so flame shows/disappears as fuel drains.
   let fireRebuildAccum = 0;
   const FIRE_REBUILD_INTERVAL = 5; // seconds
@@ -6445,9 +6510,11 @@ async function boot() {
       rebuildFireDraws(simTime);
       return fire.id;
     },
-    placeTent: (x: number, z: number, tier: 1 | 2 | 3 = 1) => {
-      const y = heightField.heightAt(x, z);
-      const tent = createTent(x, y, z, tier);
+    placeTent: (x: number, z: number, tier: 1 | 2 | 3 = 1, shape: TentShape = 'small') => {
+      // Carved ground, matching placementTarget — a debug-placed tent has to
+      // sit where a player-placed one would or a harness measures the wrong tent.
+      const y = chunkManager.ground.heightAt(x, z);
+      const tent = createTent(x, y, z, tier, shape);
       tents.push(tent);
       saveTents(tents);
       rebuildTentDraws();
@@ -6459,6 +6526,50 @@ async function boot() {
       nearCampfireOrForge(fires, controller.pos[0], controller.pos[2], simTime),
     nearForgeDebug: () =>
       nearForgeCheck(fires, controller.pos[0], controller.pos[2], simTime),
+    /**
+     * The 8-stone forge upgrade, without going through the E key.
+     *
+     * E is the player's route and it is a long else-if chain — an NPC, a well,
+     * a nest or a mount within reach all outrank the hearth. A harness that
+     * needs a FORGE (to reach tier 2 and the loom above it) should not be
+     * silently testing "was anything else standing near that campfire", so
+     * this calls the same model function the key handler does.
+     */
+    upgradeNearestFire: () => {
+      const fire = nearestFire(fires, controller.pos[0], controller.pos[2], CRAFT_FIRE_RADIUS);
+      if (fire === null || !isLit(fire, simTime)) return null;
+      if (!upgradeToForge(fire, simTime)) return null;
+      saveFires(fires);
+      rebuildFireDraws(simTime);
+      return fire.id;
+    },
+    placeLoom: (x: number, z: number, yaw = 0) => {
+      const y = chunkManager.ground.heightAt(x, z);
+      const loom = createLoom(x, y, z, yaw);
+      looms.push(loom);
+      saveLooms(looms);
+      rebuildLoomDraws();
+      return loom.id;
+    },
+    looms: () => looms.map((l) => ({ ...l })),
+    nearLoomDebug: () => nearLoom(looms, controller.pos[0], controller.pos[2]),
+    tentRoofedHere: () => underTentRoof(),
+    // The warmth side of shelter, which is proximity-based and separate from
+    // the roof test above. Exposed because world temperature is clamped and
+    // biome-dependent, so "the tent is warmer" is only measurable at the input
+    // to the model in a mild biome at midday.
+    shelterTierHere: () => shelterTier(
+      tents,
+      resourceManager.nearbyTreeRefs(controller.pos[0], controller.pos[2], 3, gameNowMs()),
+      controller.pos[0], controller.pos[1], controller.pos[2]),
+    progressStats: () => ({
+      unlocked: progress.unlocked.size,
+      crafted: progress.crafted.size,
+      seen: progress.seen.size,
+      total: RECIPES.length,
+      locked: RECIPES.filter((r) => !progress.unlocked.has(r.key)).map((r) => r.key),
+    }),
+    recipeUnlocked: (key: string) => progress.unlocked.has(key),
     // Phase I
     triggerStrike: (dx: number, dz: number, forceOutcome?: 'death' | 'survivor') => {
       const tx = controller.pos[0] + dx;
@@ -7608,11 +7719,60 @@ async function boot() {
     };
   }
 
+  // -------------------------------------------------------------------------
+  // The crafting tree's discovery record.
+  //
+  // Loaded from its own key, updated from the inventory on every change, and
+  // saved beside it. Sweeping the WHOLE inventory rather than instrumenting
+  // each way an item can arrive is deliberate: items come from gathering,
+  // chests, dropped stacks, trade, taming rewards and the starting pack, and a
+  // tree with one uninstrumented faucet has a hole only one player ever finds.
+  // -------------------------------------------------------------------------
+  const progress: ProgressState = loadProgress();
+  /**
+   * True once the boot sweep has run. The first sweep sees the entire starting
+   * pack at once and must NOT toast — a new game would open on a stack of
+   * "recipe unlocked" notices for things the player has not done yet, which
+   * teaches them to ignore the notice that matters.
+   */
+  let progressBooted = false;
+
+  /**
+   * Announce newly discovered recipes.
+   *
+   * `level_chime` has existed in sfx.ts since the first audio pass with no call
+   * site at all — it was written for an XP system this game does not have. A
+   * discovery is the thing it was always for: the one moment the game tells you
+   * you can now do something you could not do a second ago.
+   */
+  function announceUnlocks(keys: readonly string[]): void {
+    if (keys.length === 0) return;
+    const names = keys
+      .map((k) => recipeByKey(k))
+      .filter((r): r is NonNullable<typeof r> => r !== undefined)
+      .map((r) => ITEM_DEFS[r.output].name);
+    if (names.length === 0) return;
+    const shown = names.slice(0, 3).join(', ');
+    setGatherNotice(names.length > 3
+      ? `Recipe unlocked: ${shown} +${names.length - 3} more`
+      : `Recipe unlocked: ${shown}`);
+    audio.play('level_chime');
+  }
+
   // Always-visible hotbar; any model change persists + re-renders.
   const invChanged = () => {
     saveInventory(inventory);
     hotbar.refresh();
+    const revealed = observeInventory(progress, inventory);
+    if (revealed.length > 0) {
+      saveProgress(progress);
+      if (progressBooted) announceUnlocks(revealed);
+    }
   };
+  // Seed from whatever the player is already carrying, silently.
+  observeInventory(progress, inventory);
+  saveProgress(progress);
+  progressBooted = true;
   const hotbar = new Hotbar(inventory, invChanged);
 
   overlay.addEventListener('click', () => canvas.requestPointerLock());
@@ -7696,6 +7856,7 @@ async function boot() {
         nearCampfire: nearCampfireOrForge(fires, controller.pos[0], controller.pos[2], simTime),
         nearForge: nearForgeCheck(fires, controller.pos[0], controller.pos[2], simTime),
         hasCookingPot: countItem(inventory, 'cooking_pot') > 0,
+        nearLoom: nearLoom(looms, controller.pos[0], controller.pos[2]),
       });
       panels.toggle('crafting', () => {
         // Wrap invChanged to also play craft SFX (Feature 10).
@@ -7706,7 +7867,17 @@ async function boot() {
           invChanged();
         };
         craftPanelOpenMs = performance.now();
-        return buildCraftingPanel(inventory, invChangedWithCraft, buildCraftCtx());
+        return buildCraftingPanel(inventory, invChangedWithCraft, buildCraftCtx(), {
+          progress,
+          // A completed craft is the tree's other input. Recorded here rather
+          // than inside `craft()` so the pure model stays pure — it takes a
+          // read-only gate and never writes progress back.
+          onCrafted: (key: string) => {
+            const revealed = noteCraft(progress, key);
+            saveProgress(progress);
+            announceUnlocks(revealed);
+          },
+        });
       });
       audio.play('ui_click');
       return;
@@ -7997,9 +8168,12 @@ async function boot() {
     // Placement hints based on held item
     const heldForPrompt = equipped(inventory);
     if (heldForPrompt === 'campfire_kit') return 'Left click — place campfire';
-    if (heldForPrompt === 'fiber_tent' || heldForPrompt === 'wool_tent' || heldForPrompt === 'hide_tent') {
-      return 'Left click — place tent';
+    if (isTentItem(heldForPrompt)) {
+      return heldForPrompt === 'canvas_tent'
+        ? 'Left click — pitch canvas tent'
+        : 'Left click — place tent';
     }
+    if (heldForPrompt === 'loom_kit') return 'Left click — set up loom';
     if (heldForPrompt !== null && eggSpeciesFor(heldForPrompt) !== null) {
       return 'Left click — place egg';
     }
@@ -8594,9 +8768,42 @@ async function boot() {
    */
   function placementTarget(): [number, number, number] | null {
     const yaw = -orbitCam.yaw;
-    const px = controller.pos[0] + Math.sin(yaw) * 2.5;
-    const pz = controller.pos[2] - Math.cos(yaw) * 2.5;
-    const py = heightField.heightAt(px, pz);
+    // REACH IS SHORTER INSIDE A TENT, and this is the whole fix for "we can
+    // build tents but the character can't go inside".
+    //
+    // Nothing ever REJECTED placing a campfire in a tent — I went looking for
+    // the rule and there is none, and there never was. What blocked it was
+    // arithmetic: the target is always a fixed distance ahead of the camera,
+    // and a small tent is 2.4 m across, so a 2.5 m reach lands the fire outside
+    // the canvas no matter where you stand or which way you face. The player
+    // reads that as "it won't let me", which is indistinguishable from a rule.
+    //
+    // So when the player is standing inside a tent, reach in only as far as
+    // that tent's own footprint allows. Fire in a tent is fine — it is a game,
+    // and a hearth in a canvas tent is the picture the whole camp is for.
+    const inside = tentAt(tents, controller.pos[0], controller.pos[1], controller.pos[2]);
+    const reach = inside === null
+      ? 2.5
+      // 0.6 of the smaller half-extent keeps the drop point well clear of the
+      // walls for both footprints, and is still far enough ahead that the
+      // object does not land in the player's own feet.
+      : Math.max(0.7, Math.min(tentBox(inside).hx, tentBox(inside).hz) * 0.6);
+    const px = controller.pos[0] + Math.sin(yaw) * reach;
+    const pz = controller.pos[2] - Math.cos(yaw) * reach;
+    // The CARVED ground, not the raw generated field. Same lesson creatures
+    // learned: the renderer draws the carved surface (roads graded in, up to
+    // 2.5 m of cut and fill), so a placeable dropped at the raw height stands
+    // in mid-air or buried wherever a road runs — and a tent whose floor is
+    // 2 m below your feet is a tent you cannot be inside, which is the entire
+    // complaint this milestone is about.
+    //
+    // ONE FIELD FOR ALL FIVE SAMPLES. The height and the four slope probes
+    // below must come from the same surface. Reading the centre from the carved
+    // field and the neighbours from the raw one makes every road-adjacent spot
+    // look like a cliff — it cost an afternoon here, because the symptom is
+    // "Cannot place here (too steep)" on visibly flat ground.
+    const ground = (gx: number, gz: number) => chunkManager.ground.heightAt(gx, gz);
+    const py = ground(px, pz);
     // Reject water (heightAt ≤ 0)
     if (py <= 0.05) {
       setGatherNotice('Cannot place here (water).');
@@ -8604,10 +8811,10 @@ async function boot() {
     }
     // Reject steep slope: sample a ±0.5 m radius
     const dh = Math.max(
-      Math.abs(py - heightField.heightAt(px + 0.5, pz)),
-      Math.abs(py - heightField.heightAt(px - 0.5, pz)),
-      Math.abs(py - heightField.heightAt(px, pz + 0.5)),
-      Math.abs(py - heightField.heightAt(px, pz - 0.5)),
+      Math.abs(py - ground(px + 0.5, pz)),
+      Math.abs(py - ground(px - 0.5, pz)),
+      Math.abs(py - ground(px, pz + 0.5)),
+      Math.abs(py - ground(px, pz - 0.5)),
     );
     const slopeDeg = Math.atan2(dh, 0.5) * (180 / Math.PI);
     if (slopeDeg > 20) {
@@ -8632,19 +8839,57 @@ async function boot() {
     return true;
   }
 
-  /** Try to place a tent of the appropriate tier. */
-  function tryPlaceTent(itemId: 'fiber_tent' | 'wool_tent' | 'hide_tent'): boolean {
+  /** Every item that places a tent, with the tier and footprint it places. */
+  const TENT_ITEMS = {
+    fiber_tent:  { tier: 1, shape: 'small'  },
+    wool_tent:   { tier: 2, shape: 'small'  },
+    hide_tent:   { tier: 3, shape: 'small'  },
+    // The loom's walk-in: hide-tent warmth, but a room instead of a bedroll.
+    canvas_tent: { tier: 3, shape: 'walkin' },
+  } as const satisfies Record<string, { tier: 1 | 2 | 3; shape: TentShape }>;
+
+  type TentItemId = keyof typeof TENT_ITEMS;
+
+  function isTentItem(id: string | null): id is TentItemId {
+    return id !== null && Object.prototype.hasOwnProperty.call(TENT_ITEMS, id);
+  }
+
+  /** Try to place a tent of the appropriate tier and footprint. */
+  function tryPlaceTent(itemId: TentItemId): boolean {
     if (countItem(inventory, itemId) < 1) return false;
     const pos = placementTarget();
     if (pos === null) return false;
     removeItem(inventory, itemId, 1);
     invChanged();
-    const tier: 1 | 2 | 3 = itemId === 'fiber_tent' ? 1 : itemId === 'wool_tent' ? 2 : 3;
-    const tent = createTent(pos[0], pos[1], pos[2], tier);
+    const { tier, shape } = TENT_ITEMS[itemId];
+    const tent = createTent(pos[0], pos[1], pos[2], tier, shape);
     tents.push(tent);
     saveTents(tents);
     rebuildTentDraws();
-    setGatherNotice(`Tent placed (tier ${tier}).`);
+    setGatherNotice(shape === 'walkin'
+      ? 'Canvas tent pitched — step inside, out of the rain.'
+      : `Tent placed (tier ${tier}).`);
+    return true;
+  }
+
+  /**
+   * Try to place a loom_kit. Consumes 1 loom_kit.
+   *
+   * Faces the player, which every other placeable can ignore because a fire
+   * ring and a tent ridge look the same from any side and a loom does not.
+   */
+  function tryPlaceLoom(): boolean {
+    if (countItem(inventory, 'loom_kit') < 1) return false;
+    const pos = placementTarget();
+    if (pos === null) return false;
+    removeItem(inventory, 'loom_kit', 1);
+    invChanged();
+    // orbitCam.yaw is the camera's; the loom's front should look back at it.
+    const loom = createLoom(pos[0], pos[1], pos[2], -orbitCam.yaw + Math.PI);
+    looms.push(loom);
+    saveLooms(looms);
+    rebuildLoomDraws();
+    setGatherNotice('Loom placed. Stand beside it to weave.');
     return true;
   }
 
@@ -9434,10 +9679,29 @@ async function boot() {
       controller.pos[0], controller.pos[1] + PLAYER_HEIGHT * 0.9, controller.pos[2]);
   }
 
+  /**
+   * True when the player is inside a placed tent's canvas.
+   *
+   * Tested at the FEET, not the head. Everything else here asks about the head
+   * because masonry has storeys and you can stand under a first floor; a tent
+   * has one volume and a player standing in a small one pokes their head
+   * through the ridge, so a head test would have said "not sheltered" for the
+   * exact case the tent exists to cover. `tentRoofAt` allows a metre of slack
+   * below the tent's own ground sample so a tent on a slope does not strobe.
+   *
+   * This is the SAME `shelter` value the castle uses, deliberately. There is
+   * one question — is there something over me — and one eased answer to it, so
+   * rain, the wind mix, the rain-on-a-roof audio bed and anything added later
+   * all agree without being told about tents individually.
+   */
+  function underTentRoof(): boolean {
+    return tentRoofAt(tents, controller.pos[0], controller.pos[1], controller.pos[2]);
+  }
+
   function stepShelter(inInterior: boolean, nowMs: number): void {
     const dtS = Math.min(0.1, (nowMs - shelterLastMs) / 1000);
     shelterLastMs = nowMs;
-    const want = (inInterior || underCastleRoof()) ? 1 : 0;
+    const want = (inInterior || underCastleRoof() || underTentRoof()) ? 1 : 0;
     shelter += (want - shelter) * Math.min(1, SHELTER_EASE_PER_S * dtS);
     if (Math.abs(shelter - want) < 0.004) shelter = want;
   }
@@ -9831,8 +10095,12 @@ async function boot() {
         tryPlaceCampfire();
         return;
       }
-      if (heldId2 === 'fiber_tent' || heldId2 === 'wool_tent' || heldId2 === 'hide_tent') {
-        tryPlaceTent(heldId2 as 'fiber_tent' | 'wool_tent' | 'hide_tent');
+      if (isTentItem(heldId2)) {
+        tryPlaceTent(heldId2);
+        return;
+      }
+      if (heldId2 === 'loom_kit') {
+        tryPlaceLoom();
         return;
       }
       // Phase K: 2b. Place egg
@@ -11028,6 +11296,7 @@ async function boot() {
       // are billboards already queued by emitFireVfx above.
       dDraws.push(...fireDraws);
       dDraws.push(...tentDraws);
+      dDraws.push(...loomDraws);
       dDraws.push(...eggDraws);
       dDraws.push(...nestDraws);
     }

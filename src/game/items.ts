@@ -156,6 +156,30 @@ export const ITEM_DEFS = {
   fiber_tent:   { name: 'Fiber Tent',    kind: 'material',  color: [0.55, 0.60, 0.40], stack: 1,  warmth: 0.5 },
   wool_tent:    { name: 'Wool Tent',     kind: 'material',  color: [0.75, 0.72, 0.65], stack: 1,  warmth: 0.8 },
   hide_tent:    { name: 'Hide Tent',     kind: 'material',  color: [0.58, 0.42, 0.28], stack: 1,  warmth: 1.1 },
+  /**
+   * The walk-in tent. Same placement path and same warmth tier as the hide
+   * tent; what it buys is FLOOR — a volume you stand inside rather than a
+   * bedroll you huddle beside, and the one shelter you can set a campfire down
+   * in. See shelter.ts `TentShape` for the two footprints.
+   */
+  canvas_tent:  { name: 'Canvas Tent',   kind: 'material',  color: [0.80, 0.76, 0.66], stack: 1,  warmth: 1.2 },
+
+  // --- The loom (T3 station) -----------------------------------------------
+  /**
+   * The loom, flat-packed. A placeable station in the same idiom as
+   * `campfire_kit`: the item IS the station until you put it down.
+   *
+   * Forged rather than lashed together — the reed and the heddle rod are iron,
+   * which is what makes the loom a tier ABOVE the forge rather than beside it.
+   */
+  loom_kit:     { name: 'Loom Kit',      kind: 'material',  color: [0.60, 0.46, 0.30], stack: 5  },
+  /**
+   * Woven cloth — the loom's only primary output and the input to everything
+   * else it makes. Spinning was already solved by hand (`wool → wool_yarn`);
+   * weaving is the verb the game did not have, which is why the T3 station is
+   * a loom and not a spinning wheel.
+   */
+  cloth:        { name: 'Cloth',         kind: 'material',  color: [0.86, 0.83, 0.76], stack: 99 },
 
   // --- Weapons (Phase E) ----------------------------------------------------
   /**
@@ -221,6 +245,17 @@ export const ITEM_DEFS = {
   leather_cap:     { name: 'Leather Cap',     kind: 'armor', color: [0.55, 0.38, 0.22], stack: 1, warmth: 0.2, armor: { slot: 'head', defense: 2 } },
   leather_tunic:   { name: 'Leather Tunic',   kind: 'armor', color: [0.52, 0.36, 0.20], stack: 1, warmth: 0.2, armor: { slot: 'body', defense: 3 } },
   leather_leggings:{ name: 'Leather Leggings',kind: 'armor', color: [0.50, 0.34, 0.18], stack: 1, warmth: 0.2, armor: { slot: 'legs', defense: 2 } },
+
+  // --- Armor: quilted tier (defense 3/4/3, warmth 0.6) ---------------------
+  //
+  // The loom's armour, and the tier that exists because iron is COLD. Iron
+  // out-defends it 4/6/4 to 3/4/3 and carries warmth 0, so alpine nights and
+  // winter rain are the one place a full iron set is the wrong answer; a
+  // quilted gambeson is worse in a fight and better on the mountain. Madder
+  // red because a dyed woollen coat is the loudest thing a yarn person owns.
+  quilted_hood:     { name: 'Quilted Hood',     kind: 'armor', color: [0.66, 0.34, 0.30], stack: 1, warmth: 0.6, armor: { slot: 'head', defense: 3 } },
+  quilted_tunic:    { name: 'Quilted Tunic',    kind: 'armor', color: [0.62, 0.31, 0.28], stack: 1, warmth: 0.6, armor: { slot: 'body', defense: 4 } },
+  quilted_leggings: { name: 'Quilted Leggings', kind: 'armor', color: [0.58, 0.29, 0.26], stack: 1, warmth: 0.6, armor: { slot: 'legs', defense: 3 } },
 
   // --- Armor: iron tier (defense 4/6/4, warmth 0) --------------------------
   iron_helm:  { name: 'Iron Helm',  kind: 'armor', color: [0.68, 0.70, 0.74], stack: 1, warmth: 0, armor: { slot: 'head', defense: 4 } },
