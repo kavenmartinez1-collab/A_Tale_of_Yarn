@@ -321,13 +321,16 @@ const MODELS = path.join(REPO, 'models');
  * REQUIRED_ASSETS list upstairs exists to prevent.
  */
 const MUSIC_DIR = 'music';
+// Recorded gameplay samples (the wingbeats) — same provenance and same
+// serving path as the soundtrack, vendored small enough to commit.
+const SFX_DIR = 'sfx';
 const shipModels = fs.existsSync(MODELS)
   ? fs.readdirSync(MODELS).filter((d) => {
     // Only the vendored HF-style repos — never the flux2/piper/whisper dirs,
     // which are the playground's and are not on the game path at all.
     const p = path.join(MODELS, d);
     if (!fs.statSync(p).isDirectory()) return false;
-    return d.includes('--') || d === MUSIC_DIR;
+    return d.includes('--') || d === MUSIC_DIR || d === SFX_DIR;
   })
   : [];
 for (const d of SKIP_MODELS ? [] : shipModels) {
@@ -419,6 +422,24 @@ if (!SKIP_MODELS) {
   if (badMusic.length) {
     console.error('\npack-steam: refusing to build a depot without the developer\'s soundtrack.');
     console.error('            run `npx tsx scripts/prepare-music.mts` and pack again.\n');
+    process.exit(1);
+  }
+  const sfxDir = path.join(OUT, 'resources', 'models', SFX_DIR);
+  const REQUIRED_SFX = [
+    ['wingbeat-dragon.wav', 0.12], ['wingbeat-wyvern.wav', 0.08],
+    ['wingbeat-griffin.wav', 0.06],
+  ];
+  const badSfx = REQUIRED_SFX.filter(([file, minMB]) => {
+    const p = path.join(sfxDir, file);
+    return !fs.existsSync(p) || fs.statSync(p).size < minMB * 1024 * 1024;
+  });
+  for (const [file, minMB] of badSfx) {
+    const p = path.join(sfxDir, file);
+    const got = fs.existsSync(p) ? `${(fs.statSync(p).size / 1048576).toFixed(2)} MB` : 'ABSENT';
+    console.error(`      MISSING  models/sfx/${file} — wingbeat sample (${got}, need >= ${minMB} MB)`);
+  }
+  if (badSfx.length) {
+    console.error('\npack-steam: refusing to build a depot without the wingbeat samples.');
     process.exit(1);
   }
   console.log(`      required music files present: `

@@ -22,6 +22,7 @@ models/*
 # `models/music` itself, and git does not descend into an excluded directory,
 # so a bare `!models/music/**` would never match anything.
 !models/music/
+!models/sfx/
 
 # build + runtime artifacts (standalone repo)
 dist/

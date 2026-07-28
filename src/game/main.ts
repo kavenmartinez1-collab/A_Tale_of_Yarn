@@ -158,7 +158,7 @@ import { castleGateLocal } from './settlement/settlement-layout';
 import { EntityManager } from './entities/entity-manager';
 import { EntityRenderer, DEAD_SHOW_S } from './entities/entity-renderer';
 import {
-  stepAnimal, onEntityDamaged, FOLLOW_RADIUS, DEFEND_GIVEUP_DIST,
+  stepAnimal, onEntityDamaged, attackCadence, FOLLOW_RADIUS, DEFEND_GIVEUP_DIST,
   type DefendTarget,
   CombatIndex, wantsAirborne, staggerAnimal, staggerRemaining,
 } from './entities/animal-ai';
@@ -207,6 +207,7 @@ import {
   type CrimeState,
 } from './crime';
 import { GameAudio, type AmbienceState } from './audio/audio-engine';
+import { WINGBEAT_FOR, type SampleName } from './audio/samples';
 import { settings, type GameSettings } from './ui/game-settings';
 import { buildControlsPanel } from './ui/controls-panel';
 import { VoiceOut } from './voice/voice-out';
@@ -693,6 +694,8 @@ declare global {
       occupiedBuilding(): { settlementName: string; padIndex: number; kind: string } | null;
       /** The interaction line the HUD is currently showing. */
       interactPrompt(): string | null;
+      /** Voiced recorded-sample events (wingbeats) — harness instrument. */
+      sampleEvents(n: import('./audio/samples').SampleName): number;
       /** Who the player could talk to right now. */
       nearestNpc(): { id: string; name: string; role: string } | null;
       /** Teleport to the exit zone inside a building. */
@@ -2688,6 +2691,12 @@ async function boot() {
   );
   entityManager.ecologyDirector = directorOff ? null : ecologyDirector;
   const entityRenderer = new EntityRenderer(renderer);
+  // Wingbeat audio rides the renderer's animation clock, so the whoosh is the
+  // same event as the visible downstroke — see EntityRenderer.onWingbeat.
+  entityRenderer.onWingbeat = (species, dist) => {
+    const wb = WINGBEAT_FOR[species];
+    if (wb !== undefined) audio.playSample(wb, { dist });
+  };
   // Lets winged creatures detect flight from height above ground rather than
   // from vertical velocity, so a dragon holding level altitude keeps beating
   // its wings instead of folding them because it happens not to be climbing.
@@ -4389,6 +4398,11 @@ async function boot() {
     if (!cmd.handOff) {
       e.x = cmd.x; e.y = cmd.y; e.z = cmd.z; e.yaw = cmd.yaw;
       e.mode = 'aggro';
+      // Every scripted frame parks the swing clock, so the frame that hands
+      // the dragon to the ordinary AI hands it a FULL cadence: the first bite
+      // after landing winds up on screen like every later one, instead of
+      // landing on the very tick of the handoff.
+      e.stateTimer = attackCadence(SPECIES_DEFS[e.species]);
       e.walkPhase += DRAGON_AIRBORNE_FLAP_RATE * dtS;
     } else {
       // Grounded: hand the animal to the ordinary AI. `flightOverride` has to
@@ -4427,6 +4441,12 @@ async function boot() {
     king.x = rp.x; king.y = rp.y; king.z = rp.z; king.yaw = rp.yaw;
     king.mode = dragon.mode === 'dead' ? king.mode : dragon.mode;
     king.walkPhase = dragon.walkPhase;
+    // Park his swing clock every seated frame. He rides in `aggro` (copied
+    // from the dragon just above) and nothing else touches his timer while he
+    // is a passenger — without this he dismounted with a zeroed clock, and
+    // his greeting to whoever stood at the landing was an untelegraphed
+    // 8-damage cleave on that same tick.
+    king.stateTimer = attackCadence(SPECIES_DEFS[king.species]);
   }
 
   /** True while the King is still a passenger — drives his seated pose. */
@@ -6419,6 +6439,7 @@ async function boot() {
     occupiedBuilding: () => buildingManager.occupiedBuilding,
     /** The interaction line the HUD is currently showing. */
     interactPrompt: () => lastInteractPrompt,
+    sampleEvents: (n: SampleName) => audio.sampleEvents(n),
     /** Who the player could talk to right now (indoors or out). */
     nearestNpc: () => {
       const rt = nearestNpc();

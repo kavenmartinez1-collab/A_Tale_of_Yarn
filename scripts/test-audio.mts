@@ -728,7 +728,10 @@ check('envelopeDuration([1, 2, 3]) == 6', Math.abs(envelopeDuration([1, 2, 3]) -
   {
     const STRIKE_S = 0.055, BURN_S = 0.34, LIFE_S = 1.10;
     const r = SFX_RECIPES.tintreach_bolt;
-    check('tintreach_bolt duration == LIFE_S', Math.abs(r.duration - LIFE_S) < 1e-9);
+    // The sound outlasts the seam deliberately: thunder reverberates after
+    // the flash. But it must never die BEFORE the visual.
+    check('tintreach_bolt outlasts the seam', r.duration >= LIFE_S,
+      `${r.duration}s vs LIFE_S ${LIFE_S}s`);
 
     const envs = [...(r.osc ?? []), ...(r.noise ?? [])].map(l => envelopeDuration(l.envelope));
     check('tintreach_bolt has a layer ending at STRIKE_S',
@@ -737,8 +740,13 @@ check('envelopeDuration([1, 2, 3]) == 6', Math.abs(envelopeDuration([1, 2, 3]) -
       envs.some(d => Math.abs(d - BURN_S) < 0.002));
     check('tintreach_bolt has a layer ending at LIFE_S',
       envs.some(d => Math.abs(d - LIFE_S) < 0.002));
-    check('tintreach_bolt flickers at RESTRIKE_HZ (10)',
-      [...(r.noise ?? [])].some(l => l.flickerHz === 10 && l.flickerDepth === 0.45));
+    // Playtest verdict, kept as a regression: a PERIODIC flicker in the burn
+    // window reads as a laser beam. Lightning is thunder — nothing periodic.
+    check('tintreach_bolt has no periodic flicker (laser regression)',
+      [...(r.noise ?? [])].every(l => l.flickerHz === undefined));
+    check('tintreach_bolt has a full-length rumble tail',
+      [...(r.noise ?? [])].some(l => l.color === 'brown'
+        && Math.abs(envelopeDuration(l.envelope) - r.duration) < 1e-9));
 
     // The crack must be the loudest moment, not the tail: peak inside STRIKE_S
     // + one flicker step, since that is when the eye sees the strike.

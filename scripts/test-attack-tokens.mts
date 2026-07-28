@@ -21,7 +21,7 @@ import {
   CROWD_AT, CROWD_TOKENS, SOLO_TOKENS, LANDING_FLOOR_S, FOLLOW_THROUGH_S,
   INTENT_TTL_S, TOKEN_MAX_HOLD_S, CONTEND_PAD, RING_PAD_MIN, RING_PAD_MAX,
 } from '../src/game/combat/attack-tokens';
-import { stepAnimal, attackReach } from '../src/game/entities/animal-ai';
+import { stepAnimal, attackReach, attackCadence, onEntityDamaged } from '../src/game/entities/animal-ai';
 import { SPECIES_DEFS } from '../src/game/entities/entity-types';
 import type { EntityState } from '../src/game/entities/entity-manager';
 import { mulberry32 } from '../src/game/mesh-utils';
@@ -458,6 +458,63 @@ function makeWolf(n: number, x: number, z: number): EntityState {
   check('a lone wolf attacks identically with and without a pool',
     bare === pooled, `bare=${bare} pooled=${pooled}`);
   check('...and that is one blow in 1.2 s', pooled === 1, `${pooled}`);
+}
+
+// ---------------------------------------------------------------------------
+// 11. The first blow TELLS
+//
+// Regression for a playtest report: "I attack the boss and I hurt myself."
+// Both aggro entries used to zero the swing clock, so an enemy provoked
+// INSIDE its own reach — which is how every melee fight starts, because
+// landing a sword means standing 3.2 m from something whose reach can be
+// 4.1 m — retaliated on the very tick it was provoked. No windup ever
+// reached the screen; the player's own attack and the counter-damage were
+// simultaneous, and the counter was unparryable in practice. Entry now
+// parks the clock a full cadence out, like every other branch in `engage`.
+// ---------------------------------------------------------------------------
+
+{
+  const firstBlow = (
+    species: 'wolf' | 'dread_king',
+    provoke: (e: EntityState) => void,
+  ): { aggro: boolean; hitAtS: number | null } => {
+    let hitAtS: number | null = null;
+    const e: EntityState = {
+      id: `tell:${species}`, species, x: 0.5, y: 5, z: 0, yaw: 0, hp: 999,
+      mode: 'idle', walkPhase: 0, colorVariant: 0, homeX: 0.5, homeZ: 0,
+      stateTimer: 0, fleeTimer: 0,
+    };
+    provoke(e);
+    for (let t = 0; t < 60 * 6 && hitAtS === null; t++) { // 6 s of fighting
+      stepAnimal(e, DT, {
+        playerX: 0, playerZ: 0, playerDist: 0.5, playerY: 5,
+        rng: mulberry32(11), heightAt: () => 5,
+        speciesDef: SPECIES_DEFS[species],
+        onAttackPlayer: () => { if (hitAtS === null) hitAtS = (t + 1) * DT; },
+        tokens: null,
+      });
+    }
+    return { aggro: e.mode === 'aggro', hitAtS };
+  };
+
+  // (a) Provoked by damage — the reported case, on the boss's own species.
+  const king = firstBlow('dread_king', (e) => onEntityDamaged(e));
+  const kingCad = attackCadence(SPECIES_DEFS.dread_king);
+  check('a struck Dread King turns hostile', king.aggro);
+  check('...but his counter is NOT on the tick he was struck',
+    king.hitAtS !== null && king.hitAtS > kingCad * 0.9,
+    `first blow at ${king.hitAtS?.toFixed(2)} s against a ${kingCad} s cadence`);
+  check('...and the counter does still arrive',
+    king.hitAtS !== null && king.hitAtS < kingCad + 1.0,
+    `first blow at ${king.hitAtS} s`);
+
+  // (b) Provoked by proximity: walking up to it earns the same windup.
+  const wolf = firstBlow('wolf', () => {});
+  const wolfCad = attackCadence(SPECIES_DEFS.wolf);
+  check('a walked-up-to wolf aggros', wolf.aggro);
+  check('...and its first bite also waits out a full cadence',
+    wolf.hitAtS !== null && wolf.hitAtS > wolfCad * 0.9,
+    `first bite at ${wolf.hitAtS?.toFixed(2)} s against a ${wolfCad} s cadence`);
 }
 
 // ---------------------------------------------------------------------------

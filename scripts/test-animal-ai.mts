@@ -8,7 +8,7 @@
  */
 
 import {
-  stepAnimal, onEntityDamaged, aggroDamage, FOLLOW_RADIUS, DEFEND_GIVEUP_DIST,
+  stepAnimal, onEntityDamaged, aggroDamage, attackCadence, FOLLOW_RADIUS, DEFEND_GIVEUP_DIST,
   CombatIndex, isFighting, wantsAirborne,
   type DefendTarget,
 } from '../src/game/entities/animal-ai';
@@ -251,7 +251,11 @@ function makeCtx(overrides: Partial<AnimalAICtx> = {}): AnimalAICtx {
   onEntityDamaged(e);
 
   check('griffin enters aggro on damage', e.mode === 'aggro');
-  check('aggro stateTimer reset', e.stateTimer === 0);
+  // Parked a FULL cadence out, not zeroed. A zeroed clock meant the riposte
+  // landed on the same tick as the provoking blow ("I attack the boss and I
+  // hurt myself") — test-attack-tokens.mts section 11 pins the timing.
+  check('aggro stateTimer parked at a full cadence',
+    e.stateTimer === attackCadence(SPECIES_DEFS['griffin']));
 }
 
 // ---------------------------------------------------------------------------
