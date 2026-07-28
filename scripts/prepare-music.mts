@@ -82,6 +82,16 @@ const BED_RMS_DBFS = {
 /** The bus trim between a song source and the output: MASTER_TRIM 0.55. */
 const BUS_TRIM_DB = 20 * Math.log10(0.55);
 
+/**
+ * Songs sit ABOVE the bed, not level with it. The first pass matched each
+ * song to the ambient pad's own rms, which put every interlude exactly in
+ * the mix's floor — the composer's verdict (2026-07-28): "they are drowned
+ * out easy." +4 dB keeps the songs clearly foreground. The -3 dBFS peak
+ * ceiling still wins whenever it is smaller, which is why the castle theme
+ * stays where it is: its peaks already touch the ceiling.
+ */
+const SONG_PRESENCE_DB = 4;
+
 /** Hard ceiling from the brief. Never exceeded, whatever the loudness match wants. */
 const PEAK_CEILING_DBFS = -3;
 
@@ -233,7 +243,7 @@ function main(): void {
 
     const target = BED_RMS_DBFS[spec.bed];
     // Gain that lands the track's RMS on the bed's, once the bus trim is paid.
-    const loudnessGain = target - lv.rmsDb - BUS_TRIM_DB;
+    const loudnessGain = target + SONG_PRESENCE_DB - lv.rmsDb - BUS_TRIM_DB;
     // Gain that lands its peak on the ceiling.
     const peakGain = PEAK_CEILING_DBFS - lv.peakDb;
     const gainDb = Math.min(loudnessGain, peakGain);

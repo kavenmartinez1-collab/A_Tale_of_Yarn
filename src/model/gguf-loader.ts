@@ -109,6 +109,127 @@ const SHEXP_GATE_RE = /^blk\.\d+\.ffn_gate_inp_shexp\.weight$/;
 const BLK_RE = /^blk\.(\d+)\./;
 const DEAD_KV_RE = /^blk\.(\d+)\.(attn_k|attn_v|attn_k_norm)\.weight$/;
 
+// ── Cooperative pacing ─────────────────────────────────────────────────
+//
+// The NPC model loads while the game is RENDERING, and the naive loop is a
+// frame-killer three ways at once: a 128 MB `arrayBuffer()` memcpy, a
+// multi-hundred-MB synchronous k-quant repack on the main thread, and a
+// single giant `writeBuffer` on the one queue WebGPU gives us — the same
+// queue every draw call uses. A pacer breaks all three into slices and asks
+// permission before each one, so the frame loop can meter loader work to
+// its spare time. No pacer -> the exact old single-shot path, byte for byte:
+// the Director, the parity suites and every offline test see no change.
+
+export interface GGUFLoadPacer {
+  /**
+   * Awaited before each slice of work (`bytes` = the slice's input size).
+   * Resolve immediately for full speed; park the promise to hold the loader.
+   */
+  budget(bytes: number): Promise<void>;
+  /** Repack/upload slice size in input bytes. Default 8 MiB. */
+  sliceBytes?: number;
+  /** Network range size while paced. Default 16 MiB (a 128 MB
+   *  `arrayBuffer()` resolve is a ~40 ms main-thread memcpy on its own). */
+  fetchChunkBytes?: number;
+}
+
+const PACED_SLICE = 8 * 1024 * 1024;
+const PACED_FETCH = 16 * 1024 * 1024;
+
+/**
+ * Repack a quant tensor to its GPU layout and upload it in paced slices.
+ *
+ * Correct because every supported quant format is BLOCK-INDEPENDENT: a run
+ * of whole blocks repacks to exactly the same bytes whether it is passed
+ * alone or as part of the full tensor, and the GPU layout is a fixed
+ * `strideU32` per block — so slice N writes at offset N*stride with no
+ * seams. Slices are whole multiples of `blockElems`, which also satisfies
+ * every repack function's own n-divisibility assertions.
+ */
+async function uploadQuantPaced(
+  device: GPUDevice,
+  ggmlType: number,
+  raw: Uint8Array,
+  elementCount: number,
+  label: string,
+  pacer: GGUFLoadPacer,
+): Promise<GPUBuffer> {
+  const layout = GGUF_GPU_LAYOUT[ggmlType];
+  const totalBlocks = elementCount / layout.blockElems;
+  const inBlockBytes = raw.byteLength / totalBlocks;
+  if (!Number.isInteger(totalBlocks) || !Number.isInteger(inBlockBytes)) {
+    throw new Error(`[GGUF] "${label}": ${elementCount} elems / ${raw.byteLength} B not block-aligned`);
+  }
+  const buf = device.createBuffer({
+    size: totalBlocks * layout.strideU32 * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    label,
+  });
+  const sliceBytes = pacer.sliceBytes ?? PACED_SLICE;
+  const blocksPerSlice = Math.max(1, Math.floor(sliceBytes / inBlockBytes));
+  for (let b0 = 0; b0 < totalBlocks; b0 += blocksPerSlice) {
+    const nb = Math.min(blocksPerSlice, totalBlocks - b0);
+    await pacer.budget(nb * inBlockBytes);
+    const part = repackGGUFForGPU(
+      ggmlType,
+      raw.subarray(b0 * inBlockBytes, (b0 + nb) * inBlockBytes),
+      nb * layout.blockElems);
+    device.queue.writeBuffer(buf, b0 * layout.strideU32 * 4,
+      part.buffer as ArrayBuffer, part.byteOffset, part.byteLength);
+  }
+  return buf;
+}
+
+/** Dequant F16/BF16 to f32 and upload in paced slices (element-aligned). */
+async function uploadHalfPaced(
+  device: GPUDevice,
+  raw: Uint8Array,
+  elementCount: number,
+  label: string,
+  bf16: boolean,
+  pacer: GGUFLoadPacer,
+): Promise<GPUBuffer> {
+  const buf = device.createBuffer({
+    size: elementCount * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    label,
+  });
+  const perSlice = Math.max(1024, Math.floor((pacer.sliceBytes ?? PACED_SLICE) / 2));
+  for (let e0 = 0; e0 < elementCount; e0 += perSlice) {
+    const n = Math.min(perSlice, elementCount - e0);
+    await pacer.budget(n * 2);
+    const part = (bf16 ? dequantBF16 : dequantF16)(raw.subarray(e0 * 2, (e0 + n) * 2), n);
+    device.queue.writeBuffer(buf, e0 * 4, part.buffer as ArrayBuffer, part.byteOffset, part.byteLength);
+  }
+  return buf;
+}
+
+/** Upload raw (already-GPU-shaped) bytes in paced slices. */
+async function uploadRawPaced(
+  device: GPUDevice,
+  data: Uint8Array | Float32Array,
+  label: string,
+  pacer: GGUFLoadPacer,
+): Promise<GPUBuffer> {
+  if (data.byteLength % 4 !== 0) {
+    throw new Error(`[GGUF] Upload "${label}": byteLength ${data.byteLength} not 4-aligned`);
+  }
+  const buf = device.createBuffer({
+    size: data.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    label,
+  });
+  const u8 = data instanceof Uint8Array
+    ? data : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  const sliceBytes = Math.ceil((pacer.sliceBytes ?? PACED_SLICE) / 4) * 4;
+  for (let o = 0; o < u8.byteLength; o += sliceBytes) {
+    const n = Math.min(sliceBytes, u8.byteLength - o);
+    await pacer.budget(n);
+    device.queue.writeBuffer(buf, o, u8.buffer as ArrayBuffer, u8.byteOffset + o, n);
+  }
+  return buf;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────
 
 /** Planned GPU bytes for a tensor after repack/dequant (for the VRAM gate). */
@@ -123,12 +244,16 @@ function plannedGPUBytes(t: GGUFTensorInfo): number {
   return t.byteLength; // F32 raw
 }
 
-/** Fetch a tensor's bytes in ≤128 MB chunks, asserting every chunk size. */
-async function fetchTensorBytes(url: string, offset: number, byteLength: number): Promise<Uint8Array> {
+/** Fetch a tensor's bytes in <=128 MB chunks (paced: smaller, budgeted),
+ *  asserting every chunk size. */
+async function fetchTensorBytes(url: string, offset: number, byteLength: number,
+  pacer?: GGUFLoadPacer): Promise<Uint8Array> {
+  const chunk = pacer !== undefined ? (pacer.fetchChunkBytes ?? PACED_FETCH) : MAX_CHUNK;
   const out = new Uint8Array(byteLength);
   let got = 0;
   while (got < byteLength) {
-    const n = Math.min(MAX_CHUNK, byteLength - got);
+    const n = Math.min(chunk, byteLength - got);
+    if (pacer !== undefined) await pacer.budget(n);
     const part = await fetchRange(url, offset + got, offset + got + n);
     if (part.byteLength !== n) {
       throw new Error(`[GGUF] Short range read at ${offset + got}: got ${part.byteLength}, want ${n}`);
@@ -166,8 +291,9 @@ export async function loadGGUFModel(
   repo: string,
   filename: string,
   onProgress?: (p: GGUFLoadProgress) => void,
-  opts?: { vramBudgetBytes?: number; ramBudgetBytes?: number },
+  opts?: { vramBudgetBytes?: number; ramBudgetBytes?: number; pacer?: GGUFLoadPacer },
 ): Promise<LoadedGGUFModel> {
+  const pacer = opts?.pacer;
   const t0 = performance.now();
   const url = resolveFileUrl(repo, filename);
 
@@ -381,7 +507,7 @@ export async function loadGGUFModel(
       continue;
     }
 
-    const raw = await fetchTensorBytes(url, t.offset, t.byteLength);
+    const raw = await fetchTensorBytes(url, t.offset, t.byteLength, pacer);
 
     if (isCPUOnly(t.name)) {
       const { blockSize, typeSize } = ggmlTypeTraits(t.ggmlType);
@@ -410,13 +536,21 @@ export async function loadGGUFModel(
           }
           payload = inv;
         }
-        buf = uploadToGPU(device, payload, t.name);
+        buf = pacer !== undefined && payload === raw
+          ? await uploadRawPaced(device, payload, t.name, pacer)
+          : uploadToGPU(device, payload, t.name);
       } else if (t.ggmlType === GGML_TYPES.F16) {
-        buf = uploadToGPU(device, dequantF16(raw, t.elementCount), t.name);
+        buf = pacer !== undefined
+          ? await uploadHalfPaced(device, raw, t.elementCount, t.name, false, pacer)
+          : uploadToGPU(device, dequantF16(raw, t.elementCount), t.name);
       } else if (t.ggmlType === GGML_TYPES.BF16) {
-        buf = uploadToGPU(device, dequantBF16(raw, t.elementCount), t.name);
+        buf = pacer !== undefined
+          ? await uploadHalfPaced(device, raw, t.elementCount, t.name, true, pacer)
+          : uploadToGPU(device, dequantBF16(raw, t.elementCount), t.name);
       } else if (QUANT_GPU_TYPES.has(t.ggmlType)) {
-        buf = uploadToGPU(device, repackGGUFForGPU(t.ggmlType, raw, t.elementCount), t.name);
+        buf = pacer !== undefined
+          ? await uploadQuantPaced(device, t.ggmlType, raw, t.elementCount, t.name, pacer)
+          : uploadToGPU(device, repackGGUFForGPU(t.ggmlType, raw, t.elementCount), t.name);
         isQuantized = true;
       } else {
         throw new Error(`[GGUF] Tensor "${t.name}": unsupported ggml type ${t.typeName} (${t.ggmlType})`);

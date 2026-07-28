@@ -166,7 +166,7 @@ export const SONGS: Record<SongId, SongTrack> = {
     tonicPc: 5, // F
     mode: 'aeolian',
     keyName: 'F minor',
-    gainDb: -9.58,
+    gainDb: -5.58,
   },
   ryan: {
     id: 'ryan',
@@ -177,7 +177,7 @@ export const SONGS: Record<SongId, SongTrack> = {
     tonicPc: 3, // Eb
     mode: 'aeolian',
     keyName: 'E-flat minor',
-    gainDb: -10.08,
+    gainDb: -6.08,
   },
   untitled: {
     id: 'untitled',
@@ -188,12 +188,16 @@ export const SONGS: Record<SongId, SongTrack> = {
     tonicPc: 0, // C
     mode: 'ionian',
     keyName: 'C major',
-    gainDb: -11.38,
+    gainDb: -7.38,
   },
   castle: {
     id: 'castle',
     file: 'castle-vhaeron.mp3',
-    durationS: 76.069,
+    // First half only, by the composer's own verdict (2026-07-28): the back
+    // half of Project 1 carries a found-voice sample they never liked, so the
+    // master is trimmed at 37.95 s — just before the 38.0 s section re-entry
+    // that opens that half — with a 3 s musical fade across the breakdown.
+    durationS: 37.95,
     bpm: 117.5,
     gridOriginS: 0.62,
     // A, with E almost as strong — they are a fifth apart, and the chroma does
@@ -204,7 +208,9 @@ export const SONGS: Record<SongId, SongTrack> = {
     tonicPc: 9,
     mode: 'ionian',
     keyName: 'A / E (fifth-ambiguous)',
-    gainDb: -2.89,
+    // peak-ceiling, not loudness-match: the surviving half is quieter overall
+    // (rms -22.2) and matching it upward would spend the -3 dBFS headroom.
+    gainDb: 0,
   },
 };
 
@@ -293,16 +299,12 @@ export const SEGMENTS: Record<SegmentId, SongSegment> = {
     id: 'castle',
     song: 'castle',
     startS: 0,
-    // The master's music stops at about 70.4 s and the remaining 5.7 s is dead
-    // air — measured as digital silence from 72.56 s and near-silence from
-    // 70.36 s. Playing it would hand the exit protocol three seconds of nothing
-    // to rise the pad under, which is the one thing the protocol exists to
-    // prevent. Ending the segment at 72 s discards no music at all.
-    //
-    // This is a segment boundary, not an edit: the file is still vendored
-    // bit-exact, and when the edited castle version arrives this line is the
-    // only thing that needs revisiting.
-    endS: 72.0,
+    // The trim's own fade drops below the silence threshold at 37.71 s
+    // (prepare-music measures [37.71, 37.95] as near-silence). The segment
+    // ends there so the exit protocol rises the pad under real music, never
+    // under the last breath of a fade — same rule as the old 72 s boundary
+    // on the full-length master.
+    endS: 37.71,
     fadeInS: 0,
     fadeOutS: 2.0,
     // The opening figure is punctuated by eleven measured rests, the last

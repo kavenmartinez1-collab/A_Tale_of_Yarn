@@ -113,6 +113,7 @@ import {
 import {
   buildNpcChatPanel, onNpcChatClosed, loadStockMap, saveStockMap,
   chatState, npcGoldFromMap, isNpcModelKey, preloadNpcChat, warmNpcApproach,
+  npcModelLoadState,
   voiceInput,
   type StockMap, setVoiceOut,
 } from './ui/npc-chat-panel';
@@ -696,6 +697,12 @@ declare global {
       interactPrompt(): string | null;
       /** Voiced recorded-sample events (wingbeats) — harness instrument. */
       sampleEvents(n: import('./audio/samples').SampleName): number;
+      /** Boot phase marks [name, msSinceBootStart] — loading instrument. */
+      bootTimings(): Array<[string, number]>;
+      /** NPC model load state — loading instrument. */
+      npcModelLoad(): { state: 'idle' | 'loading' | 'ready' | 'error'; frac: number };
+      /** Force the loader gate (true/false), or null for automatic. */
+      setLoaderThrottled(v: boolean | null): boolean;
       /** Who the player could talk to right now. */
       nearestNpc(): { id: string; name: string; role: string } | null;
       /** Teleport to the exit zone inside a building. */
@@ -888,6 +895,14 @@ function createPlayerCharacter(renderer: Renderer): {
 }
 
 async function boot() {
+  // Boot-phase timing marks — the instrument the "slow loading" reports were
+  // missing. Read back via __gameDebug.bootTimings(); one summary line logs
+  // on the first rendered frame.
+  const bootT0 = performance.now();
+  const bootMarks: Array<[string, number]> = [];
+  const bootMark = (name: string): void => {
+    bootMarks.push([name, Math.round(performance.now() - bootT0)]);
+  };
   window.__gameError = null;
   window.__gameReady = false;
   window.__gameStats = { frameCount: 0, fps: 0, chunkCount: 0 };
@@ -913,6 +928,44 @@ async function boot() {
   const canvas = document.getElementById('game-canvas') as HTMLCanvasElement;
   const hud = document.getElementById('hud')!;
   const overlay = document.getElementById('overlay')!;
+
+  // ── Cooperative GGUF loader gate ──────────────────────────────────────
+  // The weight loader asks permission before every slice of work (a fetch
+  // chunk, an 8 MB repack, an upload) — see GGUFLoadPacer in gguf-loader.
+  // While the Click-to-play overlay is up, or the tab is hidden, permission
+  // is free and the 1.1 GB NPC model streams flat out: nobody is watching
+  // frames. In live play each frame grants ONE slice (~2-3 ms of main-thread
+  // work), so the loader can never own a frame the player is looking at.
+  const ggufGate = {
+    waiters: [] as Array<() => void>,
+    /** Harness lever: true = force throttled, false = force open, null = auto. */
+    throttleOverride: null as boolean | null,
+    throttled(): boolean {
+      if (this.throttleOverride !== null) return this.throttleOverride;
+      return overlay.classList.contains('hidden') && !document.hidden;
+    },
+    pump(n = 1): void {
+      while (n-- > 0) {
+        const w = this.waiters.shift();
+        if (w === undefined) return;
+        w();
+      }
+    },
+    pacer: {
+      sliceBytes: 8 * 1024 * 1024,
+      fetchChunkBytes: 16 * 1024 * 1024,
+      budget: (_bytes: number): Promise<void> => {
+        if (!ggufGate.throttled()) return Promise.resolve();
+        return new Promise<void>((res) => { ggufGate.waiters.push(res); });
+      },
+    },
+  };
+  // The overlay coming back up (alt-tab, menus) must not strand parked
+  // slices behind a stopped rAF loop: drain whenever the gate is open.
+  window.setInterval(() => { if (!ggufGate.throttled()) ggufGate.pump(1e9); }, 250);
+  /** Last gender posted to the TTS worker — keeps the 2 Hz approach scan
+   *  from spamming identical load messages at it. */
+  let lastVoiceWarm = '';
 
   // --- pause + world map ---------------------------------------------------
   //
@@ -946,6 +999,7 @@ async function boot() {
   let lastDiscoverySaveMs = 0;
 
   const gpu = await initWebGPU();
+  bootMark('webgpu-init');
   gpu.device.addEventListener('uncapturederror', (ev) => {
     setError('uncaptured', (ev as GPUUncapturedErrorEvent).error.message);
   });
@@ -954,6 +1008,7 @@ async function boot() {
   });
 
   const renderer = new Renderer(gpu, canvas);
+  bootMark('renderer');
   const heightField = createHeightField(WORLD_SEED);
   const biomeField = createBiomeField(WORLD_SEED, heightField);
   const chunkManager = new ChunkManager(renderer, heightField, biomeField);
@@ -967,6 +1022,7 @@ async function boot() {
   // playing) so an unexpected reload — GPU device loss, browser crash —
   // resumes in place instead of resetting to spawn.
   const resumeState = consumeResume() ?? readAutoPos();
+  bootMark('save-read');
   const settlementManager =
     new SettlementManager(renderer, heightField, WORLD_SEED);
   // Outdoor world = terrain + settlement walls/platforms layered on top.
@@ -2534,6 +2590,19 @@ async function boot() {
   // lazy-load path still covers a chat opened before the warm load finishes.
   let npcPreloadStarted = false;
   const NPC_PRELOAD_DIST = 350;
+  bootMark('world-built');
+  // Start the villagers' minds at BOOT, under the Click-to-play overlay: the
+  // disk and the GPU queue are idle there, so the model streams flat out for
+  // free — and the first conversation stops paying an 11 s cold start. Once
+  // the player enters the world, ggufGate meters the loader to one slice per
+  // frame. The 350 m proximity trigger below survives as the backstop: it
+  // re-arms if this preload fails (disk error, missing weights).
+  if (!directorOff) {
+    npcPreloadStarted = true;
+    void preloadNpcChat(gpu, npcModelKey, ggufGate.pacer).then((ok) => {
+      if (!ok) npcPreloadStarted = false;
+    });
+  }
 
   // NPC trade stock — persisted across reloads per settlement+npc.
   const npcStockMap: StockMap = loadStockMap();
@@ -6440,6 +6509,13 @@ async function boot() {
     /** The interaction line the HUD is currently showing. */
     interactPrompt: () => lastInteractPrompt,
     sampleEvents: (n: SampleName) => audio.sampleEvents(n),
+    bootTimings: () => bootMarks.slice(),
+    npcModelLoad: () => npcModelLoadState(),
+    setLoaderThrottled: (v: boolean | null) => {
+      ggufGate.throttleOverride = v;
+      if (v !== true) ggufGate.pump(1e9);
+      return true;
+    },
     /** Who the player could talk to right now (indoors or out). */
     nearestNpc: () => {
       const rt = nearestNpc();
@@ -11347,8 +11423,12 @@ async function boot() {
       [player.draw, ...entityDraws, ...npcDraws], grassDraws)) {
       frameCount++;
       fpsFrames++;
+      // One loader slice per rendered frame — the other half of ggufGate.
+      ggufGate.pump(1);
       if (!window.__gameReady) {
         window.__gameReady = true;
+        bootMark('first-frame');
+        console.log('[Boot] ' + bootMarks.map(([n, ms]) => `${n} ${ms}ms`).join(' → '));
         debugSpawnFromUrl();
       }
       // Same-task canvas read-back for the live debug channel (F8/F9).
@@ -11439,7 +11519,23 @@ async function boot() {
               villageMemory, approaching.npc.settlementName, approaching.npc.id),
             following: approaching.following === true,
           });
+          // The voice is 63 MB of lazy wasm in a worker. Start it at the
+          // same 25 m the prompt warm uses, for the same reason: by the time
+          // the panel opens, the first spoken line has nothing left to wait
+          // for. Gender-keyed so only the needed model loads.
+          const vg = npcGenderFor(approaching.npc.name);
+          if (vg !== lastVoiceWarm) { lastVoiceWarm = vg; voiceOut.warm(vg); }
         }
+      }
+      // Loading must be a thing you can SEE, never a mystery: while the
+      // overlay is up it carries the villager-minds percentage. (The 16-bit
+      // art loading moment can replace this text wholesale — this is the
+      // hook, and npcModelLoadState() is the data.)
+      if (!overlay.classList.contains('hidden')) {
+        const ml = npcModelLoadState();
+        overlay.textContent = ml.state === 'loading'
+          ? `Click to play — weaving villager minds… ${Math.round(ml.frac * 100)}%`
+          : 'Click to play';
       }
       fpsFrames = 0;
       fpsLast = now;
