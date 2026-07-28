@@ -625,6 +625,15 @@ if (!SKIP_CHAT && !RELEASE && boot.debugPresent && chat?.changed && VOICE_FIXTUR
         : `${entries.length} files, sizes agree`);
   }
 
+  // The NPC model now streams at BOOT (main.ts ggufGate), so this beat runs
+  // during a 1.1 GB load. With the overlay up the gate runs the loader flat
+  // out — full-tensor repacks on the page's main thread — which is fine for
+  // a player staring at "Click to play" but starves the synthetic STT feed
+  // this beat drives from that same thread: measured, the transcript beat
+  // dropped to 1/8 word overlap. Live play never hits this (voice input
+  // exists only inside a conversation, in-world, where the gate throttles),
+  // so make the beat measure what a player gets: throttle while it runs.
+  await page.evaluate(() => window.__gameDebug?.setLoaderThrottled?.(true));
   const spoken = chat?.reply ?? 'The well is dry again, friend.';
   const t0 = Date.now();
   const probe = await page.evaluate(async (text) => {
@@ -666,6 +675,8 @@ if (!SKIP_CHAT && !RELEASE && boot.debugPresent && chat?.changed && VOICE_FIXTUR
     // Instrument calibration: the same comparison must fail on silence.
     ok('…and that RMS threshold rejects silence', !(0 > 0.01), 'silent rms 0');
   }
+
+  await page.evaluate(() => window.__gameDebug?.setLoaderThrottled?.(null));
 
   // The voice came out of the depot, not off a CDN. §6 asserts zero external
   // requests for the whole run, which covers the model fetch above too.

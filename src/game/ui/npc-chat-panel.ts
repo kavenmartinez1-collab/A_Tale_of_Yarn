@@ -869,10 +869,25 @@ export function isNpcModelKey(x: string): x is NpcModelKey {
   return Object.prototype.hasOwnProperty.call(NPC_MODELS, x);
 }
 
+/**
+ * Where the villagers' minds are: 'idle' until a load starts, 'loading' with
+ * a 0..1 fraction while the ~1.1 GB model streams in, 'ready' once chat is
+ * live, 'error' if the load failed (the stub replies carry the conversation).
+ * Surfaced on the boot overlay and in the chat panel so a wait reads as a
+ * LOAD, never as a hang — see the loading-UX note in main.ts.
+ */
+let _modelLoadState: 'idle' | 'loading' | 'ready' | 'error' = 'idle';
+let _modelLoadFrac = 0;
+
+export function npcModelLoadState(): { state: 'idle' | 'loading' | 'ready' | 'error'; frac: number } {
+  return { state: _modelLoadState, frac: _modelLoadFrac };
+}
+
 /** Build a streaming chat function backed by the game's GPU session. */
 async function buildLiveChatFn(
   gpu: import('../../engine/gpu-device').GPUContext,
   modelKey: NpcModelKey,
+  pacer?: import('../../model/gguf-loader').GGUFLoadPacer,
 ): Promise<NpcChatFn> {
   // Dynamic import keeps the cost zero when NPC chat is never used.
   const { createGGUFInferenceSession } = await import('../../engine/gguf-session');
@@ -882,12 +897,17 @@ async function buildLiveChatFn(
   const model = NPC_MODELS[modelKey];
   console.log(`[NPC chat] model '${modelKey}': ${model.repo}/${model.file}`);
 
+  _modelLoadState = 'loading';
   const session = await createGGUFInferenceSession({
     repo: model.repo,
     ggufFile: model.file,
     gpu,
-    onStatus: () => { /* no UI hook needed here */ },
+    onStatus: () => { /* messages unused; the fraction below feeds the UI */ },
+    onLoadProgress: (frac) => { _modelLoadFrac = frac; },
+    loadPacer: pacer,
   });
+  _modelLoadFrac = 1;
+  _modelLoadState = 'ready';
 
   // Private KV fork: the dedup'd shared session's default KV is also used by
   // the Dungeon/Ecology directors, so any background generation between chat
@@ -1177,16 +1197,18 @@ function warmNpcPreamble(ctx: ForkedChatContext): void {
 export async function preloadNpcChat(
   gpu: import('../../engine/gpu-device').GPUContext,
   npcModel: NpcModelKey = 'default',
+  pacer?: import('../../model/gguf-loader').GGUFLoadPacer,
 ): Promise<boolean> {
   if (_liveChatFn !== null) return true;
   if (_chatFnBuilding) return false;
   if (chatMock() !== null) return true;
   _chatFnBuilding = true;
   try {
-    _liveChatFn = await buildLiveChatFn(gpu, npcModel);
+    _liveChatFn = await buildLiveChatFn(gpu, npcModel, pacer);
     return true;
   } catch (err) {
     console.warn('[NPC chat] preload failed (will retry on first talk):', err);
+    _modelLoadState = 'error';
     return false;
   } finally {
     _chatFnBuilding = false;
@@ -2191,6 +2213,30 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
       tone === 'cold' ? 'You again. What do you want? Make it quick.' :
       ROLE_MET_GREETINGS[persona.role];
   }
+  // While the villager's mind is still streaming in, say so in-fiction with
+  // a live percentage. A wait with a number on it is a LOAD; a wait without
+  // one is a bug report — and this exact panel is where the "weird slow
+  // loading" reports came from. The line updates in place and removes
+  // itself the moment the model is ready. Stub replies still work
+  // throughout: this is information, not a lock.
+  {
+    const ml0 = npcModelLoadState();
+    if (ml0.state === 'loading') {
+      const el = appendMsg('system',
+        `${persona.name.split(' ')[0]} is gathering their thoughts… ${Math.round(ml0.frac * 100)}%`);
+      const iv = window.setInterval(() => {
+        const ml = npcModelLoadState();
+        if (ml.state !== 'loading' || !el.isConnected) {
+          window.clearInterval(iv);
+          el.remove();
+          return;
+        }
+        el.textContent =
+          `${persona.name.split(' ')[0]} is gathering their thoughts… ${Math.round(ml.frac * 100)}%`;
+      }, 500);
+    }
+  }
+
   // Spouse greeting overrides the met/cold lines (but not a bounty warning).
   if (memRec.spouse && !bountyGuard) {
     greetingText = 'Welcome home, my love. I missed you.';

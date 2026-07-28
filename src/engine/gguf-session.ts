@@ -32,6 +32,12 @@ export interface GGUFSessionConfig {
   /** Existing GPU context to share; a fresh device is requested if omitted. */
   gpu?: GPUContext;
   onStatus?: (message: string) => void;
+  /** Fraction of the weight file loaded, 0..1 — for loading UI. */
+  onLoadProgress?: (frac: number) => void;
+  /** Cooperative pacing for the weight load — see gguf-loader.GGUFLoadPacer.
+   *  Only honoured by whichever consumer CREATES the shared session first;
+   *  later consumers join the same in-flight promise. */
+  loadPacer?: import('../model/gguf-loader').GGUFLoadPacer;
 }
 
 /**
@@ -97,7 +103,11 @@ async function buildGGUFSession(
 
   status(`Loading GGUF: ${cfg.repo}/${cfg.ggufFile}`);
   const model = await loadGGUFModel(gpu.device, cfg.repo, cfg.ggufFile,
-    (p) => status(p.message));
+    (p) => {
+      status(p.message);
+      if (p.overallProgress !== undefined) cfg.onLoadProgress?.(p.overallProgress);
+    },
+    cfg.loadPacer !== undefined ? { pacer: cfg.loadPacer } : undefined);
 
   const config = descriptorFromGGUF(model.file);
   const ropeFreqsT = model.cpuTensors.get('rope_freqs.weight');
