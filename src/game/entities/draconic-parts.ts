@@ -28,7 +28,7 @@
  * `assembleParts` later poses and colours.
  */
 
-import { cone, taperedCapsule, type P3 } from '../mesh-utils';
+import { cone, memoGeom, taperedCapsule, type P3 } from '../mesh-utils';
 import { MAT } from '../render/material-table';
 import { quad2, type Color3, type Part, type Rot } from './creature-parts';
 
@@ -95,8 +95,15 @@ export function bonePart(
   a: Vec3, b: Vec3, r0: number, r1: number,
   segments = 6, material: number = MAT.SCALE,
 ): Part {
-  const verts: number[] = [];
-  taperedCapsule(verts, a[0], a[1], a[2], b[0], b[1], b[2], r0, r1, segments);
+  // Memoised like every other primitive part. Limbs on a rotation chain hit
+  // every frame; wing spars and chain vertebrae, whose endpoints are solved
+  // from the pose, miss — and cost one key string over what they did.
+  const verts = memoGeom(
+    `t${a[0]},${a[1]},${a[2]},${b[0]},${b[1]},${b[2]},${r0},${r1},${segments}`, () => {
+      const v: number[] = [];
+      taperedCapsule(v, a[0], a[1], a[2], b[0], b[1], b[2], r0, r1, segments);
+      return v;
+    });
   return { verts, color, material, rots };
 }
 
@@ -159,8 +166,13 @@ export function spikePart(
   base: Vec3, dir: Vec3, r: number, length: number,
   segments = 5, material: number = MAT.HORN,
 ): Part {
-  const verts: number[] = [];
-  coneAlong(verts, base, dir, r, length, segments);
+  const verts = memoGeom(
+    `p${base[0]},${base[1]},${base[2]},${dir[0]},${dir[1]},${dir[2]},${r},${length},${segments}`,
+    () => {
+      const v: number[] = [];
+      coneAlong(v, base, dir, r, length, segments);
+      return v;
+    });
   return { verts, color, material, rots };
 }
 

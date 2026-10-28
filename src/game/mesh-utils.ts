@@ -129,6 +129,40 @@ export function bevelBox(
 }
 
 /**
+ * Scratch for the four curved primitives below: 4 vertices × (pos3 + normal3).
+ * Every one of them used to allocate a handful of 3-tuples and a closure or
+ * two PER QUAD (sphere: 12 arrays and 2 closures a quad; capsule caps: 3
+ * closures and 11 arrays a quad) and then spread them into `push`. Creatures,
+ * NPCs and the player rebuild through these every frame, and the allocation
+ * was most of their cost — measured 1.5-3 ms per creature. The rewrites keep
+ * every arithmetic expression in its original order so the floats, and the
+ * golden mesh hashes in scripts/test-*-mesh.mts, are bit-identical.
+ */
+const V = new Float64Array(24);
+
+/** Push vertices k0, k1, k2 of `V` (each 6 floats) in that order. */
+function push3(verts: number[], k0: number, k1: number, k2: number): void {
+  const a = k0 * 6, b = k1 * 6, c = k2 * 6;
+  verts.push(
+    V[a], V[a + 1], V[a + 2], V[a + 3], V[a + 4], V[a + 5],
+    V[b], V[b + 1], V[b + 2], V[b + 3], V[b + 4], V[b + 5],
+    V[c], V[c + 1], V[c + 2], V[c + 3], V[c + 4], V[c + 5],
+  );
+}
+
+/** Push the quad a-b-c, a-c-d from slots 0..3 of `V` (same order as quadN). */
+function pushQuad(verts: number[]): void {
+  verts.push(
+    V[0], V[1], V[2], V[3], V[4], V[5],
+    V[6], V[7], V[8], V[9], V[10], V[11],
+    V[12], V[13], V[14], V[15], V[16], V[17],
+    V[0], V[1], V[2], V[3], V[4], V[5],
+    V[12], V[13], V[14], V[15], V[16], V[17],
+    V[18], V[19], V[20], V[21], V[22], V[23],
+  );
+}
+
+/**
  * Cylinder / truncated cone along +Y with smooth side normals.
  * `(cx, cy, cz)` is the centre of the bottom cap.
  */
@@ -150,12 +184,12 @@ export function cylinder(
     const c0 = Math.cos(a0), s0 = Math.sin(a0);
     const c1 = Math.cos(a1), s1 = Math.sin(a1);
 
-    const b0: P3 = [cx + c0 * rBottom, cy, cz + s0 * rBottom];
-    const b1: P3 = [cx + c1 * rBottom, cy, cz + s1 * rBottom];
-    const t1: P3 = [cx + c1 * rTop, yTop, cz + s1 * rTop];
-    const t0: P3 = [cx + c0 * rTop, yTop, cz + s0 * rTop];
-    const n0: P3 = [c0 * nr, ny, s0 * nr];
-    const n1: P3 = [c1 * nr, ny, s1 * nr];
+    const b0x = cx + c0 * rBottom, b0z = cz + s0 * rBottom;
+    const b1x = cx + c1 * rBottom, b1z = cz + s1 * rBottom;
+    const t1x = cx + c1 * rTop, t1z = cz + s1 * rTop;
+    const t0x = cx + c0 * rTop, t0z = cz + s0 * rTop;
+    const n0x = c0 * nr, n0z = s0 * nr;
+    const n1x = c1 * nr, n1z = s1 * nr;
 
     // Winding note: `box()` above establishes the convention — the right-hand
     // normal (b-a)x(c-a) must point OUTWARD, or the triangle is back-facing
@@ -163,29 +197,35 @@ export function cylinder(
     // scripts/check-winding.mts rather than by eye.
     if (rTop <= 1e-5) {
       // Degenerate top — emit a triangle so the apex has no zero-area quad.
-      const apex: P3 = [cx, yTop, cz];
-      const nm: P3 = [(n0[0] + n1[0]) * 0.5, (n0[1] + n1[1]) * 0.5, (n0[2] + n1[2]) * 0.5];
       verts.push(
-        b1[0], b1[1], b1[2], n1[0], n1[1], n1[2],
-        b0[0], b0[1], b0[2], n0[0], n0[1], n0[2],
-        apex[0], apex[1], apex[2], nm[0], nm[1], nm[2],
+        b1x, cy, b1z, n1x, ny, n1z,
+        b0x, cy, b0z, n0x, ny, n0z,
+        cx, yTop, cz, (n0x + n1x) * 0.5, (ny + ny) * 0.5, (n0z + n1z) * 0.5,
       );
     } else {
-      quadN(verts, b0, t0, t1, b1, n0, n0, n1, n1);
+      // quadN(b0, t0, t1, b1, n0, n0, n1, n1)
+      verts.push(
+        b0x, cy, b0z, n0x, ny, n0z,
+        t0x, yTop, t0z, n0x, ny, n0z,
+        t1x, yTop, t1z, n1x, ny, n1z,
+        b0x, cy, b0z, n0x, ny, n0z,
+        t1x, yTop, t1z, n1x, ny, n1z,
+        b1x, cy, b1z, n1x, ny, n1z,
+      );
     }
 
     if (capTop && rTop > 1e-5) {
       verts.push(
         cx, yTop, cz, 0, 1, 0,
-        t1[0], t1[1], t1[2], 0, 1, 0,
-        t0[0], t0[1], t0[2], 0, 1, 0,
+        t1x, yTop, t1z, 0, 1, 0,
+        t0x, yTop, t0z, 0, 1, 0,
       );
     }
     if (capBottom && rBottom > 1e-5) {
       verts.push(
         cx, cy, cz, 0, -1, 0,
-        b0[0], b0[1], b0[2], 0, -1, 0,
-        b1[0], b1[1], b1[2], 0, -1, 0,
+        b0x, cy, b0z, 0, -1, 0,
+        b1x, cy, b1z, 0, -1, 0,
       );
     }
   }
@@ -207,6 +247,19 @@ export function sphere(
   segments = 10, rings = 6,
   scaleY = 1, scaleZ = 1,
 ): void {
+  // Unit-sphere normal (nx, ny, nz) -> scratch slot k: scaled position, then
+  // the inverse-transpose normal for the non-uniform scale.
+  const put = (k: number, nx: number, ny: number, nz: number): void => {
+    const o = k * 6;
+    V[o] = cx + nx * r;
+    V[o + 1] = cy + ny * r * scaleY;
+    V[o + 2] = cz + nz * r * scaleZ;
+    const y = ny / scaleY, z = nz / scaleZ;
+    const l = Math.hypot(nx, y, z) || 1;
+    V[o + 3] = nx / l;
+    V[o + 4] = y / l;
+    V[o + 5] = z / l;
+  };
   for (let j = 0; j < rings; j++) {
     const p0 = (j / rings) * Math.PI;
     const p1 = ((j + 1) / rings) * Math.PI;
@@ -218,27 +271,17 @@ export function sphere(
       const c0 = Math.cos(a0), s0 = Math.sin(a0);
       const c1 = Math.cos(a1), s1 = Math.sin(a1);
 
-      const na: P3 = [c0 * r0, y0, s0 * r0];
-      const nb: P3 = [c1 * r0, y0, s1 * r0];
-      const nc: P3 = [c1 * r1, y1, s1 * r1];
-      const nd: P3 = [c0 * r1, y1, s0 * r1];
-      const pt = (n: P3): P3 =>
-        [cx + n[0] * r, cy + n[1] * r * scaleY, cz + n[2] * r * scaleZ];
-      // Non-uniform scale needs the inverse-transpose for correct normals.
-      const nn = (n: P3): P3 => {
-        const x = n[0], y = n[1] / scaleY, z = n[2] / scaleZ;
-        const l = Math.hypot(x, y, z) || 1;
-        return [x / l, y / l, z / l];
-      };
+      put(0, c0 * r0, y0, s0 * r0); // a
+      put(1, c1 * r0, y0, s1 * r0); // b
+      put(2, c1 * r1, y1, s1 * r1); // c
+      put(3, c0 * r1, y1, s0 * r1); // d
 
       if (j === 0) {
-        verts.push(
-          ...pt(na), ...nn(na), ...pt(nc), ...nn(nc), ...pt(nd), ...nn(nd));
+        push3(verts, 0, 2, 3);
       } else if (j === rings - 1) {
-        verts.push(
-          ...pt(na), ...nn(na), ...pt(nb), ...nn(nb), ...pt(nc), ...nn(nc));
+        push3(verts, 0, 1, 2);
       } else {
-        quadN(verts, pt(na), pt(nb), pt(nc), pt(nd), nn(na), nn(nb), nn(nc), nn(nd));
+        pushQuad(verts);
       }
     }
   }
@@ -267,32 +310,45 @@ export function capsule(
   bx /= bl; by /= bl; bz /= bl;
   const cx2 = ay * bz - az * by, cy2 = az * bx - ax * bz, cz2 = ax * by - ay * bx;
 
-  const ringPt = (t: number, ang: number, rad: number): P3 => {
+  // Scratch slot k <- point on the ring at `t` along the axis, angle `ang`,
+  // radius `rad`, pushed `o` along the axis (the cap offset; the barrel uses
+  // `ringPt`, which adds nothing, so a -0 stays a -0 there).
+  const ringPt = (k: number, t: number, ang: number, rad: number): void => {
     const c = Math.cos(ang), s = Math.sin(ang);
-    return [
-      x0 + dx * t + (bx * c + cx2 * s) * rad,
-      y0 + dy * t + (by * c + cy2 * s) * rad,
-      z0 + dz * t + (bz * c + cz2 * s) * rad,
-    ];
+    const o = k * 6;
+    V[o] = x0 + dx * t + (bx * c + cx2 * s) * rad;
+    V[o + 1] = y0 + dy * t + (by * c + cy2 * s) * rad;
+    V[o + 2] = z0 + dz * t + (bz * c + cz2 * s) * rad;
   };
-  const ringN = (ang: number, axial: number): P3 => {
+  const capPt = (k: number, t: number, ang: number, rad: number, off: number): void => {
+    const c = Math.cos(ang), s = Math.sin(ang);
+    const o = k * 6;
+    V[o] = (x0 + dx * t + (bx * c + cx2 * s) * rad) + ax * off;
+    V[o + 1] = (y0 + dy * t + (by * c + cy2 * s) * rad) + ay * off;
+    V[o + 2] = (z0 + dz * t + (bz * c + cz2 * s) * rad) + az * off;
+  };
+  const ringN = (k: number, ang: number, axial: number): void => {
     const c = Math.cos(ang), s = Math.sin(ang);
     const nx = bx * c + cx2 * s + ax * axial;
     const ny = by * c + cy2 * s + ay * axial;
     const nz = bz * c + cz2 * s + az * axial;
     const l = Math.hypot(nx, ny, nz) || 1;
-    return [nx / l, ny / l, nz / l];
+    const o = k * 6;
+    V[o + 3] = nx / l;
+    V[o + 4] = ny / l;
+    V[o + 5] = nz / l;
   };
 
-  // Barrel.
+  // Barrel: quadN(ringPt(0,a0), ringPt(0,a1), ringPt(1,a1), ringPt(1,a0),
+  //               ringN(a0), ringN(a1), ringN(a1), ringN(a0)).
   for (let i = 0; i < segments; i++) {
     const a0 = (i / segments) * Math.PI * 2;
     const a1 = ((i + 1) / segments) * Math.PI * 2;
-    quadN(
-      verts,
-      ringPt(0, a0, r), ringPt(0, a1, r), ringPt(1, a1, r), ringPt(1, a0, r),
-      ringN(a0, 0), ringN(a1, 0), ringN(a1, 0), ringN(a0, 0),
-    );
+    ringPt(0, 0, a0, r); ringN(0, a0, 0);
+    ringPt(1, 0, a1, r); ringN(1, a1, 0);
+    ringPt(2, 1, a1, r); ringN(2, a1, 0);
+    ringPt(3, 1, a0, r); ringN(3, a0, 0);
+    pushQuad(verts);
   }
 
   // Hemispherical caps: 3 latitude bands each.
@@ -300,11 +356,13 @@ export function capsule(
   for (let cap = 0; cap < 2; cap++) {
     const t = cap === 0 ? 0 : 1;
     const sign = cap === 0 ? -1 : 1;
+    const pnx = ax * sign, pny = ay * sign, pnz = az * sign; // pole normal
     for (let j = 0; j < bands; j++) {
       const e0 = (j / bands) * (Math.PI / 2);
       const e1 = ((j + 1) / bands) * (Math.PI / 2);
       const r0 = Math.cos(e0) * r, r1 = Math.cos(e1) * r;
       const o0 = Math.sin(e0) * r * sign, o1 = Math.sin(e1) * r * sign;
+      const ax0 = Math.tan(e0) * sign, ax1 = Math.tan(e1) * sign;
       // The final band closes on the pole, where r1 is zero — emitting a quad
       // there would be two zero-area triangles per segment. Characters rebuild
       // every frame, so that waste is worth avoiding.
@@ -312,32 +370,30 @@ export function capsule(
       for (let i = 0; i < segments; i++) {
         const a0 = (i / segments) * Math.PI * 2;
         const a1 = ((i + 1) / segments) * Math.PI * 2;
-        const off = (o: number): P3 => [ax * o, ay * o, az * o];
-        const p = (ang: number, rad: number, o: number): P3 => {
-          const q = ringPt(t, ang, rad);
-          const d = off(o);
-          return [q[0] + d[0], q[1] + d[1], q[2] + d[2]];
-        };
-        const n = (ang: number, e: number): P3 => ringN(ang, Math.tan(e) * sign);
-        const poleN: P3 = [ax * sign, ay * sign, az * sign];
         if (cap === 0) {
           if (atPole) {
-            const q0 = p(a1, r0, o0), q1 = p(a0, r0, o0), q2 = p(a0, r1, o1);
-            verts.push(
-              ...q0, ...n(a1, e0), ...q1, ...n(a0, e0), ...q2, ...poleN);
+            capPt(0, t, a1, r0, o0); ringN(0, a1, ax0);
+            capPt(1, t, a0, r0, o0); ringN(1, a0, ax0);
+            capPt(2, t, a0, r1, o1); V[15] = pnx; V[16] = pny; V[17] = pnz;
+            push3(verts, 0, 1, 2);
           } else {
-            quadN(verts,
-              p(a1, r0, o0), p(a0, r0, o0), p(a0, r1, o1), p(a1, r1, o1),
-              n(a1, e0), n(a0, e0), n(a0, e1), n(a1, e1));
+            capPt(0, t, a1, r0, o0); ringN(0, a1, ax0);
+            capPt(1, t, a0, r0, o0); ringN(1, a0, ax0);
+            capPt(2, t, a0, r1, o1); ringN(2, a0, ax1);
+            capPt(3, t, a1, r1, o1); ringN(3, a1, ax1);
+            pushQuad(verts);
           }
         } else if (atPole) {
-          const q0 = p(a0, r0, o0), q1 = p(a1, r0, o0), q2 = p(a1, r1, o1);
-          verts.push(
-            ...q0, ...n(a0, e0), ...q1, ...n(a1, e0), ...q2, ...poleN);
+          capPt(0, t, a0, r0, o0); ringN(0, a0, ax0);
+          capPt(1, t, a1, r0, o0); ringN(1, a1, ax0);
+          capPt(2, t, a1, r1, o1); V[15] = pnx; V[16] = pny; V[17] = pnz;
+          push3(verts, 0, 1, 2);
         } else {
-          quadN(verts,
-            p(a0, r0, o0), p(a1, r0, o0), p(a1, r1, o1), p(a0, r1, o1),
-            n(a0, e0), n(a1, e0), n(a1, e1), n(a0, e1));
+          capPt(0, t, a0, r0, o0); ringN(0, a0, ax0);
+          capPt(1, t, a1, r0, o0); ringN(1, a1, ax0);
+          capPt(2, t, a1, r1, o1); ringN(2, a1, ax1);
+          capPt(3, t, a0, r1, o1); ringN(3, a0, ax1);
+          pushQuad(verts);
         }
       }
     }
@@ -383,21 +439,30 @@ export function taperedCapsule(
   bx /= bl; by /= bl; bz /= bl;
   const cx2 = ay * bz - az * by, cy2 = az * bx - ax * bz, cz2 = ax * by - ay * bx;
 
-  const ringPt = (t: number, ang: number, rad: number): P3 => {
+  const ringPt = (k: number, t: number, ang: number, rad: number): void => {
     const c = Math.cos(ang), s = Math.sin(ang);
-    return [
-      x0 + dx * t + (bx * c + cx2 * s) * rad,
-      y0 + dy * t + (by * c + cy2 * s) * rad,
-      z0 + dz * t + (bz * c + cz2 * s) * rad,
-    ];
+    const o = k * 6;
+    V[o] = x0 + dx * t + (bx * c + cx2 * s) * rad;
+    V[o + 1] = y0 + dy * t + (by * c + cy2 * s) * rad;
+    V[o + 2] = z0 + dz * t + (bz * c + cz2 * s) * rad;
   };
-  const ringN = (ang: number, axial: number): P3 => {
+  const capPt = (k: number, t: number, ang: number, rad: number, off: number): void => {
+    const c = Math.cos(ang), s = Math.sin(ang);
+    const o = k * 6;
+    V[o] = (x0 + dx * t + (bx * c + cx2 * s) * rad) + ax * off;
+    V[o + 1] = (y0 + dy * t + (by * c + cy2 * s) * rad) + ay * off;
+    V[o + 2] = (z0 + dz * t + (bz * c + cz2 * s) * rad) + az * off;
+  };
+  const ringN = (k: number, ang: number, axial: number): void => {
     const c = Math.cos(ang), s = Math.sin(ang);
     const nx = bx * c + cx2 * s + ax * axial;
     const ny = by * c + cy2 * s + ay * axial;
     const nz = bz * c + cz2 * s + az * axial;
     const l = Math.hypot(nx, ny, nz) || 1;
-    return [nx / l, ny / l, nz / l];
+    const o = k * 6;
+    V[o + 3] = nx / l;
+    V[o + 4] = ny / l;
+    V[o + 5] = nz / l;
   };
 
   // Barrel: slanted side normals so the taper shades correctly — same
@@ -408,11 +473,11 @@ export function taperedCapsule(
   for (let i = 0; i < segments; i++) {
     const a0 = (i / segments) * Math.PI * 2;
     const a1 = ((i + 1) / segments) * Math.PI * 2;
-    quadN(
-      verts,
-      ringPt(0, a0, r0), ringPt(0, a1, r0), ringPt(1, a1, r1), ringPt(1, a0, r1),
-      ringN(a0, axial), ringN(a1, axial), ringN(a1, axial), ringN(a0, axial),
-    );
+    ringPt(0, 0, a0, r0); ringN(0, a0, axial);
+    ringPt(1, 0, a1, r0); ringN(1, a1, axial);
+    ringPt(2, 1, a1, r1); ringN(2, a1, axial);
+    ringPt(3, 1, a0, r1); ringN(3, a0, axial);
+    pushQuad(verts);
   }
 
   // Hemispherical caps: 3 latitude bands each (same layout as capsule()),
@@ -423,41 +488,41 @@ export function taperedCapsule(
     const sign = cap === 0 ? -1 : 1;
     const r = cap === 0 ? r0 : r1;
     if (r <= 1e-6) continue; // degenerate end — no cap geometry needed
+    const pnx = ax * sign, pny = ay * sign, pnz = az * sign;
     for (let j = 0; j < bands; j++) {
       const e0 = (j / bands) * (Math.PI / 2);
       const e1 = ((j + 1) / bands) * (Math.PI / 2);
       const rr0 = Math.cos(e0) * r, rr1 = Math.cos(e1) * r;
       const o0 = Math.sin(e0) * r * sign, o1 = Math.sin(e1) * r * sign;
+      const ax0 = Math.tan(e0) * sign, ax1 = Math.tan(e1) * sign;
       const atPole = j === bands - 1;
       for (let i = 0; i < segments; i++) {
         const a0 = (i / segments) * Math.PI * 2;
         const a1 = ((i + 1) / segments) * Math.PI * 2;
-        const off = (o: number): P3 => [ax * o, ay * o, az * o];
-        const p = (ang: number, rad: number, o: number): P3 => {
-          const q = ringPt(t, ang, rad);
-          const d = off(o);
-          return [q[0] + d[0], q[1] + d[1], q[2] + d[2]];
-        };
-        const n = (ang: number, e: number): P3 => ringN(ang, Math.tan(e) * sign);
-        const poleN: P3 = [ax * sign, ay * sign, az * sign];
         if (cap === 0) {
           if (atPole) {
-            const q0 = p(a1, rr0, o0), q1 = p(a0, rr0, o0), q2 = p(a0, rr1, o1);
-            verts.push(
-              ...q0, ...n(a1, e0), ...q1, ...n(a0, e0), ...q2, ...poleN);
+            capPt(0, t, a1, rr0, o0); ringN(0, a1, ax0);
+            capPt(1, t, a0, rr0, o0); ringN(1, a0, ax0);
+            capPt(2, t, a0, rr1, o1); V[15] = pnx; V[16] = pny; V[17] = pnz;
+            push3(verts, 0, 1, 2);
           } else {
-            quadN(verts,
-              p(a1, rr0, o0), p(a0, rr0, o0), p(a0, rr1, o1), p(a1, rr1, o1),
-              n(a1, e0), n(a0, e0), n(a0, e1), n(a1, e1));
+            capPt(0, t, a1, rr0, o0); ringN(0, a1, ax0);
+            capPt(1, t, a0, rr0, o0); ringN(1, a0, ax0);
+            capPt(2, t, a0, rr1, o1); ringN(2, a0, ax1);
+            capPt(3, t, a1, rr1, o1); ringN(3, a1, ax1);
+            pushQuad(verts);
           }
         } else if (atPole) {
-          const q0 = p(a0, rr0, o0), q1 = p(a1, rr0, o0), q2 = p(a1, rr1, o1);
-          verts.push(
-            ...q0, ...n(a0, e0), ...q1, ...n(a1, e0), ...q2, ...poleN);
+          capPt(0, t, a0, rr0, o0); ringN(0, a0, ax0);
+          capPt(1, t, a1, rr0, o0); ringN(1, a1, ax0);
+          capPt(2, t, a1, rr1, o1); V[15] = pnx; V[16] = pny; V[17] = pnz;
+          push3(verts, 0, 1, 2);
         } else {
-          quadN(verts,
-            p(a0, rr0, o0), p(a1, rr0, o0), p(a1, rr1, o1), p(a0, rr1, o1),
-            n(a0, e0), n(a1, e0), n(a1, e1), n(a0, e1));
+          capPt(0, t, a0, rr0, o0); ringN(0, a0, ax0);
+          capPt(1, t, a1, rr0, o0); ringN(1, a1, ax0);
+          capPt(2, t, a1, rr1, o1); ringN(2, a1, ax1);
+          capPt(3, t, a0, rr1, o1); ringN(3, a0, ax1);
+          pushQuad(verts);
         }
       }
     }
@@ -498,6 +563,42 @@ export function appendYaw(
       nx * c - nz * s, ny, nx * s + nz * c,
     );
   }
+}
+
+/**
+ * Local-space geometry memo for the per-frame mesh builders.
+ *
+ * A creature, an NPC or the player is re-posed every frame by rebuilding its
+ * parts from scratch and then rotating them into place (`assembleParts`).
+ * Most of a part's geometry does not depend on the pose at all — a leg is the
+ * same capsule every frame, only its `rots` change — so the primitive work is
+ * repeated for nothing. Measured before this: ~1.5 ms per creature rebuild,
+ * eight rebuilds a frame near a herd, and the castle dragon alone at 12 ms.
+ *
+ * `key` is the primitive name plus EVERY argument it was given, so a hit is
+ * by construction the same floats the builder would have produced (the
+ * builders are pure). A part whose arguments move with the pose (a wing spar,
+ * a chain vertebra) misses every frame and costs one key string more than it
+ * did — a few microseconds against the ~20 us it took to build. The returned
+ * array is shared between frames and between creatures and must never be
+ * mutated; `Part.verts` is typed readonly for that reason.
+ *
+ * Bounded by clearing: a steady stream of pose-dependent misses would
+ * otherwise grow it without limit. 2048 parts at a few KB each is a few MB.
+ */
+const GEOM_MEMO_MAX = 2048;
+const geomMemo = new Map<string, readonly number[]>();
+/** Hit/miss counters — the instrument for "is this part pose-independent?" */
+export const geomMemoStats = { hits: 0, misses: 0, size: () => geomMemo.size };
+
+export function memoGeom(key: string, build: () => number[]): readonly number[] {
+  const hit = geomMemo.get(key);
+  if (hit !== undefined) { geomMemoStats.hits++; return hit; }
+  geomMemoStats.misses++;
+  const verts = build();
+  if (geomMemo.size >= GEOM_MEMO_MAX) geomMemo.clear();
+  geomMemo.set(key, verts);
+  return verts;
 }
 
 /** Mulberry32 PRNG — the deterministic-scatter workhorse (same as noise.ts). */

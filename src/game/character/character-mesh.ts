@@ -25,7 +25,9 @@
  * legs kick forward with +legPitch; a hanging arm's hand moves forward/up.
  */
 
-import { box, bevelBox, sphere, capsule, taperedCapsule, cylinder } from '../mesh-utils';
+import {
+  box, bevelBox, sphere, capsule, taperedCapsule, cylinder, memoGeom,
+} from '../mesh-utils';
 import type { HeldKind } from '../items';
 // Type-only: erased at build time, so this adds no runtime edge from the
 // character rig to the combat module. Importing the union rather than
@@ -248,8 +250,9 @@ const twistY = (a: number, px = 0, pz = 0): Rot =>
   ({ ax: 1, a, p0: px, p1: pz });
 
 interface Part {
-  verts: number[]; // interleaved position+normal soup (6 floats/vertex) —
-                    // local (unposed) space, straight from mesh-utils.
+  /** Interleaved position+normal soup (6 floats/vertex) in local (unposed)
+   * space, straight from mesh-utils. READONLY: shared through `memoGeom`. */
+  verts: readonly number[];
   color: Color3;
   /** MAT.* constant (material-table.ts) — constant across the part, written
    * to every vertex it emits. */
@@ -272,8 +275,11 @@ function part(
   x0: number, y0: number, z0: number, x1: number, y1: number, z1: number,
   material: number = MAT.KNIT,
 ): Part {
-  const verts: number[] = [];
-  box(verts, x0, y0, z0, x1, y1, z1);
+  const verts = memoGeom(`b${x0},${y0},${z0},${x1},${y1},${z1}`, () => {
+    const v: number[] = [];
+    box(v, x0, y0, z0, x1, y1, z1);
+    return v;
+  });
   return { verts, color, material, rots };
 }
 
@@ -284,8 +290,11 @@ function bpart(
   x0: number, y0: number, z0: number, x1: number, y1: number, z1: number,
   bevel = 0.03, material: number = MAT.KNIT,
 ): Part {
-  const verts: number[] = [];
-  bevelBox(verts, x0, y0, z0, x1, y1, z1, bevel);
+  const verts = memoGeom(`v${x0},${y0},${z0},${x1},${y1},${z1},${bevel}`, () => {
+    const v: number[] = [];
+    bevelBox(v, x0, y0, z0, x1, y1, z1, bevel);
+    return v;
+  });
   return { verts, color, material, rots };
 }
 
@@ -295,8 +304,12 @@ function spherePart(
   cx: number, cy: number, cz: number, r: number,
   scaleY = 1, scaleZ = 1, segments = 8, rings = 6, material: number = MAT.KNIT,
 ): Part {
-  const verts: number[] = [];
-  sphere(verts, cx, cy, cz, r, segments, rings, scaleY, scaleZ);
+  const verts = memoGeom(
+    `s${cx},${cy},${cz},${r},${segments},${rings},${scaleY},${scaleZ}`, () => {
+      const v: number[] = [];
+      sphere(v, cx, cy, cz, r, segments, rings, scaleY, scaleZ);
+      return v;
+    });
   return { verts, color, material, rots };
 }
 
@@ -307,8 +320,11 @@ function capsulePart(
   x0: number, y0: number, z0: number, x1: number, y1: number, z1: number,
   r: number, segments = 6, material: number = MAT.KNIT,
 ): Part {
-  const verts: number[] = [];
-  capsule(verts, x0, y0, z0, x1, y1, z1, r, segments);
+  const verts = memoGeom(`c${x0},${y0},${z0},${x1},${y1},${z1},${r},${segments}`, () => {
+    const v: number[] = [];
+    capsule(v, x0, y0, z0, x1, y1, z1, r, segments);
+    return v;
+  });
   return { verts, color, material, rots };
 }
 
@@ -338,8 +354,11 @@ function cylinderPartY(
   cx: number, cy: number, cz: number, r: number, height: number, segments = 6,
   material: number = MAT.KNIT,
 ): Part {
-  const verts: number[] = [];
-  cylinder(verts, cx, cy, cz, r, r, height, segments);
+  const verts = memoGeom(`y${cx},${cy},${cz},${r},${height},${segments}`, () => {
+    const v: number[] = [];
+    cylinder(v, cx, cy, cz, r, r, height, segments);
+    return v;
+  });
   return { verts, color, material, rots };
 }
 

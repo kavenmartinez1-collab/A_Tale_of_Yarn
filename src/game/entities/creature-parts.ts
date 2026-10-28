@@ -16,7 +16,9 @@
  * local space with the creature's base at y = 0 facing -Z at yaw 0.
  */
 
-import { box, bevelBox, sphere, capsule, cone, quad, type P3 } from '../mesh-utils';
+import {
+  box, bevelBox, sphere, capsule, cone, quad, memoGeom, type P3,
+} from '../mesh-utils';
 import type { Species } from './entity-types';
 import { MAT } from '../render/material-table';
 
@@ -122,8 +124,10 @@ export const rollZ  = (a: number, px = 0, py = 0): Rot  => ({ ax: 2, a, p0: px, 
 export type Color3 = [number, number, number];
 
 export interface Part {
-  verts: number[]; // interleaved position+normal soup (6 floats/vertex) —
-                    // local (unposed) space, straight from mesh-utils.
+  /** Interleaved position+normal soup (6 floats/vertex) in local (unposed)
+   * space, straight from mesh-utils. READONLY: the builders hand out arrays
+   * shared through `memoGeom`, so posing must copy, never edit in place. */
+  verts: readonly number[];
   color: Color3;
   /** MAT.* constant (material-table.ts) — constant across the part, written
    * to every vertex it emits. */
@@ -152,8 +156,11 @@ export function makePart(
   x1: number, y1: number, z1: number,
   material: number = MAT.FUR,
 ): Part {
-  const verts: number[] = [];
-  box(verts, x0, y0, z0, x1, y1, z1);
+  const verts = memoGeom(`b${x0},${y0},${z0},${x1},${y1},${z1}`, () => {
+    const v: number[] = [];
+    box(v, x0, y0, z0, x1, y1, z1);
+    return v;
+  });
   return { verts, color, material, rots };
 }
 
@@ -166,8 +173,11 @@ export function makeBevelPart(
   x1: number, y1: number, z1: number,
   bevel = 0.03, material: number = MAT.FUR,
 ): Part {
-  const verts: number[] = [];
-  bevelBox(verts, x0, y0, z0, x1, y1, z1, bevel);
+  const verts = memoGeom(`v${x0},${y0},${z0},${x1},${y1},${z1},${bevel}`, () => {
+    const v: number[] = [];
+    bevelBox(v, x0, y0, z0, x1, y1, z1, bevel);
+    return v;
+  });
   return { verts, color, material, rots };
 }
 
@@ -184,8 +194,12 @@ export function makeBoxSpherePart(
   const cx = (x0 + x1) * 0.5, cy = (y0 + y1) * 0.5, cz = (z0 + z1) * 0.5;
   const scaleY = ((y1 - y0) / (2 * r)) * squashY;
   const scaleZ = (z1 - z0) / (2 * r);
-  const verts: number[] = [];
-  sphere(verts, cx, cy, cz, r, segments, rings, scaleY, scaleZ);
+  const verts = memoGeom(
+    `s${cx},${cy},${cz},${r},${segments},${rings},${scaleY},${scaleZ}`, () => {
+      const v: number[] = [];
+      sphere(v, cx, cy, cz, r, segments, rings, scaleY, scaleZ);
+      return v;
+    });
   return { verts, color, material, rots };
 }
 
@@ -197,8 +211,11 @@ export function makeCapsulePart(
   x1: number, y1: number, z1: number,
   r: number, segments = 6, material: number = MAT.FUR,
 ): Part {
-  const verts: number[] = [];
-  capsule(verts, x0, y0, z0, x1, y1, z1, r, segments);
+  const verts = memoGeom(`c${x0},${y0},${z0},${x1},${y1},${z1},${r},${segments}`, () => {
+    const v: number[] = [];
+    capsule(v, x0, y0, z0, x1, y1, z1, r, segments);
+    return v;
+  });
   return { verts, color, material, rots };
 }
 
@@ -300,8 +317,11 @@ export function makeBoxConePart(
 ): Part {
   const cx = (x0 + x1) * 0.5, cz = (z0 + z1) * 0.5;
   const r = ((x1 - x0) + (z1 - z0)) * 0.25;
-  const verts: number[] = [];
-  cone(verts, cx, y0, cz, r, y1 - y0, segments, true);
+  const verts = memoGeom(`k${cx},${y0},${cz},${r},${y1 - y0},${segments}`, () => {
+    const v: number[] = [];
+    cone(v, cx, y0, cz, r, y1 - y0, segments, true);
+    return v;
+  });
   return { verts, color, material, rots };
 }
 
@@ -321,14 +341,17 @@ export function makeBoxConePartZ(
 ): Part {
   const cx = (x0 + x1) * 0.5, cy = (y0 + y1) * 0.5;
   const r = ((x1 - x0) + (y1 - y0)) * 0.25;
-  const tmp: number[] = [];
-  cone(tmp, 0, 0, 0, r, z1 - z0, segments, true);
-  const verts: number[] = [];
-  for (let i = 0; i < tmp.length; i += 6) {
-    const lx = tmp[i], ly = tmp[i + 1], lz = tmp[i + 2];
-    const lnx = tmp[i + 3], lny = tmp[i + 4], lnz = tmp[i + 5];
-    verts.push(cx + lx, cy + lz, z1 - ly, lnx, lnz, -lny);
-  }
+  const verts = memoGeom(`z${cx},${cy},${z1},${r},${z1 - z0},${segments}`, () => {
+    const tmp: number[] = [];
+    cone(tmp, 0, 0, 0, r, z1 - z0, segments, true);
+    const v: number[] = [];
+    for (let i = 0; i < tmp.length; i += 6) {
+      const lx = tmp[i], ly = tmp[i + 1], lz = tmp[i + 2];
+      const lnx = tmp[i + 3], lny = tmp[i + 4], lnz = tmp[i + 5];
+      v.push(cx + lx, cy + lz, z1 - ly, lnx, lnz, -lny);
+    }
+    return v;
+  });
   return { verts, color, material, rots };
 }
 
