@@ -31,6 +31,8 @@
  * self-time functions, which is what turns a hitch count into a file:line.
  * `--llm` leaves the Director and NPC model on (default is `?director=off`, so
  * rendering and streaming are measured without the GPU being shared).
+ * `--query k=v&k2=v2` appends game URL params (A/B toggles such as
+ * `llmDevice=shared`).
  * `--uncapped` turns vsync and the frame-rate limit off so a frame's delta is
  * its real cost rather than 16.7 ms; `--viewport 2560x1440` sets the canvas.
  *
@@ -59,6 +61,8 @@ const HEADED = flag('headed');
 const UNCAPPED = flag('uncapped');
 const [VW, VH] = opt('viewport', '1280x720').split('x').map(Number);
 const PROFILE_BOOT = flag('profile-boot');
+/** Extra game URL params for A/B runs, e.g. `--query llmDevice=shared`. */
+const QUERY = opt('query', '');
 
 const browser = await chromium.launch({
   channel: 'chrome', headless: !HEADED,
@@ -288,7 +292,7 @@ for (let round = 0; round < ROUNDS; round++) {
   const settle = (ms) => page.waitForTimeout(ms);
 
   // --- boot ----------------------------------------------------------------
-  const url = `${BASE}/game.html?wipe=1&tod=0.45&weather=clear${LLM ? '' : '&director=off'}`;
+  const url = `${BASE}/game.html?wipe=1&tod=0.45&weather=clear${LLM ? '' : '&director=off'}${QUERY ? `&${QUERY}` : ''}`;
   const navT0 = Date.now();
   if (PROFILE_BOOT) {
     await cdp.send('Profiler.enable');

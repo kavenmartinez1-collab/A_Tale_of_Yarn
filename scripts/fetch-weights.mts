@@ -94,6 +94,7 @@ const SHIP: Want[] = [
     repo: 'LiquidAI/LFM3-1.7B-GGUF',
     file: 'LICENSE',
     revision: '4b423c332fd97961416f2e8b69467758fd27370d',
+    sha256: '4d28ca14dedc0b3d0fcc2b3339f0e79931faa33874f3d24f522183a8fc70068c',
     why: 'LFM Open License v1.0 — must ship with the weights (§4a); also in LICENSES/',
   },
 

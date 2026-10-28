@@ -2582,10 +2582,28 @@ async function boot() {
   if (npcLlmParam !== null && !isNpcModelKey(npcLlmParam)) {
     console.warn(`[NPC chat] unknown ?npcllm=${npcLlmParam} — using default`);
   }
+  // The villagers' and the Director's LLM run on their OWN GPUDevice.
+  // WebGPU executes one device's queue strictly in order, so on the shared
+  // device a ~1,000-token NPC warm prefill or Director prompt (seconds of GPU
+  // work) queued ahead of the next frame froze the game for that long —
+  // measured 2.6 s on arriving at a village and 2.4 s after a teleport
+  // (scripts/perf-harness.mjs --llm, 2026-10-28). A second device has its own
+  // hardware queue, so the OS GPU scheduler interleaves the two instead of
+  // making frames wait behind the whole job. The LLM never touches render
+  // resources, so nothing is shared. A fresh adapter is requested because a
+  // GPUAdapter can only create one device; with no adapter argument both
+  // calls get the system default (initWebGPU above does the same).
+  // A/B: ?llmDevice=shared puts the LLM back on the render device.
+  const llmGpu = directorOff || debugParams().get('llmDevice') === 'shared'
+    ? gpu
+    : await initWebGPU().catch((err) => {
+      console.warn('[llm] own GPU device unavailable, sharing the render device:', err);
+      return gpu;
+    });
   const director = !directorOff
     ? new DungeonDirector({
         seed: WORLD_SEED,
-        gpu,
+        gpu: llmGpu,
         // Carved ground: creatures walking a road should be ON it.
         heightAt: (x, z) => chunkManager.ground.heightAt(x, z),
       })
@@ -2606,7 +2624,7 @@ async function boot() {
   // re-arms if this preload fails (disk error, missing weights).
   if (!directorOff) {
     npcPreloadStarted = true;
-    void preloadNpcChat(gpu, npcModelKey, ggufGate.pacer).then((ok) => {
+    void preloadNpcChat(llmGpu, npcModelKey, ggufGate.pacer).then((ok) => {
       if (!ok) npcPreloadStarted = false;
     });
   }
@@ -3966,7 +3984,7 @@ async function boot() {
       onInvChanged: invChanged,
       panels,
       stubMode: directorOff,
-      gpu: directorOff ? undefined : gpu,
+      gpu: directorOff ? undefined : llmGpu,
       npcModel: npcModelKey,
       stockMap: npcStockMap,
       memoryMap: npcMemoryMap,
@@ -11491,7 +11509,7 @@ async function boot() {
         if (site !== null && Math.hypot(
           controller.pos[0] - site.x, controller.pos[2] - site.z) < NPC_PRELOAD_DIST) {
           npcPreloadStarted = true;
-          void preloadNpcChat(gpu, npcModelKey);
+          void preloadNpcChat(llmGpu, npcModelKey);
         }
       }
 

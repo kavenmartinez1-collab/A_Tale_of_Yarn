@@ -193,11 +193,32 @@ class HeaderCursor {
   async str(): Promise<string> {
     const len = await this.u64();
     await this.ensure(len);
-    const s = new TextDecoder('utf-8').decode(this.bytes.subarray(this.pos, this.pos + len));
+    const s = UTF8.decode(this.bytes.subarray(this.pos, this.pos + len));
     this.pos += len;
     return s;
   }
+
+  /**
+   * Synchronous string read when the whole string is already buffered, else
+   * null (caller falls back to str()). Vocabulary arrays hold ~100k-250k
+   * strings; awaiting each one and building a TextDecoder per string cost
+   * 2 x 283 ms of main-thread time on the game's boot (scripts/perf-harness.mjs
+   * --llm, LFM3 GGUF). Same bytes, same decoder settings — identical values.
+   */
+  strIfBuffered(): string | null {
+    if (this.pos + 8 > this.bytes.byteLength) return null;
+    const big = this.view.getBigUint64(this.pos, true);
+    if (big > BigInt(Number.MAX_SAFE_INTEGER)) return null; // str() throws the real error
+    const len = Number(big);
+    if (this.pos + 8 + len > this.bytes.byteLength) return null;
+    const s = UTF8.decode(this.bytes.subarray(this.pos + 8, this.pos + 8 + len));
+    this.pos += 8 + len;
+    return s;
+  }
 }
+
+/** One decoder for every header string (it is stateless for whole inputs). */
+const UTF8 = new TextDecoder('utf-8');
 
 // GGUF metadata value types (same numbering as core/gpu_pool.py _val).
 // Plain const object (not enum) so node's TS type-stripping can run this file.
@@ -224,6 +245,20 @@ async function readValue(c: HeaderCursor, type: number): Promise<unknown> {
       const elemType = await c.u32();
       const count = await c.u64();
       const out = new Array(count);
+      if (elemType === GGUFValueType.STRING) {
+        // Yield to the event loop every ~8 ms so a 400k-string vocabulary
+        // never becomes one long frame in the game (setTimeout, not a
+        // microtask: only a macrotask lets the browser render).
+        let slice = performance.now();
+        for (let i = 0; i < count; i++) {
+          out[i] = c.strIfBuffered() ?? await c.str();
+          if ((i & 1023) === 1023 && performance.now() - slice > 8) {
+            await new Promise((r) => setTimeout(r, 0));
+            slice = performance.now();
+          }
+        }
+        return out;
+      }
       for (let i = 0; i < count; i++) out[i] = await readValue(c, elemType);
       return out;
     }

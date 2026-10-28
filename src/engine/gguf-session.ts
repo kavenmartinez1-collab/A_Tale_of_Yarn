@@ -206,7 +206,9 @@ async function buildGGUFSession(
   }
 
   status('Building inference engine...');
+  const tEngine = performance.now();
   const engine = createForwardPassEngine(gpu.device, config, { global, layers });
+  console.info(`[GGUF session] ${cfg.repo}: engine built in ${(performance.now() - tEngine).toFixed(0)} ms`);
   const tokenizer = await createTokenizer({ modelId: cfg.repo });
   // Wrong-family tokenizer fallback silently produces garbage — hard-fail.
   // The embedding table may be padded past the real vocab (LFM3: 125033

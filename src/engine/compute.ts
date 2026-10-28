@@ -6,8 +6,19 @@
 
 import { reportMetric, reportError } from '../utils/metrics';
 
-// Cache compiled pipelines to avoid recompilation
-const pipelineCache = new Map<string, GPUComputePipeline>();
+// Cache compiled pipelines (and shader modules) PER DEVICE. A pipeline is
+// only valid on the device that created it, and the game runs the LLM on its
+// own device next to the renderer's, so a page-global cache would hand one
+// device another's pipeline. Shader modules are shared across entry points:
+// matmul_gguf.wgsl (~3,400 lines) used to be parsed and validated once per
+// pipeline (~30x per engine build).
+const pipelineCaches = new WeakMap<GPUDevice, Map<string, GPUComputePipeline>>();
+const moduleCaches = new WeakMap<GPUDevice, Map<string, GPUShaderModule>>();
+function cacheFor<V>(caches: WeakMap<GPUDevice, Map<string, V>>, device: GPUDevice): Map<string, V> {
+  let c = caches.get(device);
+  if (!c) { c = new Map(); caches.set(device, c); }
+  return c;
+}
 
 /**
  * Compile a WGSL shader and create a compute pipeline.
@@ -27,21 +38,27 @@ export function createComputePipeline(
     : '';
   const cacheKey = `${label}:${entryPoint}:${simpleHash(wgslSource)}${constantsKey}`;
 
+  const pipelineCache = cacheFor(pipelineCaches, device);
   const cached = pipelineCache.get(cacheKey);
   if (cached) return cached;
 
-  const module = device.createShaderModule({
-    code: wgslSource,
-    label: `${label}-module`,
-  });
-
-  // Log shader compilation errors (WebGPU silently fails otherwise)
-  module.getCompilationInfo().then(info => {
-    for (const msg of info.messages) {
-      const prefix = msg.type === 'error' ? '❌' : msg.type === 'warning' ? '⚠️' : 'ℹ️';
-      console.log(`[WGSL ${label}] ${prefix} ${msg.type} at line ${msg.lineNum}:${msg.linePos}: ${msg.message}`);
-    }
-  });
+  const moduleCache = cacheFor(moduleCaches, device);
+  const moduleKey = `${simpleHash(wgslSource)}:${wgslSource.length}`;
+  let module = moduleCache.get(moduleKey);
+  if (!module) {
+    module = device.createShaderModule({
+      code: wgslSource,
+      label: `${label}-module`,
+    });
+    moduleCache.set(moduleKey, module);
+    // Log shader compilation errors (WebGPU silently fails otherwise)
+    module.getCompilationInfo().then(info => {
+      for (const msg of info.messages) {
+        const prefix = msg.type === 'error' ? '❌' : msg.type === 'warning' ? '⚠️' : 'ℹ️';
+        console.log(`[WGSL ${label}] ${prefix} ${msg.type} at line ${msg.lineNum}:${msg.linePos}: ${msg.message}`);
+      }
+    });
+  }
 
   const pipeline = device.createComputePipeline({
     layout: 'auto',
