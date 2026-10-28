@@ -161,6 +161,34 @@ check('no threat: "hello there"', detectThreat('hello there, nice weather') === 
 check('no threat: "buy 2 bread"', detectThreat('can I buy 2 bread?') === null);
 check('threat is case-insensitive', detectThreat('I WILL KILL YOU') === 'threat');
 
+// Threats the substring scan missed (scripts/test-npc-live.mts VERB_TRIALS).
+for (const s of [
+  'I am going to gut you where you stand, merchant.',
+  'Give me everything in your stall or I break your arms.',
+  '*draws a sword and levels it at you*',
+  'I am going to burn this place to the ground and gut you first.',
+  'Prepare to die.',
+]) check(`threat: "${s}"`, detectThreat(s) === 'threat');
+check('insult: "your husband is a coward"',
+  detectThreat('Your husband Gorm is a coward and I will spit on his grave.') === 'insult');
+
+// ...and the false alarms it raised. With the live model the floor turns
+// these into real consequences (an NPC turning hostile mid-conversation).
+for (const s of [
+  'My wife died last winter. I still cannot sleep.',
+  'What do you think happens to us after we die? Do the gods care at all?',
+  'I killed three men on the road here. Cut them down and left them.',
+  'How is your wife these days?',
+  'I have a problem with my robe, it tore.',
+  'You have real skill with that hammer.',
+  'Take a break, you look tired.',
+  "I'll cut you a fair price on the wool.",
+  'I could beat you at dice any day.',
+  'I bought a pig at market this morning.',
+  'Your dog is lovely.',
+  'The soldiers marched past at dawn.',
+]) check(`no threat: "${s}"`, detectThreat(s) === null);
+
 // ---------------------------------------------------------------------------
 // 8. extractNpcAction — balanced-brace scan (Phase N2)
 // ---------------------------------------------------------------------------

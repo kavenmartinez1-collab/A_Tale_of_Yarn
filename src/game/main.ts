@@ -2561,9 +2561,10 @@ async function boot() {
   // checkbox — the panel says the setting applies on restart.
   const directorOff = debugParams().get('director') === 'off' || settings.get().directorOff;
 
-  // NPC dialogue model: defaults to STOCK Qwen3-1.7B Q4_K_M (Apache-2.0), the
-  // same model the Dungeon Director runs — one download, one set of resident
-  // weights. ?npcllm=large picks the slower stock 4B (measured TTFT ~45s vs a
+  // NPC dialogue model: defaults to LiquidAI LFM3-1.7B Q4_K_M (LFM Open
+  // License v1.0), the same model the Dungeon Director runs — one download,
+  // one set of resident weights. ?npcllm=qwen picks the previous default,
+  // stock Qwen3-1.7B. ?npcllm=large picks the slower stock 4B (measured TTFT ~45s vs a
   // 20s watchdog — expect canned replies); ?npcllm=abliterated is for
   // comparison only and must not become the default. See NPC_MODELS in
   // npc-chat-panel.ts and docs/AI_GUARDRAILS.md.

@@ -20,6 +20,8 @@ import { STEAM_RELEASE } from '../release-flags';
 import {
   screenPlayerInput, screenNpcReply, safetyDeflection,
 } from '../npc/content-safety';
+import { breaksCharacter, characterDeflection } from '../npc/persona-guard';
+import { isActionGrounded } from '../npc/action-gate';
 import type { ForkedChatContext } from '../../engine/inference';
 import {
   TRADE_CATALOG, SELL_PRICES, extractTradeOffer, extractNpcAction, stripNpcJson,
@@ -737,24 +739,49 @@ export type NpcChatFn = (
 /**
  * Selectable NPC dialogue models. Pick with `?npcllm=<key>`.
  *
- * `fast` (the shipped default) and `default` are the SAME stock Qwen3-1.7B
- * Q4_K_M, ~1.11 GB, Apache-2.0 — which is also what the Dungeon Director runs
+ * `fast` (the shipped default) and `default` are the SAME LiquidAI LFM3-1.7B
+ * Q4_K_M, ~1.10 GB — which is also what the Dungeon Director runs
  * (director.ts). One model serves both, the session dedups on `repo::file`, so
  * the pair costs one download and one set of resident weights.
  *
- * `large`: stock Qwen3-4B-Instruct-2507 Q4_K_M, ~2.50 GB, same licence, same
- * ChatML template — a size/quality dial on an identical integration. Measured
- * far better at the control-JSON contract; see scripts/test-npc-live.mts.
+ * `qwen`: stock Qwen3-1.7B, the previous default (Apache-2.0), same size.
+ * `large`: stock Qwen3-4B-Instruct-2507 Q4_K_M, ~2.50 GB — a size/quality dial.
+ * Measured far better at the control-JSON contract; see scripts/test-npc-live.mts.
  *
  * `abliterated`: mlabonne's abliterated Qwen3-4B — comparison only, never a
  * default. See the note on that key.
  *
- * All dense qwen3 arch — supported by the GGUF session (no hybrid layers).
- * Local hf-cache first, HF CDN fallback.
+ * `sampling` is per model, not cosmetic: LFM3 at the Qwen setting (0.9) broke
+ * character and leaked control JSON in scripts/test-npc-live.mts; at 0.3 /
+ * top-k 50 (near LiquidAI's recommended 0.1) it passes. Local hf-cache first,
+ * HF CDN fallback.
  */
 export const NPC_MODELS = {
   /**
-   * Shipping default: STOCK Qwen3-1.7B, Apache-2.0, ~1.11 GB.
+   * Shipping default: LiquidAI LFM3-1.7B Q4_K_M, ~1.10 GB, LFM Open License
+   * v1.0 (LICENSES/LFM-Open-License-1.0.txt; free to use and redistribute
+   * with the licence text; commercial use only below US$10M annual revenue —
+   * the game is free, see docs/AI_MODEL_LICENSING.md).
+   *
+   * Measured with scripts/test-npc-live.mts (2026-10-28, RX 6700 XT): PASS —
+   * no <think> or JSON leaks, guardrail 8/8, TTFT ~175 ms (Qwen3-1.7B on the
+   * same card: ~2 s). Like Qwen3-1.7B it emits no action verb on threats
+   * (0/4); threatActionFor() in npc-trade.ts is the floor for both.
+   * The engine runs it natively (gated short-conv + sliding-window attention
+   * hybrid; parity vs llama.cpp in scripts/test-lfm3-parity.mts).
+   * `emptyThink` is ignored for LFM: its template always emits an empty
+   * <think></think> when thinking is off, and the session never samples
+   * <think> in that mode.
+   */
+  fast: {
+    repo: 'LiquidAI/LFM3-1.7B-GGUF',
+    file: 'LFM3-1.7B-Q4_K_M.gguf',
+    emptyThink: false,
+    sampling: { temperature: 0.3, topK: 50, topP: 0.95, repetitionPenalty: 1.1, maxNewTokens: 320 },
+  },
+  /**
+   * STOCK Qwen3-1.7B, Apache-2.0, ~1.11 GB. The shipping default until
+   * 2026-10-28 (now LFM3, above); kept as `?npcllm=qwen`.
    *
    * Replaced `mradermacher/Qwen3-1.7B-abliterated-GGUF` for two independent
    * reasons that happen to point the same way (docs/AI_MODEL_LICENSING.md):
@@ -774,10 +801,11 @@ export const NPC_MODELS = {
    * system prompt, which tells the model adult subjects are open and that it
    * must not moralise. Stock Qwen3 follows that instruction perfectly well.
    */
-  fast: {
+  qwen: {
     repo: 'unsloth/Qwen3-1.7B-GGUF',
     file: 'Qwen3-1.7B-Q4_K_M.gguf',
     emptyThink: true,
+    sampling: { temperature: 0.9, topP: 0.95, repetitionPenalty: 1.1, maxNewTokens: 320 },
   },
   /**
    * Smarter/slower stock 4B, same licence and ChatML template. `?npcllm=large`.
@@ -793,6 +821,7 @@ export const NPC_MODELS = {
     repo: 'unsloth/Qwen3-4B-Instruct-2507-GGUF',
     file: 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf',
     emptyThink: false,
+    sampling: { temperature: 0.9, topP: 0.95, repetitionPenalty: 1.1, maxNewTokens: 320 },
   },
   /**
    * Alias of `fast` — the model the Director already has resident, so talking
@@ -806,9 +835,10 @@ export const NPC_MODELS = {
    * this pointed at the same GGUF as `fast`.
    */
   default: {
-    repo: 'unsloth/Qwen3-1.7B-GGUF',
-    file: 'Qwen3-1.7B-Q4_K_M.gguf',
-    emptyThink: true,
+    repo: 'LiquidAI/LFM3-1.7B-GGUF',
+    file: 'LFM3-1.7B-Q4_K_M.gguf',
+    emptyThink: false,
+    sampling: { temperature: 0.3, topK: 50, topP: 0.95, repetitionPenalty: 1.1, maxNewTokens: 320 },
   },
   /**
    * Abliterated 4B, kept behind `?npcllm=abliterated` for comparison only.
@@ -821,6 +851,7 @@ export const NPC_MODELS = {
     repo: 'bartowski/mlabonne_Qwen3-4B-abliterated-GGUF',
     file: 'mlabonne_Qwen3-4B-abliterated-Q4_K_M.gguf',
     emptyThink: true,
+    sampling: { temperature: 0.9, topP: 0.95, repetitionPenalty: 1.1, maxNewTokens: 320 },
   },
 } as const;
 
@@ -967,7 +998,8 @@ async function buildLiveChatFn(
         // generate.ts sampler-default notes).
         // 320 tokens: room for a real, human-length reply — conversations may
         // go anywhere, so answers must not be clipped mid-thought.
-        { temperature: 0.9, topP: 0.95, repetitionPenalty: 1.1, maxNewTokens: 320 },
+        // Per-model (NPC_MODELS[key].sampling): LFM3 needs a lower temperature.
+        model.sampling,
         (chunk: string) => {
           sawToken = true;
           onToken?.(chunk);
@@ -1905,6 +1937,15 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
 
     // Conversation consequences take precedence over trade offers.
     let npcAction = extractNpcAction(replyText);
+    // Gate: the model's verb only counts when the player's message supports
+    // it (action-gate.ts) — a small model fires `follow` or `hostile` during
+    // small talk, and those have real consequences.
+    if (npcAction !== null && playerSaid !== undefined
+        && !isActionGrounded(npcAction.action, playerSaid)) {
+      // eslint-disable-next-line no-console
+      console.info(`[npc] ignored ungrounded model action "${npcAction.action}"`);
+      npcAction = null;
+    }
     // Deterministic floor: a 1.7B reliably fails to emit the action verb when
     // threatened (0/4 measured, both the current and previous default — see
     // threatActionFor). Without this, threatening an NPC has consequences in
@@ -2046,13 +2087,21 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
         // screening only the completed reply would let a prohibited sentence
         // be visible for the second or two it takes to finish generating.
         let streamBlocked = false;
+        // Same treatment for a reply that steps out of the fiction ("I'm an
+        // AI language model..."): hidden the moment it shows, replaced below.
+        let oocBlocked = false;
         const fullReply = await chatFn(messages, (chunk: string) => {
           buffer += chunk;
           if (!streamBlocked && screenNpcReply(buffer).blocked) {
             streamBlocked = true;
             replyEl.textContent = '';
           }
-          if (streamBlocked) return;
+          if (!streamBlocked && !oocBlocked && breaksCharacter(buffer)) {
+            oocBlocked = true;
+            replyEl.textContent = '';
+            _voiceOut?.stop();
+          }
+          if (streamBlocked || oocBlocked) return;
           // Strip control JSON live so the player never sees it mid-stream.
           replyEl.textContent = stripNpcJson(buffer);
           // Speak what is DISPLAYED, never the raw stream — the guardrail and
@@ -2116,6 +2165,20 @@ export function buildNpcChatPanel(opts: NpcChatPanelOptions): HTMLElement {
           console.warn(`[safety] blocked model output (${outVerdict.category ?? 'stream'}/${outVerdict.detail ?? 'partial'})`);
           // Deliberately NOT passed to onReplyComplete: that is what commits
           // the turn to history, memory and disposition.
+          return;
+        }
+        // --- persona guard ---------------------------------------------------
+        // A reply that talks about being an AI/model/prompt is replaced by an
+        // in-world reaction and, like a blocked reply, never enters history
+        // (the model would otherwise keep building on it).
+        if (oocBlocked || breaksCharacter(finalReply)) {
+          _voiceOut?.stop();
+          replyEl.textContent = characterDeflection(persona.name + finalReply.length);
+          speakBegin();
+          _voiceOut?.flush(replyEl.textContent);
+          scrollBottom();
+          // eslint-disable-next-line no-console
+          console.warn('[persona] replaced an out-of-character model reply');
           return;
         }
 

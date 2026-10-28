@@ -256,6 +256,28 @@ export function threatActionFor(
   };
 }
 
+/**
+ * JSON.parse, then a narrow repair for what small models actually emit:
+ * unquoted keys (`{action: "invite_home"}`, measured from LFM3-1.7B) and
+ * single quotes. Anything still unparseable stays prose. The result goes
+ * through the same validators as strict JSON (known verbs, catalog items),
+ * so leniency here can never invent an action the game would not accept.
+ */
+function parseLenientJson(src: string): unknown {
+  try { return JSON.parse(src); } catch { /* try the repair */ }
+  const repaired = src
+    .replace(/'/g, '"')
+    .replace(/([{,]\s*)([A-Za-z_][\w]*)\s*:/g, '$1"$2":');
+  try { return JSON.parse(repaired); } catch { return undefined; }
+}
+
+/** A lone action name in braces (`{'invite_home'}`, `{hostile}`) is a
+ *  botched control object. Any other `{word}` is left alone as prose. */
+function isLoneActionInBraces(block: string): boolean {
+  const m = /^\{\s*['"]?([A-Za-z_]+)['"]?\s*\}$/.exec(block);
+  return m !== null && ACTION_KINDS.has(m[1]);
+}
+
 function parseRawAction(parsed: unknown): NpcAction | null {
   if (typeof parsed !== 'object' || parsed === null) return null;
   const p = parsed as Record<string, unknown>;
@@ -296,11 +318,8 @@ export function extractNpcAction(text: string): NpcAction | null {
       }
     }
     if (end === -1) continue;
-    try {
-      const parsed: unknown = JSON.parse(text.slice(i, end + 1));
-      const action = parseRawAction(parsed);
-      if (action !== null) last = action;
-    } catch { /* skip */ }
+    const action = parseRawAction(parseLenientJson(text.slice(i, end + 1)));
+    if (action !== null) last = action;
     i = end;
   }
   return last;
@@ -335,14 +354,14 @@ export function stripNpcJson(text: string): string {
       }
     }
     if (end === -1) { out += text[i]; continue; }
-    let control = false;
-    try {
-      const parsed: unknown = JSON.parse(text.slice(i, end + 1));
-      // Any top-level "action"/"trade" object is control data — strip even
-      // malformed ones (hallucinated ids etc.) so JSON never leaks to chat.
-      control = parsed !== null && typeof parsed === 'object' &&
-        ('action' in parsed || 'trade' in parsed);
-    } catch { /* not JSON — keep as prose */ }
+    const block = text.slice(i, end + 1);
+    const parsed = parseLenientJson(block);
+    // Any top-level "action"/"trade" object is control data — strip even
+    // malformed ones (hallucinated ids, unquoted keys) so JSON never leaks
+    // to chat; so is a lone word in braces.
+    const control = isLoneActionInBraces(block) || (
+      parsed !== null && typeof parsed === 'object' &&
+      ('action' in (parsed as object) || 'trade' in (parsed as object)));
     if (control) i = end; // skip the whole object
     else out += text[i];
   }

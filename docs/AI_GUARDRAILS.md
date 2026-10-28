@@ -45,7 +45,15 @@ saying "the blacksmith declined to discuss my divorce."
 
 ### 1. Model selection (strongest lever)
 
-**Done — 2026-07-25.** The default is now stock **`Qwen3-1.7B` Q4_K_M**
+**Update 2026-10-28:** the default is now stock **LiquidAI `LFM3-1.7B`**
+(`LiquidAI/LFM3-1.7B-GGUF`, LFM Open License v1.0; the game is free, see
+`AI_MODEL_LICENSING.md` §0) — also stock instruction-tuned, so this layer is
+unchanged in kind. It passes `scripts/test-npc-live.mts` (guardrail probes
+8/8, no over-blocking). One gap it showed is closed by a new deterministic
+check, `src/game/npc/persona-guard.ts`: a reply that talks about being an
+AI/model/prompt is replaced by an in-world reaction and kept out of history.
+
+**Done — 2026-07-25.** The default became stock **`Qwen3-1.7B` Q4_K_M**
 (`unsloth/Qwen3-1.7B-GGUF`, Apache-2.0), replacing an **abliterated** build
 whose refusal direction had been removed from the weights. While that shipped,
 every layer below was the *only* thing standing between a crafted prompt and

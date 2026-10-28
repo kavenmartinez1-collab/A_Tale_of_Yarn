@@ -5,17 +5,17 @@ Copyright (c) 2025 Kaven Martinez. This file covers everything else that is
 **distributed with it**: model weights, JavaScript dependencies, and vendored
 native code.
 
-It exists because Apache License 2.0 §4 requires, when you distribute the
-work, that you give recipients a copy of the licence and retain the
-attribution notices. Several of the models below are Apache-2.0, so this is an
-obligation and not a courtesy. Full licence texts are in [`LICENSES/`](./LICENSES).
+It exists because Apache License 2.0 §4 and the LFM Open License v1.0 §4
+require, when you distribute the work, that you give recipients a copy of the
+licence and retain the attribution notices. The shipped model is under the
+latter, so this is an obligation and not a courtesy. Full licence texts are in [`LICENSES/`](./LICENSES).
 
 > **Scope note.** This repository builds **two** front ends and they do not
 > ship the same third-party code:
 >
 > | Entry point | What it is | Third-party surface |
 > |---|---|---|
-> | `game.html` → `src/game/main.ts` | **the game** | Qwen3 weights, `@huggingface/transformers` (tokeniser only) |
+> | `game.html` → `src/game/main.ts` | **the game** | LFM3 weights, `@huggingface/transformers` (tokeniser only) |
 > | `index.html` → `src/main.ts` | companion chat / image / TTS app | all of the above **plus** ONNX Runtime Web, a vendored **GPL-3.0** eSpeak NG, Piper and Whisper weights, the FLUX.2 text encoder |
 >
 > Section 4 explains why that distinction decides whether this build is
@@ -32,8 +32,38 @@ upstream re-upload cannot change what you ship.
 
 ### 1.1 Shipped with the game
 
-**Qwen3-1.7B** — NPC dialogue *and* the Dungeon Director (one model serves
-both).
+**LFM3-1.7B** — NPC dialogue *and* the Dungeon Director (one model serves
+both), since 2026-10-28.
+
+```
+LFM3-1.7B — Liquid AI, Inc.
+Licensed under the LFM Open License v1.0
+LICENSES/LFM-Open-License-1.0.txt (also shipped beside the weights as
+models/LiquidAI--LFM3-1.7B-GGUF/LICENSE)
+```
+
+| | |
+|---|---|
+| Artefact | `LFM3-1.7B-Q4_K_M.gguf` |
+| Distribution repo | [`LiquidAI/LFM3-1.7B-GGUF`](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF) at commit `4b423c332fd97961416f2e8b69467758fd27370d` (Liquid AI's own quantisation) |
+| Base model | [`LiquidAI/LFM3-1.7B`](https://huggingface.co/LiquidAI/LFM3-1.7B) |
+| Tokeniser | `tokenizer.json` / `tokenizer_config.json` from `LiquidAI/LFM3-1.7B` at commit `ac2586a34f1a1c03329dbdcdefabd8b6478ddaa7` |
+| Licence | LFM Open License v1.0 (Apache-2.0-style grant; §5 limits **commercial** use to entities under US$10M annual revenue) |
+| Gated | No |
+| Size | 1,099,627,808 bytes |
+| SHA-256 | `3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4` |
+| Tokeniser SHA-256 | `7e226e34bface23ccf6e495d157bf77186c1c30a7659880e1a8994db528c3701` (tokenizer.json), `bf028f813efc6137bc07ed045cafe71820df9a5e26a38e39954706ed1e30a457` (tokenizer_config.json) |
+
+Obligations met: the licence text ships with the weights (§4a); the files are
+unmodified (§4b); the repo carries no `NOTICE` file. The game is distributed
+**free of charge**, so the §5 revenue threshold does not come into play — see
+[`docs/AI_MODEL_LICENSING.md`](./docs/AI_MODEL_LICENSING.md) before ever
+charging for it.
+
+### 1.2 Optional, not shipped by default
+
+**Qwen3-1.7B** — the previous default, reachable only via `?npcllm=qwen`
+(fetch-weights.mts `--all`; excluded from the depot by pack-steam.mjs).
 
 ```
 Qwen3-1.7B — Copyright 2024 Alibaba Cloud
@@ -56,7 +86,6 @@ The upstream `Qwen/Qwen3-1.7B` LICENSE is unmodified Apache-2.0 with
 (verified: HTTP 404), so there are no NOTICE contents to reproduce under
 Apache-2.0 §4(d).
 
-### 1.2 Optional, not shipped by default
 
 **Qwen3-4B-Instruct-2507** — reachable only via `?npcllm=large`. Ship it only
 if you decide to promote it to the default; otherwise it is not distributed.
@@ -186,8 +215,9 @@ which is Apache-2.0 and ungated — but sibling repos in that family
 licence, and nothing in the artefact records which one it came from.
 
 **As of 2026-07-25 it is no longer used as an LLM.** The Dungeon Director and
-the `?npcllm=default` key both pointed at it and now point at the Apache-2.0
-Qwen3-1.7B above, so no chat or dungeon-generation path can reach it.
+the `?npcllm=default` key both pointed at it and were moved to Qwen3-1.7B
+(and on 2026-10-28 to LFM3-1.7B, §1.1), so no chat or dungeon-generation path
+can reach it.
 
 It remains on disk for `src/diffusion/` (companion app), where it is used as an
 image text encoder — its actual purpose. **If the diffusion feature is ever
@@ -199,8 +229,8 @@ shipped, re-derive this file from a known-good source first.** Full analysis:
 ## 6. Verifying this file
 
 ```sh
-# model artefact hashes
-sha256sum Qwen3-1.7B-Q4_K_M.gguf
+# model artefact hashes (fetch-weights.mts also checks these pins)
+sha256sum models/LiquidAI--LFM3-1.7B-GGUF/LFM3-1.7B-Q4_K_M.gguf
 
 # what actually reaches the browser
 npm run build

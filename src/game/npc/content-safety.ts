@@ -38,8 +38,9 @@
  *
  * Term matching is not semantic and can be evaded by someone determined to
  * evade it. It is one layer of four, and it is not the strongest one — the
- * model is. The shipped default is now stock `Qwen3-1.7B` (Apache-2.0), not
- * the abliterated build that shipped before 2026-07-25, so a layer of trained
+ * model is. The shipped default is a stock instruction-tuned model — LiquidAI
+ * `LFM3-1.7B` since 2026-10-28, stock `Qwen3-1.7B` before that, and never again
+ * the abliterated build that shipped before 2026-07-25 — so a layer of trained
  * refusal sits underneath this rule list rather than having been surgically
  * removed from the weights. `?npcllm=abliterated` still reaches an abliterated
  * model for comparison; under that flag this module is genuinely the only

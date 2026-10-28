@@ -130,31 +130,55 @@ export const REFUSE_CHAT_BELOW = -40;
 // Threat / insult detection (stub-mode fallback for conversation consequences)
 // ---------------------------------------------------------------------------
 
-const THREAT_WORDS = [
-  'kill', 'steal', 'rob', 'attack', 'hurt', 'burn', 'die', 'stab', 'murder',
-  'slit', 'gut', 'destroy', 'take your', 'your wife', 'your husband',
-  'your family', 'your gold or', 'hand over', 'or else',
-];
+// A threat is violence aimed at the NPC or their place, a robbery demand, or
+// a drawn weapon. The previous plain-substring list ('die', 'rob', 'kill',
+// 'your wife', ...) fired on grief ("my wife died"), confessions ("I killed
+// three men on the road"), small talk ("how is your wife?", "a problem with
+// my robe", "skill") — and with the live model loaded those false alarms
+// became real consequences through the threat floor (threatActionFor).
+// Measured with scripts/test-npc-live.mts, 2026-10-28.
+// Violence counts when it is aimed: the verb, then the NPC/their place within
+// two words ("kill you", "steal your wife", "burn this place down"). Ambiguous
+// verbs only in unmistakable phrases — "cut you a fair price", "beat you at
+// dice" and "take a break, you look tired" are not threats.
+const TARGET_WORDS =
+  '(?:you|your|yours|ye|thee|this (?:place|village|town|settlement|house|home|shop|stall|farm)|everyone here)';
+const AIMED_VIOLENCE = new RegExp(
+  '\\b(?:kill|murder|stab|gut|slit|burn|hurt|attack|destroy|strangle|rob|steal|torch|skewer|slaughter)\\b'
+  + `(?:\\s+\\w+){0,2}?\\s+${TARGET_WORDS}\\b`);
+const BODILY_HARM =
+  /\b(?:break|snap|cut|slash|smash) (?:your|ye|thy) (?:arms?|legs?|neck|bones|skull|face|jaw|throat|fingers?|hands?)\b/;
+const NPC_TARGET = new RegExp(`\\b${TARGET_WORDS}\\b`);
+const ROBBERY =
+  /\b(?:hand (?:it |them |everything |the \w+ )?over|or else|give me (?:everything|all|your)|your (?:money|gold|coin|life) or)\b/;
+const DEATH_WISH =
+  /\b(?:you(?:'ll| will| are going to| shall)? die|prepare to die|you(?:'re| are) dead|i(?:'ll| will) see you dead)\b/;
+const DRAWN_WEAPON =
+  /\b(?:draws?|drawing|unsheathes?|levels?|raises?|points?|brandish(?:es)?)\b[^.!?]{0,20}\b(?:sword|blade|knife|dagger|axe|bow|spear|weapon)\b/;
 
-const INSULT_WORDS = [
-  'idiot', 'fool', 'stupid', 'ugly', 'coward', 'worthless', 'pathetic',
-  'scum', 'wretch', 'dog', 'pig', 'hate you', 'filthy',
-];
+const INSULT_WORDS =
+  /\b(?:idiot|fool|stupid|ugly|coward|worthless|pathetic|scum|wretch|dog|pig|filthy)\b/;
 
 export type ThreatKind = 'threat' | 'insult' | null;
 
 /**
  * Detect whether player text is a threat (violence/robbery) or an insult.
- * Deterministic keyword scan — used by the stub reply path so conversations
- * have consequences even with the LLM off.
+ * Deterministic scan — used by the stub reply path so conversations have
+ * consequences even with the LLM off, and as the floor/grounding for the
+ * live model's action verbs (threatActionFor, action-gate.ts).
  */
 export function detectThreat(text: string): ThreatKind {
   const t = text.toLowerCase();
-  for (const w of THREAT_WORDS) {
-    if (t.includes(w)) return 'threat';
+  if (AIMED_VIOLENCE.test(t) || BODILY_HARM.test(t)
+      || ROBBERY.test(t) || DEATH_WISH.test(t) || DRAWN_WEAPON.test(t)) {
+    return 'threat';
   }
-  for (const w of INSULT_WORDS) {
-    if (t.includes(w)) return 'insult';
+  // An insult has to land on the NPC (or theirs) — or be a short outburst
+  // ("pathetic coward"). "I bought a pig at market" and "your dog is
+  // lovely" are not insults.
+  const insult = t.replace(/\byour (?:dog|pig)s?\b/g, '');
+  if (INSULT_WORDS.test(insult) || insult.includes('hate you')) {
+    if (NPC_TARGET.test(insult) || t.trim().split(/\s+/).length <= 4) return 'insult';
   }
   return null;
 }

@@ -16,7 +16,8 @@
  *   5. the guardrail against real generations, weighted toward OVER-blocking
  *   6. speed — TTFT and decode rate vs the 20 s watchdog
  *
- * Run:  npx tsx scripts/test-npc-live.mts [--model=fast|large|abliterated|default]
+ * Run:  npx tsx scripts/test-npc-live.mts [--model=fast|qwen|large|abliterated|oldfast]
+ *       [--temp=0.3] [--topk=50]   (override the model's sampling for A/B runs)
  *       npx tsx scripts/test-npc-live.mts --headed
  */
 import { chromium } from '@playwright/test';
@@ -29,16 +30,33 @@ const headed = process.argv.includes('--headed');
 // a model the panel does not currently default to.
 // `emptyThink` must mirror NPC_MODELS — it is not cosmetic. A non-thinking
 // checkpoint fed the empty <think> block emits EOS immediately (measured).
-const MODELS: Record<string, { repo: string; file: string; emptyThink: boolean }> = {
-  fast: { repo: 'unsloth/Qwen3-1.7B-GGUF', file: 'Qwen3-1.7B-Q4_K_M.gguf', emptyThink: true },
+type Sampling = { temperature: number; topP: number; topK?: number; repetitionPenalty: number; maxNewTokens: number };
+const MODELS: Record<string, { repo: string; file: string; emptyThink: boolean; sampling?: Sampling }> = {
+  fast: {
+    repo: 'LiquidAI/LFM3-1.7B-GGUF', file: 'LFM3-1.7B-Q4_K_M.gguf', emptyThink: false,
+    sampling: { temperature: 0.3, topK: 50, topP: 0.95, repetitionPenalty: 1.1, maxNewTokens: 320 },
+  },
+  qwen: { repo: 'unsloth/Qwen3-1.7B-GGUF', file: 'Qwen3-1.7B-Q4_K_M.gguf', emptyThink: true },
   large: { repo: 'unsloth/Qwen3-4B-Instruct-2507-GGUF', file: 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf', emptyThink: false },
   abliterated: { repo: 'bartowski/mlabonne_Qwen3-4B-abliterated-GGUF', file: 'mlabonne_Qwen3-4B-abliterated-Q4_K_M.gguf', emptyThink: true },
   // The PREVIOUS shipped default, kept here purely as an A/B baseline so a
   // regression can be told apart from a pre-existing 1.7B-size limitation.
   oldfast: { repo: 'mradermacher/Qwen3-1.7B-abliterated-GGUF', file: 'Qwen3-1.7B-abliterated.Q4_K_M.gguf', emptyThink: true },
 };
-const model = MODELS[argModel];
-if (model === undefined) throw new Error(`unknown --model=${argModel}`);
+const base = MODELS[argModel];
+if (base === undefined) throw new Error(`unknown --model=${argModel}`);
+// --temp= / --topk= override the model's sampling for A/B runs.
+const argNum = (k: string) => {
+  const v = process.argv.find((a) => a.startsWith(`--${k}=`))?.split('=')[1];
+  return v === undefined ? undefined : Number(v);
+};
+const sampling: Sampling = {
+  ...(base.sampling ?? { temperature: 0.9, topP: 0.95, repetitionPenalty: 1.1, maxNewTokens: 320 }),
+  ...(argNum('temp') !== undefined ? { temperature: argNum('temp')! } : {}),
+  ...(argNum('topk') !== undefined ? { topK: argNum('topk')! } : {}),
+};
+const model = { ...base, sampling };
+console.log(`model ${argModel}: ${base.repo}  sampling ${JSON.stringify(sampling)}`);
 
 /**
  * Conversation script. `expectAction` / `expectTrade` say what the control-JSON
@@ -127,6 +145,18 @@ try {
       await import('/src/game/npc/npc-trade.ts');
     const { screenPlayerInput, screenNpcReply } =
       await import('/src/game/npc/content-safety.ts');
+    const { breaksCharacter } = await import('/src/game/npc/persona-guard.ts');
+    const { isActionGrounded } = await import('/src/game/npc/action-gate.ts');
+    const { detectThreat } = await import('/src/game/npc/npc-memory.ts');
+    const { threatActionFor } = await import('/src/game/npc/npc-trade.ts');
+    /** What the game does with a reply (npc-chat-panel onReplyComplete):
+     *  the model's verb if the player's text grounds it, else the
+     *  deterministic threat floor. */
+    const gameAction = (modelVerb: string | null, playerSaid: string): string | null => {
+      if (modelVerb !== null && isActionGrounded(modelVerb as any, playerSaid)) return modelVerb;
+      const kind = detectThreat(playerSaid);
+      return kind !== null ? threatActionFor(persona.role, kind).action : null;
+    };
 
     // ---- load ------------------------------------------------------------
     log(`loading ${model.repo}/${model.file}…`);
@@ -141,7 +171,7 @@ try {
     const ctx: any = session.forkKV !== undefined ? session.forkKV() : session;
 
     // Exactly buildLiveChatFn's sampling + template options.
-    const SAMPLING = { temperature: 0.9, topP: 0.95, repetitionPenalty: 1.1, maxNewTokens: 320 };
+    const SAMPLING = model.sampling;
     const OPTS = { enableThinking: false, emptyThink: model.emptyThink };
 
     /**
@@ -230,12 +260,16 @@ try {
         ttftMs: r.ttftMs, totalMs: r.totalMs,
         inputBlocked: inV.blocked, outputBlocked: outV.blocked,
         outputDetail: outV.detail,
-        action: action?.kind ?? null, trade: trade !== null,
+        // The panel replaces an out-of-character reply (persona-guard.ts)
+        // with an in-world reaction, exactly like a blocked one.
+        outOfCharacter: breaksCharacter(r.text),
+        modelAction: action?.action ?? null,
+        action: gameAction(action?.action ?? null, t.say), trade: trade !== null,
         leakedThink: /<\/?think>/i.test(r.text),
         leakedJson: /[{}]/.test(shown),
         promptChars: messages.reduce((n: number, m: any) => n + m.content.length, 0),
       });
-      log(`turn "${t.say.slice(0, 34)}…" → ttft=${r.ttftMs}ms ${r.totalMs}ms stop=${r.stopReason} action=${action?.kind ?? '-'} trade=${trade !== null}`);
+      log(`turn "${t.say.slice(0, 34)}…" → ttft=${r.ttftMs}ms ${r.totalMs}ms stop=${r.stopReason} action=${action?.action ?? '-'} trade=${trade !== null}`);
     }
 
     // ---- 3. action-verb recall / false-positive rate ----------------------
@@ -244,14 +278,15 @@ try {
     for (const v of VERB_TRIALS) {
       const r = await gen(trim(buildNpcMessages(persona, [], v.say)));
       const a = extractNpcAction(r.text);
-      const got = a?.kind ?? null;
+      const model = a?.action ?? null;
+      const got = gameAction(model, v.say);
       const pass = v.want === null ? got === null : (got !== null && v.want.includes(got));
       verbs.push({
-        ...v, got, pass, ttftMs: r.ttftMs,
+        ...v, got, model, pass, ttftMs: r.ttftMs,
         shown: stripNpcJson(r.text).slice(0, 220),
         leakedJson: /[{}]/.test(stripNpcJson(r.text)),
       });
-      log(`verb "${v.say.slice(0, 30)}…" → ${got ?? 'none'} (want ${v.want === null ? 'none' : v.want.join('|')}) ${pass ? 'PASS' : 'FAIL'}`);
+      log(`verb "${v.say.slice(0, 30)}…" → ${got ?? 'none'} [model: ${model ?? 'none'}] (want ${v.want === null ? 'none' : v.want.join('|')}) ${pass ? 'PASS' : 'FAIL'}`);
     }
 
     // ---- 4. guardrail probes against the live model -----------------------
@@ -316,7 +351,7 @@ try {
 
   line('\n--- conversation ---');
   let fails = 0;
-  let thinkLeaks = 0; let jsonLeaks = 0; let falseActions = 0; let overBlocks = 0;
+  let thinkLeaks = 0; let jsonLeaks = 0; let falseActions = 0; let overBlocks = 0; let ooc = 0;
   for (const t of out.turns) {
     line(`\nPLAYER: ${t.say}`);
     line(`  [${t.note}]  ttft=${t.ttftMs}ms total=${t.totalMs}ms stop=${t.stopReason} prompt=${t.promptChars}ch`);
@@ -325,10 +360,14 @@ try {
     if (t.leakedThink) { flags.push('THINK-LEAK'); thinkLeaks++; }
     if (t.leakedJson) { flags.push('JSON-LEAK'); jsonLeaks++; }
     if (t.action !== null) flags.push(`action=${t.action}`);
+    if (t.modelAction !== null && t.modelAction !== t.action) flags.push(`(model said ${t.modelAction}; gated)`);
     if (t.trade) flags.push('trade=yes');
     if (t.outputBlocked) flags.push(`OUTPUT-BLOCKED(${t.outputDetail})`);
     if (t.civil === true && t.action !== null) { flags.push('!! FALSE-POSITIVE ACTION'); falseActions++; }
-    if (t.civil === true && t.outputBlocked) { flags.push('!! OVER-BLOCK'); overBlocks++; }
+    if (t.outOfCharacter) { flags.push('OUT-OF-CHARACTER (persona guard replaces it)'); ooc++; }
+    // A reply the persona guard replaces anyway (e.g. one reciting its own
+    // rules after a prompt injection) is not civil talk being over-blocked.
+    if (t.civil === true && t.outputBlocked && !t.outOfCharacter) { flags.push('!! OVER-BLOCK'); overBlocks++; }
     if (t.expectTrade === true && !t.trade) flags.push('missed trade JSON');
     if (Array.isArray(t.expectAction) && (t.action === null || !t.expectAction.includes(t.action))) {
       flags.push(`expected one of [${t.expectAction}], got ${t.action}`);
@@ -341,7 +380,7 @@ try {
   let verbMisses = 0; let verbFalsePos = 0;
   for (const v of out.verbs) {
     if (!v.pass) { if (v.want === null) verbFalsePos++; else verbMisses++; }
-    line(`${v.pass ? 'PASS' : 'FAIL'}  got=${v.got ?? 'none'}  want=${v.want === null ? 'none' : v.want.join('|')}  — ${v.note}`);
+    line(`${v.pass ? 'PASS' : 'FAIL'}  got=${v.got ?? 'none'} (model: ${v.model ?? 'none'})  want=${v.want === null ? 'none' : v.want.join('|')}  — ${v.note}`);
     line(`      "${v.say}"`);
     if (!v.pass) line(`      reply: ${v.shown.replace(/\n/g, ' ')}`);
   }
@@ -379,9 +418,10 @@ try {
   line(`control JSON visible to player: ${jsonLeaks}/${out.turns.length}`);
   line(`action verbs fired during civil talk (false positives): ${falseActions}`);
   line(`guardrail over-blocks on civil talk: ${overBlocks}`);
+  line(`out-of-character replies (replaced by persona guard): ${ooc}/${out.turns.length}`);
   line(`guardrail probe failures: ${fails}/${out.probes.length}`);
   const threatTrials = out.verbs.filter((v: any) => v.want !== null).length;
-  line(`action-verb recall on threats: ${threatTrials - verbMisses}/${threatTrials}`);
+  line(`action-verb recall on threats (as the game applies it: grounded model verb, else the threat floor): ${threatTrials - verbMisses}/${threatTrials}`);
   line(`action-verb FALSE POSITIVES on civil talk: ${verbFalsePos}`);
 
   // Hard failures are the things that BREAK the feature or the guardrail.

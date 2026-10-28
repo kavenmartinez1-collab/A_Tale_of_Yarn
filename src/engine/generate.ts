@@ -54,6 +54,9 @@ export interface SamplingConfig {
   dryRangeLastN?: number;
   /** Use TurboQuant compressed KV cache (saves ~80% KV memory). Default: false */
   useCompressedKV?: boolean;
+  /** Token ids that may never be sampled (e.g. `<think>` when thinking is
+   *  off). Default: none. */
+  suppressTokens?: number[];
 }
 
 // ── Generation Output ────────────────────────────────────────────────────
@@ -283,6 +286,9 @@ function sampleFromLogits(
   generatedIds: number[],
 ): number {
   const vocabSize = logits.length;
+  for (const id of config.suppressTokens) {
+    if (id >= 0 && id < vocabSize) logits[id] = -Infinity;
+  }
 
   // ── Logit-distribution probe ──────────────────────────────────────────
   // Gated on __DEBUG_LOGIT_TOPK__ (number): interval in decode steps.
@@ -579,6 +585,7 @@ export function generate(
     dryAllowedLength: sampling.dryAllowedLength ?? 2,
     dryRangeLastN: sampling.dryRangeLastN ?? 512,
     useCompressedKV: sampling.useCompressedKV ?? false,
+    suppressTokens: sampling.suppressTokens ?? [],
   };
 
   const result = (async (): Promise<GenerationResult> => {
@@ -626,7 +633,8 @@ export function generate(
     // Same greedy-neutral eligibility as gpuArgmax (verify IS a greedy argmax
     // per row). Drafts come from ngramDraft today; an MTP head can replace
     // the drafter without touching the verify loop. Default OFF.
-    const specEnabled = __argmaxSearch?.get('spec') === '1' && gpuArgmax !== null;
+    const specEnabled = __argmaxSearch?.get('spec') === '1' && gpuArgmax !== null
+      && config.suppressTokens.length === 0;
     if (__argmaxSearch?.get('spec') === '1' && !specEnabled) {
       console.warn('[Spec] ?spec=1 ignored — requires greedy-neutral sampling (gpuArgmax eligibility)');
     }
@@ -1145,8 +1153,13 @@ export function generate(
         const __tGpuDone = performance.now();
         let nextId: number;
         let __tReadback: number;
-        if (gpuArgmax) {
-          nextId = await gpuArgmax.run(output.logitsBuffer, engine.config.vocabSize);
+        // GPU argmax stays on with suppressed tokens: they are rarely the
+        // argmax, so only a step whose argmax IS suppressed pays for the
+        // full-logits readback below.
+        const gpuId = gpuArgmax
+          ? await gpuArgmax.run(output.logitsBuffer, engine.config.vocabSize) : -1;
+        if (gpuArgmax && !config.suppressTokens.includes(gpuId)) {
+          nextId = gpuId;
           __tReadback = performance.now();
         } else {
           const logitsRaw = await readBuffer(

@@ -6,7 +6,9 @@
  * extras. This module is the lean DENSE-ONLY subset (full-attention trunk,
  * k-quant matrices via matmul_gguf, CPU row-gather embed) packaged behind the
  * same InferenceSession interface, for consumers like the DungeonDirector
- * that load a plain Qwen3-style GGUF. Unsupported archs throw at load.
+ * that load a plain Qwen3-style GGUF, or LFM3 (its gated short-conv layers
+ * are a per-layer op with a small carried state, no MoE/PLE/DeltaNet
+ * machinery). Unsupported archs throw at load.
  */
 
 import { initWebGPU, type GPUContext } from './gpu-device';
@@ -116,10 +118,11 @@ async function buildGGUFSession(
       ropeFreqsT.data.buffer, ropeFreqsT.data.byteOffset, ropeFreqsT.data.byteLength / 4));
   }
 
-  // Dense-only guard: MoE / PLE / hybrid trunks need the chat app's full path.
+  // Guard: MoE / PLE / DeltaNet-hybrid trunks need the chat app's full path.
+  // LFM3's short-conv layers are handled here (see the layer loop).
   if (config.layers.some((d) => d.moe) || config.perLayerEmbed
       || config.layers.some((d) => d.kind === 'linear_attention')) {
-    throw new Error(`GGUF session: ${cfg.repo} needs MoE/PLE/hybrid support — dense models only`);
+    throw new Error(`GGUF session: ${cfg.repo} needs MoE/PLE/DeltaNet support — not in this session type`);
   }
 
   const loc = createGGUFLocator(model.file.tensors, ggufArchitecture(model.file));
@@ -174,19 +177,27 @@ async function buildGGUFSession(
       attnPostNorm: roleBuf('attnPostNorm', l),
       ffnPostNorm: roleBuf('ffnPostNorm', l),
     };
-    assignProj(lw, 'qProj', 'qProj', l);
-    if (config.layers[l].kvSourceLayer === undefined) {
-      assignProj(lw, 'kProj', 'kProj', l);
-      assignProj(lw, 'vProj', 'vProj', l);
-    }
-    assignProj(lw, 'oProj', 'oProj', l);
-    lw.qNorm = roleBuf('qNorm', l);
-    lw.kNorm = roleBuf('kNorm', l);
-    if (config.attentionBias) {
-      lw.qBias = roleBuf('qBias', l);
-      lw.kBias = roleBuf('kBias', l);
-      lw.vBias = roleBuf('vBias', l);
-      lw.oBias = roleBuf('oBias', l);
+    if (config.layers[l].kind === 'short_conv') {
+      // LFM3 gated short conv: in_proj -> B|C|X, depthwise conv, out_proj.
+      assignProj(lw, 'shortConvInProj', 'shortConvInProj', l);
+      assignProj(lw, 'shortConvOutProj', 'shortConvOutProj', l);
+      lw.shortConvWeight = requireBuf('shortConvWeight', l);
+    } else {
+      assignProj(lw, 'qProj', 'qProj', l);
+      if (config.layers[l].kvSourceLayer === undefined) {
+        assignProj(lw, 'kProj', 'kProj', l);
+        assignProj(lw, 'vProj', 'vProj', l);
+      }
+      assignProj(lw, 'oProj', 'oProj', l);
+      lw.qNorm = roleBuf('qNorm', l);
+      lw.kNorm = roleBuf('kNorm', l);
+      if (config.attnHeadGate) assignProj(lw, 'attnHeadGate', 'attnHeadGate', l);
+      if (config.attentionBias) {
+        lw.qBias = roleBuf('qBias', l);
+        lw.kBias = roleBuf('kBias', l);
+        lw.vBias = roleBuf('vBias', l);
+        lw.oBias = roleBuf('oBias', l);
+      }
     }
     assignProj(lw, 'gateProj', 'gateProj', l);
     assignProj(lw, 'upProj', 'upProj', l);
@@ -198,11 +209,27 @@ async function buildGGUFSession(
   const engine = createForwardPassEngine(gpu.device, config, { global, layers });
   const tokenizer = await createTokenizer({ modelId: cfg.repo });
   // Wrong-family tokenizer fallback silently produces garbage — hard-fail.
-  if (tokenizer.vocabSize && Math.abs(tokenizer.vocabSize - config.vocabSize) > 1024) {
+  // The embedding table may be padded past the real vocab (LFM3: 125033
+  // tokens, 128000 rows); a tokenizer LARGER than the table never is.
+  const vocabSlack = tokenizer.vocabSize - config.vocabSize;
+  if (tokenizer.vocabSize && (vocabSlack > 1024 || vocabSlack < -4096)) {
     throw new Error(
       `Tokenizer/model vocab mismatch: tokenizer has ${tokenizer.vocabSize} tokens `
       + `but model expects ${config.vocabSize}`);
   }
+
+  // With thinking off, a model that reasons anyway leaks it into an NPC's
+  // mouth: LFM3 opens <think> on hard prompts even after the empty
+  // <think></think> preamble, and sometimes writes a draft, then </think>,
+  // then the answer. Never sample either tag in that mode.
+  const thinkTags = ['<think>', '</think>']
+    .map((t) => tokenizer.encode(t))
+    .filter((ids) => ids.length === 1)
+    .map((ids) => ids[0]);
+  const noThink = (sampling: SamplingConfig | undefined, opts?: { enableThinking?: boolean }) =>
+    opts?.enableThinking === false && thinkTags.length > 0
+      ? { ...sampling, suppressTokens: [...(sampling?.suppressTokens ?? []), ...thinkTags] }
+      : sampling;
 
   const kvSession = createKVSession(
     Math.min(config.maxPositionEmbeddings || 8192, 8192, MAX_ATTN_SEQ_LEN));
@@ -254,7 +281,7 @@ async function buildGGUFSession(
     return {
       chat: (messages, sampling, onToken, opts) => chainGen(() => {
         const tokenIds = applyChatTemplate(tokenizer, messages, opts);
-        return generate(gpu.device, engine, tokenizer, tokenIds, sampling, onToken,
+        return generate(gpu.device, engine, tokenizer, tokenIds, noThink(sampling, opts), onToken,
           { kvSession: kv, prefillChunk: opts?.prefillChunk });
       }),
       resetKV: () => {
@@ -270,7 +297,7 @@ async function buildGGUFSession(
       chainGen(() => generate(gpu.device, engine, tokenizer, prompt, sampling, onToken)),
     chat: (messages, sampling, onToken, opts) => chainGen(() => {
       const tokenIds = applyChatTemplate(tokenizer, messages, opts);
-      return generate(gpu.device, engine, tokenizer, tokenIds, sampling, onToken,
+      return generate(gpu.device, engine, tokenizer, tokenIds, noThink(sampling, opts), onToken,
         { kvSession, prefillChunk: opts?.prefillChunk });
     }),
     forkKV,

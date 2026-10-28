@@ -25,7 +25,7 @@ import { chromium } from '@playwright/test';
 
 const BASE = 'http://127.0.0.1:5173';
 const headed = process.argv.includes('--headed');
-const EXPECT_REPO = 'unsloth/Qwen3-1.7B-GGUF';
+const EXPECT_REPO = 'LiquidAI/LFM3-1.7B-GGUF';
 
 const SAY = [
   'Well met. What do they call you?',

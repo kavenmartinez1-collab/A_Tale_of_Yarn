@@ -31,7 +31,13 @@ import {
 import { createSpecStore, type SpecStore } from './director-store';
 
 /**
- * The Director runs the SAME stock Qwen3-1.7B as the NPCs (NPC_MODELS.fast).
+ * The Director runs the SAME model as the NPCs (NPC_MODELS.fast): LiquidAI
+ * LFM3-1.7B since 2026-10-28 (stock Qwen3-1.7B before that). Measured with
+ * scripts/test-director-live.mts: 8/8 briefs produced a valid spec (7 on the
+ * first try), ~10 s per dungeon in the background. Licence: LFM Open License
+ * v1.0, see LICENSES/ and docs/AI_MODEL_LICENSING.md.
+ *
+ * History of the choice (Qwen3-1.7B):
  *
  * Was `local/flux2-te-qwen3-4b-q4_k_m` — an unlabelled 2.5 GB checkpoint whose
  * GGUF header carries 29 keys and not one licence or base-model field
@@ -56,8 +62,8 @@ import { createSpecStore, type SpecStore } from './director-store';
  * The flux2 checkpoint stays on disk — src/diffusion/flux2-image.ts still uses
  * it as an image text encoder, which is what it actually is.
  */
-export const DIRECTOR_MODEL_ID = 'unsloth/Qwen3-1.7B-GGUF';
-export const DIRECTOR_GGUF_FILE = 'Qwen3-1.7B-Q4_K_M.gguf';
+export const DIRECTOR_MODEL_ID = 'LiquidAI/LFM3-1.7B-GGUF';
+export const DIRECTOR_GGUF_FILE = 'LFM3-1.7B-Q4_K_M.gguf';
 
 /** Thrown when a generation is cut short because the Director was paused. */
 class PauseAbort extends Error {

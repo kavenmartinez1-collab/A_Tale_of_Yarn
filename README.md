@@ -26,7 +26,7 @@ Useful URL flags (append to `game.html`):
 | Flag | Effect |
 |---|---|
 | `?director=off` | Disable the LLM Director; dungeons/ecology fall back to deterministic fixtures |
-| `?npcllm=fast\|abliterated\|default` | NPC dialogue model. `fast` (default): abliterated Qwen3-1.7B — uncensored, snappy replies. `abliterated`: Qwen3-4B — smarter, slower. `default`: reuses the Director model (no extra download, stock safety training) |
+| `?npcllm=fast\|qwen\|large\|abliterated` | NPC dialogue model. `fast` (default, = `default`): LiquidAI LFM3-1.7B, the same model as the Director (one download). `qwen`: stock Qwen3-1.7B, the previous default. `large`: stock Qwen3-4B, smarter, slower. `abliterated`: comparison only |
 | `?wipe=1` | Blank slate: delete ALL saved data (saves, slots, NPC memories, caches) before boot |
 | `?tod=0.5` | Freeze the day/night cycle at a fixed time |
 | `?weather=clear\|overcast\|rain` | Pin the weather |

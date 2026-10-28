@@ -324,12 +324,22 @@ const MUSIC_DIR = 'music';
 // Recorded gameplay samples (the wingbeats) — same provenance and same
 // serving path as the soundtrack, vendored small enough to commit.
 const SFX_DIR = 'sfx';
+/**
+ * Vendored model dirs that are dev-only comparison paths (fetch-weights.mts
+ * OPTIONAL): a release build cannot select them (?npcllm is a debug param),
+ * so shipping them is dead weight — 1.1 GB for the previous Qwen3-1.7B alone.
+ */
+const DEV_ONLY_MODEL_DIRS = new Set([
+  'unsloth--Qwen3-1.7B-GGUF',
+  'unsloth--Qwen3-4B-Instruct-2507-GGUF',
+]);
 const shipModels = fs.existsSync(MODELS)
   ? fs.readdirSync(MODELS).filter((d) => {
     // Only the vendored HF-style repos — never the flux2/piper/whisper dirs,
     // which are the playground's and are not on the game path at all.
     const p = path.join(MODELS, d);
     if (!fs.statSync(p).isDirectory()) return false;
+    if (DEV_ONLY_MODEL_DIRS.has(d)) return false;
     return d.includes('--') || d === MUSIC_DIR || d === SFX_DIR;
   })
   : [];
@@ -364,6 +374,12 @@ if (shipModels.length === 0 && !SKIP_MODELS) {
  * too even though their own model was present.
  */
 const REQUIRED_MODELS = [
+  ['LiquidAI--LFM3-1.7B-GGUF', 'LFM3-1.7B-Q4_K_M.gguf',
+    'the NPC dialogue + Dungeon Director model'],
+  ['LiquidAI--LFM3-1.7B-GGUF', 'tokenizer.json',
+    'its tokenizer — without it the game would fetch one from huggingface.co'],
+  ['LiquidAI--LFM3-1.7B-GGUF', 'LICENSE',
+    'the LFM Open License v1.0, which must accompany the weights (§4a)'],
   ['rhasspy--piper-en-us-joe-medium', 'en_US-joe-medium.onnx',
     'male villager voices'],
   ['rhasspy--piper-en-us-joe-medium', 'lexicon-en-us.txt',

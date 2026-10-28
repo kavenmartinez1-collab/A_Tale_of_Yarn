@@ -45,6 +45,56 @@ reads as "you should" was the recommendation *before* the change.
 
 ---
 
+## 0. Update 2026-10-28 — the game now ships LFM3-1.7B
+
+The owner chose LiquidAI **LFM3-1.7B** (`LiquidAI/LFM3-1.7B-GGUF`, Q4_K_M) as the
+NPC + Director model, replacing Qwen3-1.7B. The two reasons §3 gave for
+ruling the LFM family out have both changed:
+
+1. **Architecture.** The engine now runs LFM3 natively: a gated short-conv
+   kernel and a per-head attention gate on top of the sliding-window / partial
+   RoPE paths Gemma 4 already used (`src/shaders/short_conv.wgsl`; parity with
+   llama.cpp b11945 in `scripts/test-lfm3-parity.mts`).
+   `gguf-session.ts` accepts short-conv layers. MoE, PLE and DeltaNet remain
+   refused there.
+2. **The §5 revenue cap.** The game is distributed **free of charge**: no
+   sale, no Steam, no money involved. That is not "Commercial Use" as §1
+   defines it ("direct or indirect commercial advantage or monetary
+   compensation"), so the US$10M threshold never comes into play. **If the
+   game is ever sold, monetised (ads, paid DLC, donations tied to the game)
+   or bundled with a paid product, re-read §5 first.** Below the threshold it
+   is still licensed; at or above it, either get a commercial licence from
+   Liquid AI or switch back. Switching back is a one-line change each in
+   `NPC_MODELS.fast` / `.default` (npc-chat-panel.ts) and
+   `DIRECTOR_MODEL_ID` / `DIRECTOR_GGUF_FILE` (director.ts); Qwen3-1.7B stays
+   available as `?npcllm=qwen`.
+
+Obligations, all met in the repo: the licence ships beside the weights
+(`models/LiquidAI--LFM3-1.7B-GGUF/LICENSE`, required by pack-steam.mjs) and in
+`LICENSES/LFM-Open-License-1.0.txt`; the weights are unmodified; Liquid AI's
+repo has no NOTICE file. Pins (commit + SHA-256) are in
+`scripts/fetch-weights.mts` and THIRD_PARTY_NOTICES.md §1.1.
+
+Measured on the same harnesses as the Qwen choice (RX 6700 XT):
+
+| | LFM3-1.7B (temp 0.3, top-k 50) | Qwen3-1.7B (recorded) |
+|---|---|---|
+| `test-npc-live.mts` | **PASS**: no `<think>`/JSON leaks, guardrail 8/8, 0 false-positive verbs | not re-run: its first NPC prefill hung this AMD driver (DXGI_ERROR_DEVICE_HUNG) under headless Chrome, with or without the LFM3 changes |
+| Threat verbs emitted by the model | 0/4 (the `threatActionFor` floor decides) | 0/4 (recorded in npc-trade.ts) |
+| Time to first token | ~175 ms per NPC turn | 2.2 s on the harness's short sanity prompt |
+| `test-director-live.mts` | 8/8 valid dungeon specs (7 first try), ~10 s each | not recorded |
+
+What it took: a lower sampling temperature for LFM3 (at Qwen's 0.9 it broke
+character and leaked control JSON); never sampling `<think>` when thinking is
+off (gguf-session.ts; LFM3 opens one on hard prompts even after the empty
+think block); and `src/game/npc/persona-guard.ts`, which replaces a reply
+that talks about being an AI/model/prompt with an in-world reaction. At
+temperature 0.3, LFM3 answered a direct prompt-injection by naming itself as
+Liquid AI's model.
+
+The rest of this document is the original analysis (written for a paid Steam
+release) and still stands for every other model.
+
 ## 1. Recommendation
 
 ### Ship this
@@ -197,7 +247,7 @@ listings. "Speed" is relative to the 1.7B baseline; see the note on measurement 
 | EXAONE 4.0 1.2B | `license: other` / `exaone` (verified) | **Reported non-commercial.** Reject | — | — | — | — |
 | Hunyuan 1.8B Instruct | **No licence declared on HF at all** (verified: `license: null`) | Reported to exclude the EU, UK and South Korea — fatal for a worldwide Steam release. Reject | — | — | — | — |
 | Aya / Command (Cohere) | `cc-by-nc-4.0` | Non-commercial. Reject | — | — | — | — |
-| LFM2 (Liquid AI) | **LFM Open License v1.0** — not Apache; a copy is in the repo root at `lfm25.txt` | **Revenue cap.** §5 conditions all commercial rights on not exceeding a "Threshold" defined in §1 as *"annual revenue of 10 million United States dollars ($10,000,000) or more"*; §5(b): commercial use above it *"is not licensed under this Agreement"*. A successful game can cross this — and the licence would lapse retroactively at the moment it did | — | very fast | Good for size | **Blocked** — hybrid conv/attention arch, dense-only guard |
+| LFM2 (Liquid AI) | **LFM Open License v1.0** — not Apache; a copy is in the repo root at `lfm25.txt` | **Revenue cap.** §5 conditions all commercial rights on not exceeding a "Threshold" defined in §1 as *"annual revenue of 10 million United States dollars ($10,000,000) or more"*; §5(b): commercial use above it *"is not licensed under this Agreement"*. A successful game can cross this — and the licence would lapse retroactively at the moment it did | — | very fast | Good for size | ~~Blocked — hybrid conv/attention arch~~ LFM3 now runs and ships (see §0; the game is free, so §5 does not bite) |
 
 **The conclusion the table drives:** the engine's dense-only, ChatML-only,
 `qwen3`/`llama`/`gemma4`-only support surface knocks out almost every alternative
@@ -593,8 +643,8 @@ obligations are real work.
 5. *(Resolved — no confirmation needed.)* The LFM Open License v1.0 threshold is
    **$10,000,000 annual revenue**, read directly from §1 and §5 of the copy at
    `lfm25.txt`. This is the kind of clause the brief asked to watch for: a
-   revenue cap a game could plausibly cross. LFM2 is ruled out on architecture
-   anyway, but do not reach for it later without re-reading that clause.
+   revenue cap a game could plausibly cross. (2026-10-28: LFM3 now ships
+   because the game is free — §0. Re-read that clause before ever charging.)
 6. **Real tokens/sec for these models in this engine.** The repo's measured
    figures are for a 27B IQ2_XXS on an RX 6700 XT (~11.5 tok/s) and are not
    transferable. The only in-repo numbers for the game models are relative

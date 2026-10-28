@@ -18,6 +18,7 @@ import {
   threatActionFor,
   memoryFactForAction,
   extractNpcAction,
+  stripNpcJson,
   type CatalogEntry,
   type TradeOffer,
 } from '../src/game/npc/npc-trade';
@@ -922,6 +923,27 @@ if (GOLDEN_NPC_HASH === null) {
 ${JSON.stringify({ action: a.action, reason: a.reason })}`);
       return round !== null && round.action === 'afraid';
     })());
+}
+
+// ---------------------------------------------------------------------------
+// Lenient control JSON (small models botch the format; measured on LFM3-1.7B)
+// ---------------------------------------------------------------------------
+{
+  const unquoted = 'So tell me, what do you want?\n{action: "invite_home"}';
+  check('lenient: unquoted-key action is recognised',
+    extractNpcAction(unquoted)?.action === 'invite_home');
+  check('lenient: unquoted-key action is stripped from the bubble',
+    stripNpcJson(unquoted) === 'So tell me, what do you want?');
+  check('lenient: single-quoted action is recognised',
+    extractNpcAction("Out! {'action': 'hostile', 'reason': 'he drew steel'}")?.action === 'hostile');
+  check('lenient: lone word in braces is stripped',
+    stripNpcJson("Come in, then.\n{'invite_home'}") === 'Come in, then.');
+  check('lenient: an unknown verb is still not an action',
+    extractNpcAction('{action: "dance"}') === null);
+  check('lenient: prose with braces and apostrophes is kept',
+    stripNpcJson("I don't know {the price} yet.") === "I don't know {the price} yet.");
+  check('lenient: strict JSON behaves as before',
+    extractNpcAction('{"action":"afraid","reason":"a blade"}')?.action === 'afraid');
 }
 
 // ---------------------------------------------------------------------------
