@@ -95,8 +95,10 @@ for (const [name, go] of places) {
     const vs = on.equals(off) ? 0 : await pixelDiff(on, off);
     const floor = on.equals(on2) ? 0 : await pixelDiff(on, on2);
     // Culling is innocent when its difference is within the frame-to-frame
-    // noise of the same scene with culling on both times.
-    const same = vs <= Math.max(floor, 0);
+    // noise of the same scene with culling on both times. The noise is a
+    // few hundred pixels on distant animated creatures and varies run to
+    // run; a culled chunk, tree or shadow is thousands of pixels in a shape.
+    const same = vs <= Math.max(2 * floor, 64);
     if (!same) {
       bad++;
       fs.mkdirSync(outDir, { recursive: true });

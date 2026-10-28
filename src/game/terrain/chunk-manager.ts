@@ -20,10 +20,30 @@ import { buildChunkIndices, buildChunkVertices, CHUNK_SIZE, INDEX_COUNT } from '
 import { buildGrassTuftMesh, GRASS_TUFT_VERTS } from '../grass-mesh';
 import { grassForChunk } from './grass-scatter';
 import { carveRoads, sharedRoadNetwork, type RoadNetwork } from '../world/roads';
+import { aabb } from '../render/frustum';
 
 const LOAD_RADIUS = 6;                    // 13x13 = 169 chunks, 832 m square
 const UNLOAD_RADIUS = LOAD_RADIUS + 1;    // hysteresis
-const GENS_PER_FRAME = 2;                 // mesh-generation budget
+/**
+ * Mesh-generation budget, in main-thread milliseconds per frame.
+ *
+ * This was a fixed two chunks per frame. A chunk is ~2.5 ms of noise plus its
+ * tree scatter, so two of them were 5-9 ms on top of whatever the frame
+ * already cost — fine while standing in an empty field, a 33 ms frame at the
+ * castle, where the frame starts at 12 ms. A time budget spends what the
+ * machine has: a fast one still streams two or three chunks a frame, a slow
+ * one streams one and keeps its frame. At least one chunk always loads, so a
+ * teleport cannot stall the fill.
+ */
+const GEN_BUDGET_MS = 3.0;
+/** Foliage instance scale range (tree-scatter.ts) — bounds must cover it. */
+const TREE_MAX_SCALE = 1.5;
+/**
+ * Foliage sway (frame.wgsl windOffset) peaks at sway * gust = 0.13 * 1.5 *
+ * 1.44 = 0.28 m; tree roots are sunk 0.15 m and the instance y is sampled
+ * between the chunk's vertices. 2 m covers all of it with room to spare.
+ */
+const FOLIAGE_PAD = 2.0;
 
 /**
  * Chebyshev radius of chunks that carry grass. 1 gives a 192 m square around
@@ -43,6 +63,7 @@ interface ChunkGrass {
   buffer: GPUBuffer;
   bindGroup: GPUBindGroup;
   count: number;
+  bounds: Float32Array;
 }
 
 interface LoadedChunk {
@@ -50,6 +71,9 @@ interface LoadedChunk {
   originBuffer: GPUBuffer;
   /** Per-kind instanced foliage for this chunk. */
   treeDraws: ChunkTreeDraws;
+  /** Lowest and highest vertex of the chunk mesh (roads carved in). */
+  minY: number;
+  maxY: number;
   /** Ground clutter — only populated while the chunk is near the player. */
   grass: ChunkGrass | null;
   /**
@@ -69,6 +93,9 @@ export class ChunkManager {
   /** Shared mesh vertex buffers per kind. */
   private readonly treeVertexBuffers: Record<TreeKind, GPUBuffer>;
   private readonly treeVertexCounts: Record<TreeKind, number>;
+  /** Largest horizontal reach and height of any tree mesh, at scale 1. */
+  private readonly treeReach: number;
+  private readonly treeHeight: number;
   private readonly grassVertexBuffer: GPUBuffer;
   private pending: Array<[cx: number, cz: number]> = [];
   private lastCx = Number.NaN;
@@ -135,6 +162,20 @@ export class ChunkManager {
       cactus: cactusVerts.length / (STRIDE_PROP / 4),
       jungle: jungleVerts.length / (STRIDE_PROP / 4),
     };
+    // Measured off the meshes rather than assumed, so a taller tree variant
+    // cannot silently poke out of its chunk's culling box. Reach is the
+    // RADIUS: foliageWorld yaws every instance by its own hash, so a canopy
+    // vertex at (x, z) can land anywhere on the circle of radius hypot(x, z).
+    let reach = 0;
+    let height = 0;
+    for (const data of [oakVerts, cactusVerts, jungleVerts]) {
+      for (let i = 0; i < data.length; i += STRIDE_PROP / 4) {
+        reach = Math.max(reach, Math.hypot(data[i], data[i + 2]));
+        height = Math.max(height, data[i + 1]);
+      }
+    }
+    this.treeReach = reach * TREE_MAX_SCALE + FOLIAGE_PAD;
+    this.treeHeight = height * TREE_MAX_SCALE + FOLIAGE_PAD;
 
     this.grassVertexBuffer = makeVB('grass-tuft-mesh', buildGrassTuftMesh());
   }
@@ -177,9 +218,13 @@ export class ChunkManager {
         Math.max(Math.abs(b[0] - pcx), Math.abs(b[1] - pcz)));
     }
 
-    for (let n = 0; n < GENS_PER_FRAME && this.pending.length > 0; n++) {
-      const [cx, cz] = this.pending.shift()!;
-      this.loadChunk(cx, cz);
+    // At least one chunk, then as many more as the budget allows.
+    if (this.pending.length > 0) {
+      const t0 = performance.now();
+      do {
+        const [cx, cz] = this.pending.shift()!;
+        this.loadChunk(cx, cz);
+      } while (this.pending.length > 0 && performance.now() - t0 < GEN_BUDGET_MS);
     }
 
     // Grass for whatever is in range and does not have it yet, nearest first
@@ -190,7 +235,7 @@ export class ChunkManager {
         if (built >= GRASS_GENS_PER_FRAME) return;
         const chunk = this.chunks.get(`${cx},${cz}`);
         if (chunk === undefined || chunk.grassTried) continue;
-        chunk.grass = this.buildGrass(cx, cz);
+        chunk.grass = this.buildGrass(cx, cz, chunk.minY, chunk.maxY);
         chunk.grassTried = true;
         built++;
       }
@@ -198,7 +243,7 @@ export class ChunkManager {
   }
 
   /** Instanced grass tufts for one chunk, or null where nothing grows. */
-  private buildGrass(cx: number, cz: number): ChunkGrass | null {
+  private buildGrass(cx: number, cz: number, minY: number, maxY: number): ChunkGrass | null {
     const { data, count } = grassForChunk(
       this.heightField.seed, cx, cz, this.groundField, this.biomeField,
       this.roadNetwork);
@@ -214,6 +259,11 @@ export class ChunkManager {
       buffer,
       bindGroup: this.renderer.createTreeInstanceBindGroup(buffer),
       count,
+      // Blades are under half a metre at their largest scale and sway less
+      // than that; the pad is the same one the trees use.
+      bounds: aabb(
+        cx * CHUNK_SIZE - FOLIAGE_PAD, minY - FOLIAGE_PAD, cz * CHUNK_SIZE - FOLIAGE_PAD,
+        (cx + 1) * CHUNK_SIZE + FOLIAGE_PAD, maxY + FOLIAGE_PAD, (cz + 1) * CHUNK_SIZE + FOLIAGE_PAD),
     };
   }
 
@@ -228,6 +278,15 @@ export class ChunkManager {
       (cx + 1) * CHUNK_SIZE + 2, (cz + 1) * CHUNK_SIZE + 2);
     const verts = buildChunkVertices(
       this.heightField, this.biomeField, cx, cz, this.roadNetwork);
+    // Vertical extent for the culling box: y is the second float of each
+    // 10-float vertex (chunk-mesh.ts VERTEX_STRIDE).
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (let i = 1; i < verts.length; i += 10) {
+      const y = verts[i];
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
     const vertexBuffer = device.createBuffer({
       label: `chunk(${cx},${cz})`,
       size: verts.byteLength,
@@ -238,15 +297,22 @@ export class ChunkManager {
       this.renderer.createObjectBindGroup(cx * CHUNK_SIZE, 0, cz * CHUNK_SIZE);
 
     // Per-chunk instanced foliage (deterministic scatter, may be empty).
-    const treeDraws = this.buildTreeDraws(cx, cz);
+    const treeDraws = this.buildTreeDraws(cx, cz, minY, maxY);
 
     this.chunks.set(`${cx},${cz}`, {
       draw: {
         vertexBuffer, indexBuffer: this.indexBuffer, count: INDEX_COUNT,
         bindGroup, shadowBindGroup,
+        // The mesh is exactly the chunk's footprint: vertex x/z run 0..64
+        // from the origin and nothing in the vertex shader moves them.
+        bounds: aabb(
+          cx * CHUNK_SIZE, minY, cz * CHUNK_SIZE,
+          (cx + 1) * CHUNK_SIZE, maxY, (cz + 1) * CHUNK_SIZE),
       },
       originBuffer: buffer,
       treeDraws,
+      minY,
+      maxY,
       grass: null,
       grassTried: false,
       cx,
@@ -255,8 +321,14 @@ export class ChunkManager {
   }
 
   /** Foliage instances for a chunk, split per kind, minus filtered (chopped) trees. */
-  private buildTreeDraws(cx: number, cz: number): ChunkTreeDraws {
+  private buildTreeDraws(cx: number, cz: number, minY: number, maxY: number): ChunkTreeDraws {
     const device = this.renderer.device;
+    // One box for every kind: the chunk footprint grown by the widest tree
+    // at its largest scale, from the lowest root to the tallest crown.
+    const bounds = aabb(
+      cx * CHUNK_SIZE - this.treeReach, minY - FOLIAGE_PAD, cz * CHUNK_SIZE - this.treeReach,
+      (cx + 1) * CHUNK_SIZE + this.treeReach, maxY + this.treeHeight,
+      (cz + 1) * CHUNK_SIZE + this.treeReach);
     // Grounded on the carved field so trunks sit on the road-graded surface
     // rather than hovering over or sinking into it, then anything standing in
     // the road is dropped — a tree through the paving reads as a bug even
@@ -297,6 +369,7 @@ export class ChunkManager {
         instanceBindGroup: this.renderer.createTreeInstanceBindGroup(buf),
         instanceCount: data.length / 4,
         shadowBindGroup: this.renderer.createTreeShadowBindGroup(buf),
+        bounds,
       });
     }
 
@@ -308,7 +381,7 @@ export class ChunkManager {
     const chunk = this.chunks.get(`${cx},${cz}`);
     if (chunk === undefined) return;
     for (const b of chunk.treeDraws.instanceBuffers) b.destroy();
-    chunk.treeDraws = this.buildTreeDraws(cx, cz);
+    chunk.treeDraws = this.buildTreeDraws(cx, cz, chunk.minY, chunk.maxY);
   }
 
   draws(): TerrainDraw[] {
@@ -334,6 +407,7 @@ export class ChunkManager {
         vertexCount: GRASS_TUFT_VERTS,
         instanceBindGroup: c.grass.bindGroup,
         instanceCount: c.grass.count,
+        bounds: c.grass.bounds,
       });
     }
     return out;

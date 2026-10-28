@@ -22,6 +22,10 @@
  *   dungeon     enter the nearest dungeon, then leave it
  *   equip       hotbar cycling through six held items, armor swaps, shield on
  *               and off, inventory panel open/close
+ *   idle        20 s standing still near a village — with `--llm` this is
+ *               where the Director starts dreaming (8 s idle gate) and the
+ *               NPC prompt warm-up runs, i.e. LLM prefill/decode sharing the
+ *               GPU with the renderer
  *
  * `--profile` wraps every scenario in a CDP CPU profile and prints the top
  * self-time functions, which is what turns a hitch count into a file:line.
@@ -46,7 +50,7 @@ const flag = (name) => args.includes(`--${name}`);
 
 const BASE = opt('base', 'http://127.0.0.1:5173');
 const OUT = opt('out', null);
-const SCENARIOS = opt('scenarios', 'boot,teleport,walk,settlement,dungeon,equip').split(',');
+const SCENARIOS = opt('scenarios', 'boot,teleport,walk,settlement,dungeon,equip,idle').split(',');
 const PROFILE = flag('profile');
 const LLM = flag('llm');
 const ROUNDS = Number(opt('rounds', '1'));
@@ -433,6 +437,20 @@ for (let round = 0; round < ROUNDS; round++) {
         await page.keyboard.press('Escape');
         await settle(700);
       }
+    });
+  }
+
+  // --- idle (LLM work shares the GPU) ----------------------------------------
+  if (SCENARIOS.includes('idle')) {
+    await D(() => window.__gameDebug.teleportToNearestSettlement('village'));
+    await settle(3000);
+    await scenario('idle:village-20s', async () => {
+      await settle(20000);
+      const st = await D(() => ({
+        director: window.__gameStats.directorStatus ?? null,
+        model: window.__gameDebug.npcModelLoad?.() ?? null,
+      }));
+      return st;
     });
   }
 

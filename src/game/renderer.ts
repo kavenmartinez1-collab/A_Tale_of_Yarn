@@ -33,6 +33,7 @@ import { MaterialAtlas } from './render/materials';
 import { packMaterialTable, MAX_MATERIALS, MATERIAL_ROW_FLOATS } from './render/material-table';
 import { ShadowMap, CASCADE_SPLITS } from './render/shadow-map';
 import { FireFX } from './render/fire-fx';
+import { extractPlanes, aabbInFrustum, type FrustumPlanes } from './render/frustum';
 import {
   PostFX, DEFAULT_POST, HDR_FORMAT, NORMAL_FORMAT, DEPTH_FORMAT,
   type PostSettings,
@@ -94,6 +95,12 @@ export interface TerrainDraw {
   bindGroup: GPUBindGroup;
   /** Shadow-pass bind group for the same object uniform. */
   shadowBindGroup?: GPUBindGroup;
+  /**
+   * World-space AABB [minX, minY, minZ, maxX, maxY, maxZ]. When present, every
+   * pass culls the draw against its own frustum (render/frustum.ts); absent,
+   * the draw is unconditional. Terrain chunks and their foliage carry one.
+   */
+  bounds?: Float32Array;
 }
 
 /** One dungeon-pipeline draw: mesh + object group 1 + torch lights group 2. */
@@ -110,6 +117,16 @@ export interface TreeDraw {
   instanceCount: number;
   /** Shadow-pass bind group over the same instance buffer. */
   shadowBindGroup?: GPUBindGroup;
+  /** As TerrainDraw.bounds — must already include wind sway and scale. */
+  bounds?: Float32Array;
+}
+
+/** Draws issued / skipped by the last renderFrame — the culling instrument. */
+export interface DrawStats {
+  terrain: number; terrainCulled: number;
+  trees: number; treesCulled: number;
+  shadowTerrain: number; shadowTerrainCulled: number;
+  shadowTrees: number; shadowTreesCulled: number;
 }
 
 /** Byte size of the group-2 lights uniform: vec4 count + 32 × 32 B lights. */
@@ -166,6 +183,16 @@ export class Renderer {
 
   /** Post-process tunables; the game mutates these per frame. */
   readonly postSettings: PostSettings = { ...DEFAULT_POST };
+
+  /** Culling counters for the last frame (see DrawStats). */
+  readonly drawStats: DrawStats = {
+    terrain: 0, terrainCulled: 0, trees: 0, treesCulled: 0,
+    shadowTerrain: 0, shadowTerrainCulled: 0, shadowTrees: 0, shadowTreesCulled: 0,
+  };
+  private readonly cameraPlanes: FrustumPlanes = new Float32Array(24);
+  /** Harness lever: false draws everything, as before culling existed. */
+  cullingEnabled = true;
+  private readonly cascadePlanes: FrustumPlanes = new Float32Array(24);
 
   private sceneCopy: GPUTexture | null = null;
   private sceneCopyView: GPUTextureView | null = null;
@@ -627,10 +654,19 @@ export class Renderer {
     this.writeFrameUniforms(frame, w, h);
 
     const encoder = this.device.createCommandEncoder({ label: 'game-frame' });
+    const st = this.drawStats;
+    const cull = this.cullingEnabled;
+    st.terrain = st.terrainCulled = st.trees = st.treesCulled = 0;
+    st.shadowTerrain = st.shadowTerrainCulled = st.shadowTrees = st.shadowTreesCulled = 0;
 
     // --- 1. shadow cascades ---------------------------------------------
     if (shadowStrength > 0) {
       for (let c = 0; c < 3; c++) {
+        // Each cascade is an orthographic box in light space; a chunk outside
+        // it cannot shadow anything the cascade covers, however close to the
+        // camera it is. The near cascade spans 22 m and was being handed the
+        // whole 832 m streaming square.
+        const planes = extractPlanes(this.shadows.cascades[c].viewProj, this.cascadePlanes);
         const pass = this.shadows.beginPass(encoder, c);
         // Terrain moved to 40 B when the per-vertex road weight landed. The
         // shadow pass reads only position (byte 0), but the STRIDE is how it
@@ -638,6 +674,11 @@ export class Renderer {
         pass.setPipeline(this.shadows.propPipeline40);
         for (const d of draws) {
           if (!d.shadowBindGroup) continue;
+          st.shadowTerrain++;
+          if (cull && d.bounds !== undefined && !aabbInFrustum(planes, d.bounds)) {
+            st.shadowTerrainCulled++;
+            continue;
+          }
           pass.setBindGroup(1, d.shadowBindGroup);
           pass.setVertexBuffer(0, d.vertexBuffer);
           if (d.indexBuffer) {
@@ -673,6 +714,11 @@ export class Renderer {
         pass.setPipeline(this.shadows.foliagePipeline);
         for (const t of treeDraws) {
           if (!t.shadowBindGroup) continue;
+          st.shadowTrees++;
+          if (cull && t.bounds !== undefined && !aabbInFrustum(planes, t.bounds)) {
+            st.shadowTreesCulled++;
+            continue;
+          }
           pass.setBindGroup(1, t.shadowBindGroup);
           pass.setVertexBuffer(0, t.vertexBuffer);
           pass.draw(t.vertexCount, t.instanceCount);
@@ -680,6 +726,10 @@ export class Renderer {
         pass.end();
       }
     }
+
+    // Camera frustum for the opaque pass. Only draws that carry bounds are
+    // tested; everything else is drawn exactly as before.
+    const camPlanes = extractPlanes(frame.viewProj, this.cameraPlanes);
 
     // --- 2. opaque pass ---------------------------------------------------
     const pass = encoder.beginRenderPass({
@@ -707,6 +757,11 @@ export class Renderer {
 
     pass.setPipeline(this.terrainPipeline);
     for (const draw of draws) {
+      st.terrain++;
+      if (cull && draw.bounds !== undefined && !aabbInFrustum(camPlanes, draw.bounds)) {
+        st.terrainCulled++;
+        continue;
+      }
       pass.setBindGroup(1, draw.bindGroup);
       pass.setVertexBuffer(0, draw.vertexBuffer);
       if (draw.indexBuffer) {
@@ -729,6 +784,11 @@ export class Renderer {
     if (treeDraws.length > 0) {
       pass.setPipeline(this.treePipeline);
       for (const t of treeDraws) {
+        st.trees++;
+        if (cull && t.bounds !== undefined && !aabbInFrustum(camPlanes, t.bounds)) {
+          st.treesCulled++;
+          continue;
+        }
         pass.setBindGroup(1, t.instanceBindGroup);
         pass.setVertexBuffer(0, t.vertexBuffer);
         pass.draw(t.vertexCount, t.instanceCount);
@@ -740,6 +800,7 @@ export class Renderer {
     if (grassDraws.length > 0) {
       pass.setPipeline(this.grassPipeline);
       for (const g of grassDraws) {
+        if (cull && g.bounds !== undefined && !aabbInFrustum(camPlanes, g.bounds)) continue;
         pass.setBindGroup(1, g.instanceBindGroup);
         pass.setVertexBuffer(0, g.vertexBuffer);
         pass.draw(g.vertexCount, g.instanceCount);

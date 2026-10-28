@@ -199,6 +199,11 @@ export class EntityRenderer {
       (window as unknown as { __entityRenderer?: EntityRenderer })
         .__entityRenderer = this;
     }
+    // The whole pool up front. It used to grow on first sight, which put up
+    // to twenty 200 KB vertex-buffer allocations into the single frame a
+    // castle garrison came into range — measured as a 104 ms frame at the
+    // castle gate. Six MB of VRAM at boot, never freed, never reallocated.
+    while (this.pool.length < MAX_DRAWN) this.pool.push(this._allocEntry());
   }
 
   /** Current number of live animators. Diagnostics only. */
