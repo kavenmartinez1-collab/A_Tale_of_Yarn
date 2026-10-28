@@ -19,7 +19,7 @@ import { UiFocus } from './input/ui-focus';
 import {
   Renderer, LIGHTS_BUFFER_SIZE, DEFAULT_POST, STRIDE_CREATURE, STRIDE_PROP,
   MAX_WORLD_LIGHTS,
-  type FrameUniforms, type TerrainDraw, type DungeonDraw,
+  type FrameUniforms, type TerrainDraw, type DungeonDraw, type DrawStats,
 } from './renderer';
 import { MATERIALS } from './render/materials';
 import { layoutDungeon, mix32 } from './dungeon/dungeon-layout';
@@ -276,6 +276,8 @@ declare global {
       jailRemainS?: number;
       /** Ground-clutter instances currently submitted (graphics debugging). */
       grassInstances?: number;
+      /** Draws issued and frustum-culled by the last frame (render/frustum.ts). */
+      drawStats?: DrawStats;
       /** Point lights submitted to the world-light set (graphics debugging). */
       worldLightCount?: number;
     };
@@ -521,6 +523,10 @@ declare global {
       };
       /** false reproduces the pre-LOD path: every drawn NPC, every frame. */
       setNpcLod(on: boolean): void;
+      /** Frustum culling of terrain/foliage draws (render/frustum.ts). */
+      setCulling(on: boolean): void;
+      /** Draws issued / culled by the LAST frame, live (not the 500 ms stats). */
+      drawStats(): import('./renderer').DrawStats;
       /** Free every projectile slot, flying or planted. */
       clearProjectiles(): void;
       /** Count of projectiles currently in flight. */
@@ -2903,6 +2909,9 @@ async function boot() {
     count: number;
   }
   const npcPool: NpcPoolEntry[] = [];
+  // Filled at boot (below, once `getNpcPoolEntry` exists) for the same reason
+  // the creature pool is: a village coming into range used to allocate its
+  // twelve 324 KB vertex buffers in one frame.
   /** Debug: force shadows on/off (null = follow weather). */
   let shadowOverride: boolean | null = null;
   /**
@@ -2973,6 +2982,7 @@ async function boot() {
     }
     return npcPool[i];
   }
+  getNpcPoolEntry(NPC_MAX_DRAWN - 1);
 
   // --- NPC animation LOD -----------------------------------------------------
   //
@@ -6890,6 +6900,7 @@ async function boot() {
       return inFlightCount(projectilePool);
     },
     npcDrawCost: () => ({ ...npcDrawCost }),
+    drawStats: () => ({ ...renderer.drawStats }),
     /**
      * Empty the projectile pool.
      *
@@ -6904,6 +6915,7 @@ async function boot() {
       for (const p of projectilePool.slots) releaseProjectile(p);
     },
     setNpcLod: (on: boolean) => { npcLodEnabled = on; },
+    setCulling: (on: boolean) => { renderer.cullingEnabled = on; },
     projectileCount: () => inFlightCount(projectilePool),
     stuckProjectileCount: () => activeCount(projectilePool) - inFlightCount(projectilePool),
     /**
@@ -11591,6 +11603,7 @@ async function boot() {
         mapChunks: discovery.chunkCount,
         chunkCount: chunkManager.count,
         grassInstances: grassDraws.reduce((n, g) => n + g.instanceCount, 0),
+        drawStats: { ...renderer.drawStats },
         worldLightCount,
         playerPos: [p[0], p[1], p[2]],
         grounded: controller.grounded,

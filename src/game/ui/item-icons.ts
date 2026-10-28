@@ -1117,7 +1117,14 @@ export function itemIcon(id: GameItemId): string {
   const canvas = document.createElement('canvas');
   canvas.width = SIZE;
   canvas.height = SIZE;
-  const ctx = canvas.getContext('2d');
+  // A SOFTWARE canvas, on purpose. The default 2D context is GPU-backed, and
+  // `toDataURL` on a GPU canvas is a synchronous read-back through the GPU
+  // process — which at boot is busy compiling the game's render pipelines, so
+  // the hotbar's first icons sat behind that queue: measured 1.6 s of a 2.1 s
+  // boot inside this function, and ~4 ms per icon in steady play against
+  // 0.09 ms on a software canvas. A 48 px pictogram gains nothing from the
+  // GPU; the pixels are the same either way.
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (ctx === null) return '';
   draw(ctx, id);
   const url = canvas.toDataURL();

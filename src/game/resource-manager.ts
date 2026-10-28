@@ -23,6 +23,26 @@ import { buildResourceMeshes } from './resource-mesh';
 import type { NodeRegistry } from './resource-nodes';
 
 const RES_CHUNK_RADIUS = 3; // meshed rocks/bushes: 7×7 chunks (~450 m)
+/**
+ * Resource-mesh builds per frame. A teleport or a long sprint used to build
+ * every chunk in the 7x7 square whose meshes were missing in ONE frame —
+ * measured 45-50 ms of boulders and bushes in the frame after a teleport,
+ * the single largest arrival hitch left once terrain streaming was budgeted.
+ * Nearest first, so the ground the player can reach is meshed before the
+ * horizon, and a harvested node's rebuild waits at most a few frames.
+ */
+const RES_BUILDS_PER_FRAME = 2;
+/** The 7x7 window as offsets, nearest ring first. */
+const RES_OFFSETS: ReadonlyArray<readonly [number, number]> = (() => {
+  const o: [number, number][] = [];
+  for (let dz = -RES_CHUNK_RADIUS; dz <= RES_CHUNK_RADIUS; dz++) {
+    for (let dx = -RES_CHUNK_RADIUS; dx <= RES_CHUNK_RADIUS; dx++) o.push([dx, dz]);
+  }
+  o.sort((a, b) =>
+    (Math.max(Math.abs(a[0]), Math.abs(a[1])) - Math.max(Math.abs(b[0]), Math.abs(b[1])))
+    || (Math.hypot(a[0], a[1]) - Math.hypot(b[0], b[1])));
+  return o;
+})();
 
 export type NodeType = 'rock' | 'bush' | 'tree'
   | 'flax' | 'mushroom' | 'cooling_herb' | 'warming_herb'
@@ -117,13 +137,12 @@ export class ResourceManager {
       }
     }
 
-    for (let dz = -RES_CHUNK_RADIUS; dz <= RES_CHUNK_RADIUS; dz++) {
-      for (let dx = -RES_CHUNK_RADIUS; dx <= RES_CHUNK_RADIUS; dx++) {
-        const cx = pcx + dx;
-        const cz = pcz + dz;
-        this.ensureChunk(cx, cz, now);
-        this.checkTrees(cx, cz, now);
-      }
+    let builds = RES_BUILDS_PER_FRAME;
+    for (const [dx, dz] of RES_OFFSETS) {
+      const cx = pcx + dx;
+      const cz = pcz + dz;
+      if (this.ensureChunk(cx, cz, now, builds > 0)) builds--;
+      this.checkTrees(cx, cz, now);
     }
   }
 
@@ -137,11 +156,17 @@ export class ResourceManager {
     return sig;
   }
 
-  private ensureChunk(cx: number, cz: number, now: number): void {
+  /**
+   * (Re)build a chunk's resource meshes if its harvest signature changed.
+   * Returns true when a build happened; `mayBuild` false defers it to a later
+   * frame (the stale mesh, or none, stays up meanwhile).
+   */
+  private ensureChunk(cx: number, cz: number, now: number, mayBuild: boolean): boolean {
     const key = `${cx},${cz}`;
     const sig = this.resSig(cx, cz, now);
     const existing = this.active.get(key);
-    if (existing !== undefined && existing.sig === sig) return;
+    if (existing !== undefined && existing.sig === sig) return false;
+    if (!mayBuild) return false;
     if (existing !== undefined) for (const b of existing.buffers) b.destroy();
 
     const visible = this.resources(cx, cz).filter((_, i) =>
@@ -166,6 +191,7 @@ export class ResourceManager {
         };
       });
     this.active.set(key, { draws, buffers, sig });
+    return true;
   }
 
   /** Refresh a chunk's tree instances when chops/respawns change them. */
