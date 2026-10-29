@@ -3728,21 +3728,30 @@ async function boot() {
   }
 
   /**
-   * Indoors, does the nearest NPC beat the building's own prompt for the E key?
+   * Does the nearest NPC beat the building's own prompt for the E key?
    *
    * The tavern bar has a chest beside it, so standing at the counter offered
    * "Press E to open the chest" while the keeper you came to talk to was 8 cm
    * away and unreachable — the building branch is tested first and, until now,
    * unconditionally. Whoever is nearer wins.
+   *
+   * Outdoors the same thing happened with doors, worse: "Press E to enter"
+   * fires anywhere within reach of a building's WALL, so a villager standing
+   * beside any house could not be talked to at all — E walked you into the
+   * house. Outdoors someone within arm's reach always wins (you walked up to a
+   * person, not a wall); past that, the nearer of the two.
    */
   function npcBeatsBuilding(): boolean {
-    if (!buildingManager.isInside) return false;
+    if (buildingManager.interactPrompt === null) return false;
     const rt = nearestNpc();
     if (rt === null) return false;
     const d = Math.hypot(
       rt.wx - controller.pos[0], rt.wz - controller.pos[2]);
-    return d < buildingManager.interactDist;
+    if (buildingManager.isInside) return d < buildingManager.interactDist;
+    return d < NPC_ARM_REACH || d < buildingManager.interactDist;
   }
+  /** Outdoors, an NPC this close wins E over a building's door (npcBeatsBuilding). */
+  const NPC_ARM_REACH = 1.8;
 
   /** Nearest NPC within NPC_INTERACT_DIST from the player, or null. */
   function nearestNpc(): NpcRuntime | null {
@@ -8108,7 +8117,13 @@ async function boot() {
         // castle is the only place it exists, and below dungeons because the
         // two are never both in range.
         castleManager.tryInteract();
-      } else if (buildingManager.interactPrompt !== null && !npcBeatsBuilding()) {
+      } else if (buildingManager.interactPrompt !== null && npcBeatsBuilding()) {
+        // The person beats the building (see npcBeatsBuilding). Handled HERE,
+        // in the building's slot, so E does exactly what the HUD label says:
+        // the label chain puts this NPC in the same slot.
+        e.preventDefault();
+        openNpcChatFor(nearestNpc()!);
+      } else if (buildingManager.interactPrompt !== null) {
         buildingManager.tryInteract();
       } else if (!dungeonManager.isInside && !buildingManager.isInside && settlementManager.interactPrompt !== null) {
         settlementManager.tryInteract();
@@ -11581,8 +11596,8 @@ async function boot() {
         ? (nearestWellPad() !== null ? 'E — drink from the well'
           : nearFreshWater() ? 'E — drink' : null)
         : null;
-      // The indoor NPC has to win the LABEL as well as the key, or the HUD
-      // offers the chest while E talks to the keeper.
+      // The NPC has to win the LABEL as well as the key, or the HUD offers the
+      // chest (indoors) or the door (outdoors) while E talks to the person.
       const indoorNpc = npcBeatsBuilding() ? nearestNpc() : null;
       // Display order must match the KeyE chain above, or the HUD offers one
       // thing and the key does another.

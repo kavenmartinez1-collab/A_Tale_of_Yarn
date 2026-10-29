@@ -524,8 +524,9 @@ export class BuildingManager {
 
   /**
    * How far away the current prompt's target is, or Infinity when there is
-   * none. Only meaningful indoors; door prompts leave it Infinity because
-   * outdoors the NPC branch is ordered after them anyway.
+   * none. Outdoors it is the distance to the building's wall: the door prompt
+   * fires anywhere along the perimeter, so an NPC by the house has to be able
+   * to beat it (main.ts npcBeatsBuilding).
    */
   get interactDist(): number {
     return this.promptD;
@@ -643,7 +644,7 @@ export class BuildingManager {
   private findDoorInteraction(
     pos: Vec3,
     nearbySettlements: ResolvedSettlement[],
-  ): { label: string; act: () => void } | null {
+  ): { label: string; act: () => void; dist: number } | null {
     let best: { label: string; act: () => void } | null = null;
     let bestD = INTERACT_DIST;
 
@@ -665,7 +666,7 @@ export class BuildingManager {
         }
       }
     }
-    return best;
+    return best === null ? null : { ...best, dist: bestD };
   }
 
   private resolveKind(entry: BuildingKind | 'varied', buildingSeed: number): BuildingKind {

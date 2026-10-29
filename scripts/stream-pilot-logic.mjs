@@ -14,6 +14,10 @@
  *   {type:"talk", name?}                             walk to an NPC and open the chat; stays
  *                                                    open for {do:"talk",text} lines via /act
  *   {type:"leave"}                                   get out of the building you are in
+ *   {type:"shop", item, count}                       buy from the nearest trader who stocks it
+ *                                                    (walks to a town if nobody near does)
+ *   {type:"adventure"}                               run on its own: next unvisited dungeon or
+ *                                                    town, clear it / chat / restock, repeat
  *   {type:"dungeon", name?}                          walk into the nearest (or named) dungeon,
  *                                                    then hunt inside it
  */
@@ -104,7 +108,7 @@ export async function state(ctx) {
 
 // ── goals ─────────────────────────────────────────────────────────────
 export async function setGoal(ctx, g) {
-  const types = ['idle', 'travel', 'explore', 'hunt', 'talk', 'leave', 'dungeon'];
+  const types = ['idle', 'travel', 'explore', 'hunt', 'talk', 'leave', 'dungeon', 'shop', 'adventure'];
   if (!types.includes(g.type)) throw new Error(`goal type must be one of ${types.join(', ')}`);
   if (g.type === 'travel' && !(Number.isFinite(g.x) && Number.isFinite(g.z))) throw new Error('travel needs x and z');
   const s = await snap(ctx);
@@ -112,6 +116,9 @@ export async function setGoal(ctx, g) {
   await release(ctx);
   ctx.goal = { ...g, since: now() };
   ctx.mem.nav = {};
+  // `adventure` is a loop over the other goals; any goal set from outside ends it.
+  if (g.type === 'adventure') { ctx.mem.adventure = { on: true, visited: ctx.mem.adventure?.visited ?? [], shopAt: {} }; ctx.goal = { type: 'idle', since: now() }; }
+  else if (ctx.mem.adventure) ctx.mem.adventure.on = false;
   ctx.event('goal', `${g.type}${g.label ? ' ' + g.label : g.name ? ' ' + g.name : g.species ? ' ' + g.species : ''}`);
 }
 
@@ -191,7 +198,7 @@ function astar(g, sx, sz, tx, tz) {
   const s0 = key(sx, sz), goal = key(tx, tz);
   gs[s0] = 0; push(0, s0);
   let expanded = 0;
-  while (heap.length && expanded < 40000) {
+  while (heap.length && expanded < (g.maxExpand ?? 40000)) {
     const [, k] = pop();
     if (done[k]) continue; done[k] = 1; expanded++;
     if (k === goal) break;
@@ -202,7 +209,7 @@ function astar(g, sx, sz, tx, tz) {
       if (!open(g, nx, nz)) continue;
       if (dx && dz && (!open(g, x + dx, z) || !open(g, x, z + dz))) continue;   // no corner cutting
       const nk = key(nx, nz);
-      const ng = gs[k] + (dx && dz ? 1.414 : 1) + wallCost(nx, nz);
+      const ng = gs[k] + (dx && dz ? 1.414 : 1) + wallCost(nx, nz) + (g.cost ? g.cost[nk] : 0);
       if (ng < gs[nk]) { gs[nk] = ng; from[nk] = k; push(ng + Math.hypot(tx - nx, tz - nz), nk); }
     }
   }
@@ -293,8 +300,63 @@ async function localGrid(ctx, s, x, z, pad = 24) {
   }, [ox, oz, w, h]);
 }
 
+// ── long-range route ──────────────────────────────────────────────────
+// Lakes and coastlines are bigger than any local window. For trips over 80 m,
+// sample land/water on an 8 m grid across the whole trip (+250 m around it),
+// A* it once, then walk the route point to point.
+async function longRoute(ctx, s, x, z) {
+  const C = 8, pad = 250;
+  const ox = Math.min(s.p[0], x) - pad, oz = Math.min(s.p[2], z) - pad;
+  const w = Math.min(420, Math.ceil((Math.abs(x - s.p[0]) + 2 * pad) / C));
+  const h = Math.min(420, Math.ceil((Math.abs(z - s.p[2]) + 2 * pad) / C));
+  // Land/water, plus slope: cliffs (> ~40° over a cell) are walls, steep
+  // ground costs extra — running down it is where the "Hard landing" HP goes.
+  const { cells, cost } = await ctx.G(([ox, oz, w, h, C]) => {
+    const hAt = window.__gameDebug.heightAt, y = new Float32Array(w * h), cells = new Array(w * h), cost = new Array(w * h).fill(0);
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) y[j * w + i] = hAt(ox + (i + 0.5) * C, oz + (j + 0.5) * C);
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+      const k = j * w + i; let d = 0;
+      if (i > 0) d = Math.max(d, Math.abs(y[k] - y[k - 1])); if (i < w - 1) d = Math.max(d, Math.abs(y[k] - y[k + 1]));
+      if (j > 0) d = Math.max(d, Math.abs(y[k] - y[k - w])); if (j < h - 1) d = Math.max(d, Math.abs(y[k] - y[k + w]));
+      cells[k] = y[k] >= 0.6 && d < C * 0.85 ? 1 : 0;
+      cost[k] = d > C * 0.45 ? 4 : d > C * 0.3 ? 1.5 : 0;
+    }
+    return { cells, cost };
+  }, [ox, oz, w, h, C]);
+  const g = { w, h, cells, cost, maxExpand: w * h };
+  const cx = (wx) => Math.max(0, Math.min(w - 1, Math.floor((wx - ox) / C)));
+  const cz = (wz) => Math.max(0, Math.min(h - 1, Math.floor((wz - oz) / C)));
+  const start = [cx(s.p[0]), cz(s.p[2])];
+  if (!g.cells[start[1] * w + start[0]]) {   // standing in the shallows: start from the nearest land cell
+    let best = null;
+    for (let r = 1; r < 6 && !best; r++) for (let dz = -r; dz <= r; dz++) for (let dx = -r; dx <= r; dx++) {
+      const i = start[0] + dx, j = start[1] + dz;
+      if (!best && i >= 0 && j >= 0 && i < w && j < h && g.cells[j * w + i]) best = [i, j];
+    }
+    if (best) start.splice(0, 2, ...best);
+  }
+  const path = astar(g, start[0], start[1], cx(x), cz(z));
+  if (!path) return null;
+  return path.map(([i, j]) => [ox + i * C, oz + j * C]).filter((_, k, a) => k % 2 === 1 || k === a.length - 1);
+}
+
 async function travelTo(ctx, s, x, z, opts) {
   const nav = ctx.mem.nav;
+  const far = Math.hypot(x - s.p[0], z - s.p[2]);
+  if (s.p[1] > -200 && !s.inside && !opts?.swim && (far > 80 || nav.route)) {
+    const key = `${Math.round(x / 20)},${Math.round(z / 20)}`;
+    if (nav.routeKey !== key || (nav.route && nav.routeFail)) {
+      nav.routeKey = key; nav.routeFail = false;
+      nav.route = await longRoute(ctx, s, x, z);
+      if (nav.route) ctx.event('route', `planned a ${Math.round(nav.route.length * 16)} m route around the water`);
+    }
+    if (nav.route) {
+      while (nav.route.length > 1 && Math.hypot(nav.route[0][0] - s.p[0], nav.route[0][1] - s.p[2]) < 12) nav.route.shift();
+      if (far < 30 || nav.route.length <= 1) nav.route = null;   // last stretch: local steering
+      else if (nav.stuckTotal >= 2 && (nav.stuckTotal ?? 0) < 4) { /* local planner below handles walls */ }
+      else return steer(ctx, s, nav.route[0][0], nav.route[0][1], opts);
+    }
+  }
   if (!(s.p[1] < -200) && (nav.stuckTotal ?? 0) >= 2) {
     if (!nav.local || now() - nav.local.at > 20000) {
       // Widen until A* finds a way (the gate may be round the far side).
@@ -437,6 +499,19 @@ export async function tick(ctx) {
   }
 
   // Self-defense: something just hit us and is close -> fight it, whatever the goal.
+  // Retreat: low on HP with nothing left to heal with -> run, don't trade blows
+  // to the death. Back in when the heal comes back or the threat is gone.
+  const hostile = s.ents.filter((e) => !PASSIVE.has(e.species) && e.dist < 14);
+  if (hostile.length && s.hp < 7 && !(await hasHeal(ctx)) && !(m.fleeUntil > t)) {
+    m.fleeUntil = t + 7000;
+    ctx.event('retreat', `retreating at ${Math.round(s.hp)} hp, no potions left`);
+  }
+  if (m.fleeUntil > t && hostile.length) {
+    m.fightAt = 0;
+    const fp = await fleePoint(ctx, s, hostile);
+    return travelTo(ctx, s, fp[0], fp[1], { sprint: true });
+  }
+
   // Focus fire: in a crowd, finish the weakest enemy in sword reach first —
   // switching to whoever hit last spreads the damage and kills nothing.
   if (m.hurtAt && t - m.hurtAt < 4000 && m.attacker && ctx.goal.type !== 'talk') {
@@ -448,7 +523,7 @@ export async function tick(ctx) {
 
   // An NPC opened a conversation on us (a gate guard's challenge): stop moving —
   // held keys would type into the chat box — and hand it to the AI.
-  if (s.chatOpen && ctx.goal.type !== 'talk') {
+  if (s.chatOpen && ctx.goal.type !== 'talk' && ctx.goal.type !== 'shop') {
     await release(ctx);
     if (!last?.chatOpen) ctx.event('chat', `an NPC started talking to me: ${s.reply ?? ''}`);
     return;
@@ -462,6 +537,19 @@ export async function tick(ctx) {
   if (!fighting && s.slot !== wantSlot && (s.slot === 1 || s.slot === 4 || s.slot === 5) && (!m.slotAt || t - m.slotAt > 800)) {
     m.slotAt = t;
     await ctx.page.keyboard.press(`Digit${wantSlot}`);
+  }
+
+  // An adventure step that drags on (an NPC wandered off, a route that never
+  // arrives) is dropped so the loop keeps moving.
+  if (m.adventure?.on && ctx.goal.auto && t - ctx.goal.since > (ctx.goal.type === 'talk' ? 90000 : 600000)) {
+    ctx.event('gave-up', `gave up on ${ctx.goal.type} after too long`);
+    if (s.chatOpen) await ctx.page.keyboard.press('Escape');
+    ctx.goal = { type: 'idle', since: t };
+  }
+  if (ctx.goal.type === 'idle' && m.adventure?.on && (!m.advAt || t - m.advAt > 3000)) {
+    m.advAt = t;
+    const next = await nextAdventure(ctx, s);
+    if (next) { ctx.goal = { ...next, since: t, auto: true }; m.nav = {}; ctx.event('goal', `adventure: ${next.why}`); }
   }
 
   const g = ctx.goal;
@@ -496,6 +584,47 @@ export async function tick(ctx) {
       if (last && last.p[1] < -200 && s.p[1] > -200) { ctx.event('outside', 'back up in the open air'); ctx.goal = { type: 'idle', since: t }; return; }
       return leave(ctx, s, () => { ctx.goal = { type: 'idle', since: t }; });
     }
+    case 'shop': {
+      g.tried ??= [];
+      g.got ??= 0;
+      const want = Math.max(1, (g.count ?? 20) - g.got);
+      if (s.chatOpen) {
+        await release(ctx);
+        if (!g.chatAt) { g.chatAt = t; return; }
+        if (t - g.chatAt < 1500) return;   // let the trade column render
+        const got = await buyFromOpenChat(ctx, g.item, want);
+        g.got += got;
+        g.tried.push(g.lock);
+        ctx.event(got ? 'bought' : 'no-stock', got ? `bought ${got} ${g.item} from ${g.lock?.split('|')[0]}` : `${g.lock?.split('|')[0]} has no ${g.item}`);
+        await ctx.page.keyboard.press('Escape');
+        g.lock = null; g.chatAt = null;
+        if (g.got >= (g.count ?? 20)) { ctx.goal = { type: 'idle', since: t }; ctx.event('shopped', `done shopping: ${g.got} ${g.item}`); }
+        return;
+      }
+      if (s.inside) return leave(ctx, s);
+      const rank = { merchant: 0, guard: 1, farmer: 2 };   // who most likely stocks it
+      const traders = s.npcs.filter((n) => n.role in rank && !g.tried.includes(n.name + '|' + n.role))
+        .sort((a, b) => rank[a.role] - rank[b.role] || a.dist - b.dist);
+      const npc = (g.lock && s.npcs.find((n) => n.name + '|' + n.role === g.lock)) || traders[0];
+      if (!npc) {   // nobody here sells it: the nearest town on the map
+        if (!g.town) {
+          g.town = await ctx.G(() => {
+            const g = window.__gameDebug, p = g.playerPos();
+            const ts = (g.mapLandmarks?.() ?? []).filter((l) => l.kind === 'settlement' && !/ruin/i.test(l.name));
+            ts.sort((a, b) => Math.hypot(a.x - p[0], a.z - p[2]) - Math.hypot(b.x - p[0], b.z - p[2]));
+            return ts[0] ? { x: ts[0].x, z: ts[0].z, name: ts[0].name } : null;
+          });
+          if (!g.town) { ctx.event('no-stock', 'no town on the map to shop in'); ctx.goal = { type: 'idle', since: t }; return; }
+          ctx.event('goal', `heading to ${g.town.name} to buy ${g.item}`);
+        }
+        if (Math.hypot(g.town.x - s.p[0], g.town.z - s.p[2]) < 25 && !traders.length && s.npcs.length) {
+          ctx.event('no-stock', `nobody in ${g.town.name} sells ${g.item}`); ctx.goal = { type: 'idle', since: t }; return;
+        }
+        return travelTo(ctx, s, g.town.x, g.town.z, { sprint: true });
+      }
+      g.lock = npc.name + '|' + npc.role;
+      return approachNpc(ctx, s, npc);
+    }
     case 'dungeon': {
       if (s.p[1] < -200) {   // in: go hunting
         ctx.event('entered', 'went down into the dungeon');
@@ -521,6 +650,11 @@ export async function tick(ctx) {
         await release(ctx);
         ctx.event('arrived', `reached ${g.label ?? `${Math.round(g.x)}, ${Math.round(g.z)}`}`);
         ctx.goal = { type: 'idle', since: t };
+        if (g.auto && m.adventure?.pendingTalk === g.label) {   // a town: meet somebody
+          m.adventure.pendingTalk = null;
+          const who = s.npcs.find((n) => n.role !== 'guard') ?? s.npcs[0];
+          if (who) ctx.goal = { type: 'talk', name: who.name, role: who.role, since: t, auto: true };
+        }
         return;
       }
       return travelTo(ctx, s, g.x, g.z, { sprint: g.sprint ?? dist > 25 });
@@ -593,6 +727,21 @@ export async function tick(ctx) {
       return fight(ctx, s, prey);
     }
     case 'talk': {
+      if (s.chatOpen && g.auto) {   // adventure chat: one opener, read the reply, move on
+        await release(ctx);
+        if (!g.saidAt) {
+          g.saidAt = t; g.replyWas = s.reply;
+          const line = OPENERS[(Math.random() * OPENERS.length) | 0];
+          const input = ctx.page.locator('#npc-chat-panel .npc-input').first();
+          if (await input.count()) { await input.fill(line); await input.press('Enter'); ctx.event('said', line); }
+          return;
+        }
+        if ((s.reply !== g.replyWas && t - g.saidAt > 8000) || t - g.saidAt > 45000) {
+          await ctx.page.keyboard.press('Escape');
+          ctx.goal = { type: 'idle', since: t };
+        }
+        return;
+      }
       if (s.chatOpen) { await release(ctx); return; }   // conversation in progress: hold still
       const npc = (g.lock && s.npcs.find((n) => n.name + '|' + n.role === g.lock)) || s.npcs.find((n) => (!g.name || String(n.name).toLowerCase().includes(String(g.name).toLowerCase()))
         && (!g.role || n.role === g.role));   // names repeat (two Quills): role disambiguates
@@ -604,13 +753,7 @@ export async function tick(ctx) {
       if (!g.lock) g.lock = npc.name + '|' + npc.role;
       // E does whatever the prompt says: only press it when it offers talk (a door
       // or "leave" trigger also sits on E). Otherwise keep closing in.
-      // Indoors the HUD says "E — talk to <name>"; outdoors NPC talk has no prompt,
-      // so there E is only safe when nothing else (a door, a sign) is offered.
-      const talkPrompt = new RegExp(`talk to ${npc.name}|speak`, 'i').test(s.prompt ?? '');
-      if (talkPrompt || (!s.inside && npc.dist < 2.4 && !s.prompt)) { await release(ctx); return pressE(ctx); }
-      if (npc.dist > 1.2) return travelTo(ctx, s, npc.x, npc.z, { sprint: npc.dist > 25 });
-      await release(ctx);
-      return;
+      return approachNpc(ctx, s, npc);
     }
   }
 }
@@ -620,6 +763,71 @@ async function pressE(ctx) {
   if (m.lastE && now() - m.lastE < 1500) return;
   m.lastE = now();
   await ctx.page.keyboard.press('KeyE');
+}
+
+async function hasHeal(ctx) {
+  return ctx.G(() => { const inv = window.__gameDebug.inventory();
+    return inv.hotbar.concat(inv.pack).some((it) => it?.id === 'healing_potion' || it?.id === 'meat_cooked'); });
+}
+/** A point ~20 m directly away from the threats (dungeons: a reachable floor cell). */
+async function fleePoint(ctx, s, threats) {
+  let ax = 0, az = 0;
+  for (const e of threats) { const d = Math.max(1, e.dist); ax += (s.p[0] - e.x) / d; az += (s.p[2] - e.z) / d; }
+  const n = Math.hypot(ax, az) || 1; ax /= n; az /= n;
+  const grid = await dungeonGrid(ctx, s);
+  if (!grid) return [s.p[0] + ax * 20, s.p[2] + az * 20];
+  let best = null, bestScore = -Infinity;   // far from threats, roughly the right way
+  for (let k = 0; k < 300; k++) {
+    const i = (Math.random() * grid.w) | 0, j = (Math.random() * grid.h) | 0;
+    if (!grid.cells[j * grid.w + i]) continue;
+    const wx = grid.origin[0] + i + 0.5, wz = grid.origin[2] + j + 0.5;
+    const d = Math.hypot(wx - s.p[0], wz - s.p[2]);
+    if (d < 8 || d > 35) continue;
+    const away = Math.min(...threats.map((e) => Math.hypot(wx - e.x, wz - e.z)));
+    const score = away + ((wx - s.p[0]) * ax + (wz - s.p[2]) * az) * 0.5;
+    if (score > bestScore) { bestScore = score; best = [wx, wz]; }
+  }
+  return best ?? [s.p[0] + ax * 20, s.p[2] + az * 20];
+}
+
+// ── adventure ─────────────────────────────────────────────────────────
+const OPENERS = [
+  'Evening. What is the most dangerous thing within a day of here?',
+  'I am new in these parts. Who should I avoid, and who should I meet?',
+  'Any dungeons nearby that people are afraid of? Asking for a friend. The friend is me.',
+  'What do people here do for fun, apart from staring at strangers?',
+  'If you could get rid of one monster around here, which would it be?',
+];
+async function packCount(ctx, ids) {
+  return ctx.G((ids) => { const inv = window.__gameDebug.inventory();
+    return inv.hotbar.concat(inv.pack).reduce((n, it) => n + (ids.includes(it?.id) ? (it.count ?? 1) : 0), 0); }, ids);
+}
+/** The next step of an adventure: restock if low, else the nearest unvisited place. */
+async function nextAdventure(ctx, s) {
+  const adv = ctx.mem.adventure, t = now();
+  const marks = await ctx.G(() => {
+    const g = window.__gameDebug, p = g.playerPos();
+    return (g.mapLandmarks?.() ?? []).map((l) => ({ kind: l.kind, name: l.name, x: l.x, z: l.z,
+      dist: Math.hypot(l.x - p[0], l.z - p[2]) })).sort((a, b) => a.dist - b.dist);
+  });
+  const town = marks.find((l) => l.kind === 'settlement' && !/ruin/i.test(l.name));
+  // Restock (each item at most every 10 min, so a town that doesn't sell it can't loop us).
+  const flint = await packCount(ctx, ['flint_arrow']);
+  const heals = await packCount(ctx, ['healing_potion', 'meat_cooked']);
+  for (const [item, have, low, count] of [['flint_arrow', flint, 10, 30], ['healing_potion', heals, 4, 6]]) {
+    if (have < low && town && town.dist < 1500 && (!adv.shopAt[item] || t - adv.shopAt[item] > 600000)) {
+      adv.shopAt[item] = t;
+      return { type: 'shop', item, count, why: `restocking ${item.replace('_', ' ')}s in ${town.name}` };
+    }
+  }
+  const key = (l) => `${l.name}@${Math.round(l.x)},${Math.round(l.z)}`;
+  const next = marks.find((l) => (l.kind === 'dungeon' || (l.kind === 'settlement' && !/ruin/i.test(l.name)))
+    && !adv.visited.includes(key(l)) && l.dist < 2500);
+  if (!next) return { type: 'explore', why: 'nothing new on the map, wandering' };
+  adv.visited.push(key(next));
+  if (next.kind === 'dungeon') return { type: 'dungeon', at: { x: next.x, z: next.z, name: next.name }, why: `off to the dungeon ${next.name}` };
+  adv.pendingTalk = next.name;
+  return { type: 'travel', x: next.x, z: next.z, label: next.name, within: 25, why: `visiting ${next.name}` };
 }
 
 // ── the bow ───────────────────────────────────────────────────────────
@@ -710,6 +918,13 @@ async function shoot(ctx, s, target) {
 async function fight(ctx, s, target) {
   const m = ctx.mem;
   m.fightAt = now();
+  // Kite a boss: with arrows, never stand in its reach — back off to bow range.
+  if (target.hp > 60 && s.bow && target.dist < 6 && !(m.kiteUntil > now())) m.kiteUntil = now() + 2500;
+  if (m.kiteUntil > now() && target.hp > 60 && s.bow) {
+    if (!m.kiteSaid || now() - m.kiteSaid > 20000) { m.kiteSaid = now(); ctx.event('kite', `backing off from the ${target.species} to shoot`); }
+    const fp = await fleePoint(ctx, s, [target]);
+    return travelTo(ctx, s, fp[0], fp[1], { sprint: true });
+  }
   if (await canShoot(ctx, s, target)) {
     if (!m.target || m.target.id !== target.id) { m.target = { id: target.id, species: target.species }; ctx.event('fight', `engaging a ${target.species} with the bow`); }
     return shoot(ctx, s, target);
@@ -744,6 +959,40 @@ async function leave(ctx, s, done) {
   await ctx.page.keyboard.press('KeyE');
 }
 
+/**
+ * Walk up to an NPC and press E once the HUD offers "talk to <name>". A door or
+ * a stall can own the E prompt instead (an NPC standing in a doorway): then
+ * step round to the NPC's far side, away from whatever claimed the key.
+ */
+async function approachNpc(ctx, s, npc) {
+  const m = ctx.mem;
+  if (new RegExp(`talk to ${npc.name}|speak`, 'i').test(s.prompt ?? '')) { await release(ctx); return pressE(ctx); }
+  if (npc.dist < 2.6 && s.prompt) {
+    const dx = npc.x - s.p[0], dz = npc.z - s.p[2], n = Math.hypot(dx, dz) || 1;
+    return travelTo(ctx, s, npc.x + dx / n * 1.6, npc.z + dz / n * 1.6, {});
+  }
+  if (npc.dist > 1.2) return travelTo(ctx, s, npc.x, npc.z, { sprint: npc.dist > 25 });
+  await release(ctx);
+}
+
+/** Click an open trade panel's Buy button up to `count` times; returns how many bought. */
+async function buyFromOpenChat(ctx, item, count) {
+  const btn = ctx.page.locator(`#npc-chat-panel [data-trade-btn="buy-${item}"]`).first();
+  let got = 0;
+  for (let i = 0; i < count; i++) {
+    if (await btn.count() === 0) break;   // not stocked, sold out, or panel closed
+    const before = await ctx.G((id) => window.__gameDebug.inventory().pack.concat(window.__gameDebug.inventory().hotbar)
+      .reduce((n, it) => n + (it?.id === id ? (it.count ?? 1) : 0), 0), item);
+    await btn.click().catch(() => {});
+    await ctx.sleep(90);
+    const after = await ctx.G((id) => window.__gameDebug.inventory().pack.concat(window.__gameDebug.inventory().hotbar)
+      .reduce((n, it) => n + (it?.id === id ? (it.count ?? 1) : 0), 0), item);
+    if (after <= before) break;   // out of gold (the panel says so)
+    got += after - before;
+  }
+  return got;
+}
+
 // ── immediate actions (POST /act) ─────────────────────────────────────
 export async function act(ctx, a) {
   const { page, G, sleep } = ctx;
@@ -757,6 +1006,12 @@ export async function act(ctx, a) {
       return;
     }
     case 'close': return page.keyboard.press('Escape');
+    case 'buy': {   // {item, count} from the trader whose chat is open
+      if (!(await snap(ctx)).chatOpen) throw new Error('no NPC chat is open');
+      const got = await buyFromOpenChat(ctx, String(a.item), Math.max(1, Math.min(99, a.count | 0 || 1)));
+      ctx.event('bought', `bought ${got} ${a.item}`);
+      return;
+    }
     case 'slot': return page.keyboard.press(`Digit${Math.max(1, Math.min(9, a.n | 0))}`);
     case 'jump': return page.keyboard.press('Space');
     case 'interact': return page.keyboard.press('KeyE');
