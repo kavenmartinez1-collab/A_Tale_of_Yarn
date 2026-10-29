@@ -16,6 +16,8 @@
  *   {type:"leave"}                                   get out of the building you are in
  *   {type:"shop", item, count}                       buy from the nearest trader who stocks it
  *                                                    (walks to a town if nobody near does)
+ *   {type:"tame", species?}                          find a griffin (default) in the mountains and
+ *                                                    tame it: E until the bucking stops
  *   {type:"adventure"}                               run on its own: next unvisited dungeon or
  *                                                    town, clear it / chat / restock, repeat
  *   {type:"dungeon", name?}                          walk into the nearest (or named) dungeon,
@@ -108,7 +110,7 @@ export async function state(ctx) {
 
 // ── goals ─────────────────────────────────────────────────────────────
 export async function setGoal(ctx, g) {
-  const types = ['idle', 'travel', 'explore', 'hunt', 'talk', 'leave', 'dungeon', 'shop', 'adventure'];
+  const types = ['idle', 'travel', 'explore', 'hunt', 'talk', 'leave', 'dungeon', 'shop', 'adventure', 'tame'];
   if (!types.includes(g.type)) throw new Error(`goal type must be one of ${types.join(', ')}`);
   if (g.type === 'travel' && !(Number.isFinite(g.x) && Number.isFinite(g.z))) throw new Error('travel needs x and z');
   const s = await snap(ctx);
@@ -139,6 +141,7 @@ async function steer(ctx, s, x, z, { sprint = false } = {}) {
     if (nav.check && Math.hypot(s.p[0] - nav.check.p[0], s.p[2] - nav.check.p[2]) < 0.6 && nav.walking) {
       nav.stuck = (nav.stuck ?? 0) + 1;
       nav.stuckTotal = (nav.stuckTotal ?? 0) + 1;
+      nav.lastStuckAt = t;
       nav.unstickUntil = t + 700;
       nav.strafe = nav.stuck % 2 ? 'KeyA' : 'KeyD';
       await ctx.page.keyboard.press('Space');
@@ -148,7 +151,11 @@ async function steer(ctx, s, x, z, { sprint = false } = {}) {
         nav.detour = { x: s.p[0] - Math.sin(a) * 10, z: s.p[2] - Math.cos(a) * 10, until: t + 3500 };
         nav.stuck = 0;
       }
-    } else if (nav.check) nav.stuck = 0;
+    } else if (nav.check) {
+      nav.stuck = 0;
+      // Moving freely for 15 s: back to plain steering (and the long route).
+      if (nav.stuckTotal && t - (nav.lastStuckAt ?? 0) > 15000) { nav.stuckTotal = 0; nav.local = null; }
+    }
     nav.check = { t, p: s.p };
   }
   const keys = Math.abs(d) < 1.2 ? ['KeyW'] : [];   // turn first when facing away
@@ -358,21 +365,26 @@ async function travelTo(ctx, s, x, z, opts) {
     }
   }
   if (!(s.p[1] < -200) && (nav.stuckTotal ?? 0) >= 2) {
+    // Plan to somewhere the window can hold: the next long-route point, or a
+    // point at most 120 m along the way (a far target falls outside the grid).
+    let [x0, z0] = nav.route?.length ? nav.route[Math.min(2, nav.route.length - 1)] : [x, z];
+    const dd = Math.hypot(x0 - s.p[0], z0 - s.p[2]);
+    if (dd > 120) { x0 = s.p[0] + (x0 - s.p[0]) * 120 / dd; z0 = s.p[2] + (z0 - s.p[2]) * 120 / dd; }
     if (!nav.local || now() - nav.local.at > 20000) {
       // Widen until A* finds a way (the gate may be round the far side).
       for (const pad of [24, 60, 100]) {
-        const g = await localGrid(ctx, s, x, z, pad);
+        const g = await localGrid(ctx, s, x0, z0, pad);
         const lx = Math.floor(s.p[0] - g.origin[0]), lz = Math.floor(s.p[2] - g.origin[2]);
-        const path = astar(g, lx, lz, Math.floor(x - g.origin[0]), Math.floor(z - g.origin[2]));
+        const path = astar(g, lx, lz, Math.floor(x0 - g.origin[0]), Math.floor(z0 - g.origin[2]));
         nav.local = { at: now(), g, ok: !!path };
-        nav.path = path; nav.pathAt = now(); nav.pathGoal = [x - g.origin[0], z - g.origin[2]];
+        nav.path = path; nav.pathAt = now(); nav.pathGoal = [x0 - g.origin[0], z0 - g.origin[2]];
         if (path) break;
       }
       ctx.event('plan', nav.local.ok ? `blocked, found a ${nav.path.length} m way around` : 'blocked and no way around found');
     }
     const g = nav.local.g, inside = (px, pz) => px >= g.origin[0] && pz >= g.origin[2] && px < g.origin[0] + g.w && pz < g.origin[2] + g.h;
     if (inside(s.p[0], s.p[2])) {
-      const tx = Math.max(g.origin[0] + 1, Math.min(g.origin[0] + g.w - 2, x)), tz = Math.max(g.origin[2] + 1, Math.min(g.origin[2] + g.h - 2, z));
+      const tx = Math.max(g.origin[0] + 1, Math.min(g.origin[0] + g.w - 2, x0)), tz = Math.max(g.origin[2] + 1, Math.min(g.origin[2] + g.h - 2, z0));
       const wp = dungeonWaypoint(ctx, g, s, tx, tz);
       if (wp) return steer(ctx, s, wp[0], wp[1], opts);
     }
@@ -514,7 +526,7 @@ export async function tick(ctx) {
 
   // Focus fire: in a crowd, finish the weakest enemy in sword reach first —
   // switching to whoever hit last spreads the damage and kills nothing.
-  if (m.hurtAt && t - m.hurtAt < 4000 && m.attacker && ctx.goal.type !== 'talk') {
+  if (m.hurtAt && t - m.hurtAt < 4000 && m.attacker && ctx.goal.type !== 'talk' && ctx.goal.type !== 'tame') {
     const reach = s.ents.filter((e) => e.dist < 3.2 && !PASSIVE.has(e.species));
     const cur = reach.find((e) => e.id === m.target?.id);
     const a = cur ?? reach.sort((x, y) => x.hp - y.hp)[0] ?? s.ents.find((e) => e.id === m.attacker);
@@ -624,6 +636,57 @@ export async function tick(ctx) {
       }
       g.lock = npc.name + '|' + npc.role;
       return approachNpc(ctx, s, npc);
+    }
+    case 'tame': {
+      const sp = g.species ?? 'griffin';
+      const info = await ctx.G((sp) => {
+        const g = window.__gameDebug, p = g.playerPos(), tam = g.taming().tamed;
+        const es = (g.entities() || []).filter((e) => e.species === sp && (e.hp ?? 1) > 0)
+          .map((e) => ({ id: e.id, x: e.x, y: e.y ?? p[1], z: e.z, dist: Math.hypot(e.x - p[0], e.z - p[2]),
+            dy: (e.y ?? p[1]) - p[1], temper: tam[e.id]?.temper ?? 0, tamed: !!tam[e.id]?.tamed }))
+          .sort((a, b) => a.dist - b.dist);
+        return { target: es[0] ?? null, mounted: g.mounted() };
+      }, sp);
+      const tgt = (g.lockId && info.target?.id !== g.lockId) ? info.target : info.target;
+      if (info.mounted && tgt && info.mounted === tgt.id) {
+        if (tgt.tamed) {
+          if (!g.done) { g.done = true; ctx.event('tamed', `tamed the ${sp}! (temper ${tgt.temper})`); }
+          await release(ctx); ctx.goal = { type: 'idle', since: t }; return;   // stay in the saddle
+        }
+        // A short "accepted" ride: hop off after a moment and try again.
+        g.rideAt ??= t;
+        if (t - g.rideAt > 2000) { g.rideAt = null; await ctx.G(() => window.__gameDebug.dismount()); }
+        return;
+      }
+      g.rideAt = null;
+      if (!tgt || tgt.dist > 150) {   // search: high ground, where griffins live
+        if (!g.peaks) {
+          g.peaks = await ctx.G(() => {
+            const g = window.__gameDebug, p = g.playerPos(), pts = [];
+            for (let r = 200; r <= 3000; r += 200) for (let a = 0; a < Math.PI * 2; a += 300 / r) {
+              const x = p[0] + Math.cos(a) * r, z = p[2] + Math.sin(a) * r, h = g.heightAt(x, z);
+              if (h > 70) pts.push({ x, z, h, d: r });
+            }
+            return pts.sort((a, b) => (a.d - b.d) - (b.h - a.h) * 3).slice(0, 12);
+          });
+          g.peakIx = 0;
+          ctx.event('goal', g.peaks.length ? `searching the mountains for a ${sp}` : `no mountains within 3 km`);
+        }
+        const pk = g.peaks[g.peakIx];
+        if (!pk) { ctx.event('gave-up', `no ${sp} found on any nearby mountain`); ctx.goal = { type: 'idle', since: t }; return; }
+        if (Math.hypot(pk.x - s.p[0], pk.z - s.p[2]) < 20) { g.peakIx++; return; }
+        return travelTo(ctx, s, pk.x, pk.z, { sprint: true });
+      }
+      if (!g.seen || g.seen !== tgt.id) { g.seen = tgt.id; ctx.event('spotted', `spotted a ${sp} ${Math.round(tgt.dist)} m away (temper ${tgt.temper}/80)`); }
+      if (tgt.dist > 2.4 || Math.abs(tgt.dy) > 2.4) return travelTo(ctx, s, tgt.x, tgt.z, { sprint: tgt.dist > 15 });
+      await release(ctx);
+      if (!g.tryAt || t - g.tryAt > 1300) {
+        g.tryAt = t;
+        await ctx.page.keyboard.press('KeyE');
+        g.tries = (g.tries ?? 0) + 1;
+        if (g.tries % 4 === 1) ctx.event('taming', `trying to mount the ${sp} (temper ${tgt.temper}/80)`);
+      }
+      return;
     }
     case 'dungeon': {
       if (s.p[1] < -200) {   // in: go hunting
