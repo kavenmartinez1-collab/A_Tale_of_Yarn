@@ -503,13 +503,13 @@ export class SettlementManager {
   }
 
   /** Name + kind of the nearest settlement (debug/e2e). */
-  nearestSettlement(): { name: string; kind: string } | null {
+  nearestSettlement(): { name: string; kind: string; x: number; z: number } | null {
     const site = this.findNearestSite(this.pos[0], this.pos[2]);
     if (site === null) return null;
     const key = `${Math.floor(site.x / SCELL)},${Math.floor(site.z / SCELL)}`;
     const resolved = this.active.get(key)?.resolved
       ?? resolveSettlement(site, (x, z) => this.heightField.heightAt(x, z));
-    return { name: resolved.name, kind: site.kind };
+    return { name: resolved.name, kind: site.kind, x: site.x, z: site.z };
   }
 
   /** Pure per-cell roll (settlement-scatter.ts); memoized. */
