@@ -243,8 +243,26 @@ const brief = buildBrief(0x1234, 2, 2, 10);
   check('gen bad-output fallback: NOT a chat error', r.chatError === false);
 }
 
-check('sampling: greedy contract', DIRECTOR_SAMPLING.temperature === 0);
+// Sampled since the Qwen3.5-2B switch (greedy loops on this model; see
+// DIRECTOR_SAMPLING). Keep it a narrow, low-entropy preset: a JSON contract
+// does not survive a hot sampler, and no penalty may touch repeated keys.
+check('sampling: low-entropy preset', DIRECTOR_SAMPLING.temperature <= 0.8
+  && DIRECTOR_SAMPLING.topK <= 40 && DIRECTOR_SAMPLING.topP <= 0.9);
+check('sampling: no repetition/presence penalty',
+  !('repetitionPenalty' in DIRECTOR_SAMPLING) && !('presencePenalty' in DIRECTOR_SAMPLING));
 check('sampling: bounded output', DIRECTOR_SAMPLING.maxNewTokens <= 1024);
+{
+  // Retries carry only the latest failed attempt: stacking every failure
+  // overflowed the 2,047-token prompt limit (a chat error, Director disabled).
+  const calls: Array<Array<{ role: string; content: string }>> = [];
+  const r = await generateSpecWithRetries(async (m) => {
+    calls.push(m.map((x) => ({ ...x })));
+    return { text: 'no json here', stopReason: 'eos' };
+  }, brief);
+  check('retry context: fallback after all attempts', r.source === 'fallback' && calls.length === MAX_RETRIES + 1);
+  check('retry context: last attempt carries one failure',
+    calls[calls.length - 1].filter((x) => x.role === 'assistant').length === 1);
+}
 
 // ── Spec store ───────────────────────────────────────────────────────────
 

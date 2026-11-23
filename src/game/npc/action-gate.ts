@@ -6,7 +6,7 @@
  * makes the NPC a companion, `invite_home` opens their door, `charmed` and the
  * proposal verbs move romance. A small model does not hold the rule "only when
  * the traveller actually did X". Measured with scripts/test-npc-live.mts
- * (2026-10-28, LFM3-1.7B): `charmed` after a question about the gods,
+ * (2026-10-28, a 1.7B model): `charmed` after a question about the gods,
  * `follow` after small talk about the weather, `invite_home` in answer to a
  * robbery threat, and `hostile` after a confession that did not threaten the
  * NPC. The game's own principle (npc-trade.ts, docs/AI_MODEL_LICENSING.md) is

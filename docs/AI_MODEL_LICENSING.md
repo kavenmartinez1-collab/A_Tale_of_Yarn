@@ -45,52 +45,63 @@ reads as "you should" was the recommendation *before* the change.
 
 ---
 
-## 0. Update 2026-10-28 — the game now ships LFM3-1.7B
+## 0. Update 2026-11-23 — the game now ships Qwen3.5-2B
 
-The owner chose LiquidAI **LFM3-1.7B** (`LiquidAI/LFM3-1.7B-GGUF`, Q4_K_M) as the
-NPC + Director model, replacing Qwen3-1.7B. The two reasons §3 gave for
-ruling the LFM family out have both changed:
+The NPC + Director model is now stock **Qwen3.5-2B** (`unsloth/Qwen3.5-2B-GGUF`,
+Q4_K_M, 1.28 GB), **Apache-2.0**: no revenue cap, no user threshold, no
+acceptable-use policy, not gated.
 
-1. **Architecture.** The engine now runs LFM3 natively: a gated short-conv
-   kernel and a per-head attention gate on top of the sliding-window / partial
-   RoPE paths Gemma 4 already used (`src/shaders/short_conv.wgsl`; parity with
-   llama.cpp b11945 in `scripts/test-lfm3-parity.mts`).
-   `gguf-session.ts` accepts short-conv layers. MoE, PLE and DeltaNet remain
-   refused there.
-2. **The §5 revenue cap.** The game is distributed **free of charge**: no
-   sale, no Steam, no money involved. That is not "Commercial Use" as §1
-   defines it ("direct or indirect commercial advantage or monetary
-   compensation"), so the US$10M threshold never comes into play. **If the
-   game is ever sold, monetised (ads, paid DLC, donations tied to the game)
-   or bundled with a paid product, re-read §5 first.** Below the threshold it
-   is still licensed; at or above it, either get a commercial licence from
-   Liquid AI or switch back. Switching back is a one-line change each in
-   `NPC_MODELS.fast` / `.default` (npc-chat-panel.ts) and
-   `DIRECTOR_MODEL_ID` / `DIRECTOR_GGUF_FILE` (director.ts); Qwen3-1.7B stays
-   available as `?npcllm=qwen`.
+It replaces the model chosen on 2026-10-28 — Liquid AI's 1.7B, under Liquid
+AI's own open licence. That licence caps commercial use at US$10M annual
+revenue (§5, see the table in §3), and the owner decided nothing in Artifex
+may rely on a licence with a revenue cap. It is gone from the game entirely:
+weights pins, licence file, chat template, and the engine's support for its
+architecture (short-conv layers and the per-head attention gate). Qwen3-1.7B
+stays available as `?npcllm=qwen`.
 
-Obligations, all met in the repo: the licence ships beside the weights
-(`models/LiquidAI--LFM3-1.7B-GGUF/LICENSE`, required by pack-steam.mjs) and in
-`LICENSES/LFM-Open-License-1.0.txt`; the weights are unmodified; Liquid AI's
-repo has no NOTICE file. Pins (commit + SHA-256) are in
-`scripts/fetch-weights.mts` and THIRD_PARTY_NOTICES.md §1.1.
+What it took:
 
-Measured on the same harnesses as the Qwen choice (RX 6700 XT):
+1. **Architecture.** Qwen3.5 is a Gated-DeltaNet hybrid (18 linear-attention
+   + 6 full-attention layers), which §3 and §6 list as the reason it was
+   blocked: `gguf-session.ts` was dense-only. It now wires the linear-attention
+   layers the way the companion app (`src/main.ts`) always has; MoE and PLE are
+   still refused there. Parity with llama.cpp in
+   `scripts/test-model-parity.mts` (fixture: llama.cpp b12651 CPU + b12600 CUDA):
+   tokenizer exact on all three prompts, argmax 71/72 (one near-tie), inside
+   llama.cpp's own CPU..GPU range except one soft spot (0.082, where the two
+   llama.cpp builds differ by 0.080), 16- vs 64-token prefill identical to 1e-6.
+2. **KV reuse.** A recurrent state cannot be rewound, so every NPC turn after
+   the chat's prompt budget starts trimming old turns re-prefilled the whole
+   villager card (7.1 s time-to-first-token on an RX 6700 XT). The session now
+   saves the state at the end of the system prompt and restores it
+   (`GenerateOptions.ssmCheckpointAt`): 0.2 s again, and token-identical to a
+   fresh prefill (`scripts/test-ssm-checkpoint.mts`).
+3. **Sampling.** NPCs use Qwen's recommended non-thinking preset (temperature
+   0.7, top-p 0.8, top-k 20, presence penalty 1.5 — added to the sampler for
+   this). The Director moved from greedy to temperature 0.7 / top-p 0.8 /
+   top-k 20: greedy decoding loops on this model (duplicate room ids, self-loop
+   edges) and a deterministic retry repeats the loop. Director retries now
+   carry only the latest failed attempt; stacking all of them overflowed the
+   2,047-token prompt limit, which the game treats as "model unavailable".
+4. **Thinking off** the way Qwen's own template does it: the generation prompt
+   ends in an empty `<think></think>` block, and the session never samples
+   `<think>` or `</think>` while thinking is off.
 
-| | LFM3-1.7B (temp 0.3, top-k 50) | Qwen3-1.7B (recorded) |
+Obligations, all met in the repo: Qwen's LICENSE ships beside the weights
+(`models/unsloth--Qwen3.5-2B-GGUF/LICENSE`, required by pack-steam.mjs) and in
+`LICENSES/Qwen3.5-Apache-2.0.txt`; the weights are unmodified; neither repo has
+a NOTICE file. Pins (commit + SHA-256) are in `scripts/fetch-weights.mts` and
+THIRD_PARTY_NOTICES.md §1.1. pack-steam.mjs now ships model directories from an
+allow-list, so a retired model still on a developer's disk cannot reach a depot.
+
+Measured on the same harnesses (RX 6700 XT, 2026-11-23):
+
+| | Qwen3.5-2B | the 2026-10-28 model (recorded) |
 |---|---|---|
-| `test-npc-live.mts` | **PASS**: no `<think>`/JSON leaks, guardrail 8/8, 0 false-positive verbs | not re-run: its first NPC prefill hung this AMD driver (DXGI_ERROR_DEVICE_HUNG) under headless Chrome, with or without the LFM3 changes |
-| Threat verbs emitted by the model | 0/4 (the `threatActionFor` floor decides) | 0/4 (recorded in npc-trade.ts) |
-| Time to first token | ~175 ms per NPC turn | 2.2 s on the harness's short sanity prompt |
-| `test-director-live.mts` | 8/8 valid dungeon specs (7 first try), ~10 s each | not recorded |
-
-What it took: a lower sampling temperature for LFM3 (at Qwen's 0.9 it broke
-character and leaked control JSON); never sampling `<think>` when thinking is
-off (gguf-session.ts; LFM3 opens one on hard prompts even after the empty
-think block); and `src/game/npc/persona-guard.ts`, which replaces a reply
-that talks about being an AI/model/prompt with an in-world reaction. At
-temperature 0.3, LFM3 answered a direct prompt-injection by naming itself as
-Liquid AI's model.
+| `test-npc-live.mts` | **PASS**: no `<think>`/JSON leaks, guardrail 8/8, 0 false-positive verbs, 1/10 out-of-character (prompt injection; replaced by persona-guard) | PASS |
+| Threat verbs (as the game applies them) | 4/4 (the `threatActionFor` floor decides; the model emits none) | 0/4 from the model, floor decides |
+| Time to first token | median 0.22 s, worst 0.24 s per NPC turn | ~175 ms |
+| `test-director-live.mts` | 14/16 valid specs (13 first try), avg 13.3 s per dungeon (greedy was 4/8) | 8/8 valid specs (7 first try), ~10 s each |
 
 The rest of this document is the original analysis (written for a paid Steam
 release) and still stands for every other model.
@@ -230,7 +241,7 @@ listings. "Speed" is relative to the 1.7B baseline; see the note on measurement 
 | **Qwen3-4B-Instruct-2507** *(fallback)* | Apache-2.0 ([LICENSE](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/blob/main/LICENSE)) | None | 2.497 GB | ~0.4–0.5x | Best in class at this size; no `<think>` workaround needed | Native; zero work |
 | Qwen3-0.6B | Apache-2.0 ([LICENSE](https://huggingface.co/Qwen/Qwen3-0.6B/blob/main/LICENSE)) | None | 0.397 GB | ~2.5–3x | Likely too weak for the JSON verbs; possible low-spec tier | Native; zero work |
 | Qwen3-4B (base instruct) | Apache-2.0 | None | 2.497 GB | ~0.4–0.5x | Superseded by 2507 | Native |
-| **Qwen3.5-2B / 4B** | Apache-2.0, not gated ([LICENSE](https://huggingface.co/Qwen/Qwen3.5-2B/blob/main/LICENSE)) | None | n/a | — | Newer/stronger family | **Blocked** — hybrid linear-attention layers; the game's session is dense-only (`gguf-session.ts:110-113`). Future upgrade path, needs engine work |
+| **Qwen3.5-2B / 4B** | Apache-2.0, not gated ([LICENSE](https://huggingface.co/Qwen/Qwen3.5-2B/blob/main/LICENSE)) | None | n/a | — | Newer/stronger family | ~~Blocked — hybrid linear-attention layers~~ **Ships (2B) since 2026-11-23** — `gguf-session.ts` now wires the Gated-DeltaNet layers; see §0 |
 | **Gemma 4** (E2B / E4B / 12B) | **Apache-2.0** ([licence page](https://ai.google.dev/gemma/docs/gemma_4_license)), not gated — a change from Gemma 1–3's custom terms | Prohibited Use Policy + Terms of Use referenced alongside; whether they bind downstream needs a lawyer's read | — | — | Strong | **Blocked** for the small sizes — E2B/E4B use Per-Layer Embeddings, rejected by the dense-only guard. Smallest dense Gemma 4 is 12B, far too large |
 | Gemma 3 (270M / 1B / 4B) | Custom **[Gemma Terms of Use](https://ai.google.dev/gemma/terms)** (`license: gemma`) — not open source. **`gated: manual`** | The heaviest obligations here. §3.2 incorporates the [Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy) *by reference*, and §3.1 requires you to include those restrictions **as an enforceable provision in your own game's EULA**, give every player a copy of the Gemma Terms, and ship a NOTICE file — with the NOTICE condition explicitly targeting non-hosted distribution, i.e. exactly a game installer. The PUP bars sexual chatbot content, which is in direct tension with an uncensored dialogue model | — | — | 1B is weak; 4B is decent | Arch explicitly excluded (`model-descriptor.ts:161-166`) |
 | **Llama 3.2 1B / 3B** | Llama 3.2 Community License (`license: llama3.2`). **`gated: manual`**. Copy at `l32gh.txt` in the repo root | Works for a game — §2's threshold is **700 million MAU** — but §1(b)(i) requires you to **provide a copy of the agreement** with any redistribution and **prominently display "Built with Llama"**, and to prefix any derived model's name with "Llama". Plus a binding Acceptable Use Policy | — | fast | 1B is weak for structured output | Loads (`llama` arch is supported) but the engine emits **ChatML, not the Llama-3 header template** — silent quality loss unless template work is done |
@@ -247,7 +258,7 @@ listings. "Speed" is relative to the 1.7B baseline; see the note on measurement 
 | EXAONE 4.0 1.2B | `license: other` / `exaone` (verified) | **Reported non-commercial.** Reject | — | — | — | — |
 | Hunyuan 1.8B Instruct | **No licence declared on HF at all** (verified: `license: null`) | Reported to exclude the EU, UK and South Korea — fatal for a worldwide Steam release. Reject | — | — | — | — |
 | Aya / Command (Cohere) | `cc-by-nc-4.0` | Non-commercial. Reject | — | — | — | — |
-| LFM2 (Liquid AI) | **LFM Open License v1.0** — not Apache; a copy is in the repo root at `lfm25.txt` | **Revenue cap.** §5 conditions all commercial rights on not exceeding a "Threshold" defined in §1 as *"annual revenue of 10 million United States dollars ($10,000,000) or more"*; §5(b): commercial use above it *"is not licensed under this Agreement"*. A successful game can cross this — and the licence would lapse retroactively at the moment it did | — | very fast | Good for size | ~~Blocked — hybrid conv/attention arch~~ LFM3 now runs and ships (see §0; the game is free, so §5 does not bite) |
+| Liquid AI's open-weight models | Liquid AI's own open licence (v1.0) — not Apache | **Revenue cap.** §5 conditions all commercial rights on not exceeding a "Threshold" defined in §1 as *"annual revenue of 10 million United States dollars ($10,000,000) or more"*; §5(b): commercial use above it *"is not licensed under this Agreement"*. A successful game can cross this — and the licence would lapse retroactively at the moment it did | — | very fast | Good for size | **Rejected.** Shipped 2026-10-28 → 2026-11-23 while the game was free; removed from the game and the engine over this cap (§0) |
 
 **The conclusion the table drives:** the engine's dense-only, ChatML-only,
 `qwen3`/`llama`/`gemma4`-only support surface knocks out almost every alternative
@@ -537,8 +548,9 @@ Two traps, both silent:
   is the single most likely way a model swap goes wrong without erroring.
 - **The dense-only guard.** `src/engine/gguf-session.ts:110-113` throws for
   MoE, Gemma-PLE and hybrid models. This is what rules out Qwen3.5-2B (hybrid
-  linear attention), Gemma 4 E2B/E4B (PLE), and LFM2 (hybrid conv) — all of which
-  would otherwise be attractive. `model-descriptor.ts:187` throws outright for
+  linear attention), Gemma 4 E2B/E4B (PLE), and Liquid AI's conv hybrids — all of which
+  would otherwise be attractive. (2026-11-23: Gated-DeltaNet hybrids are now
+  wired; MoE and PLE are still refused.) `model-descriptor.ts:187` throws outright for
   Phi-3, DeepSeek and Gemma 2/3.
 
 ---
@@ -640,11 +652,11 @@ obligations are real work.
    prohibited-use text. That suggests the PUP is advisory for Gemma 4 and binding
    for Gemma 1–3 — **but this is an inference from licence structure, not
    something Google states.** Only matters if the engine ever gains PLE support.
-5. *(Resolved — no confirmation needed.)* The LFM Open License v1.0 threshold is
-   **$10,000,000 annual revenue**, read directly from §1 and §5 of the copy at
-   `lfm25.txt`. This is the kind of clause the brief asked to watch for: a
-   revenue cap a game could plausibly cross. (2026-10-28: LFM3 now ships
-   because the game is free — §0. Re-read that clause before ever charging.)
+5. *(Resolved — no confirmation needed.)* Liquid AI's open licence (v1.0) threshold is
+   **$10,000,000 annual revenue**, read directly from its §1 and §5. This is
+   the kind of clause the brief asked to watch for: a revenue cap a game could
+   plausibly cross. (2026-11-23: the reason the game no longer ships any
+   Liquid AI model — §0.)
 6. **Real tokens/sec for these models in this engine.** The repo's measured
    figures are for a 27B IQ2_XXS on an RX 6700 XT (~11.5 tok/s) and are not
    transferable. The only in-repo numbers for the game models are relative

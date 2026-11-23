@@ -325,13 +325,21 @@ const MUSIC_DIR = 'music';
 // serving path as the soundtrack, vendored small enough to commit.
 const SFX_DIR = 'sfx';
 /**
- * Vendored model dirs that are dev-only comparison paths (fetch-weights.mts
- * OPTIONAL): a release build cannot select them (?npcllm is a debug param),
- * so shipping them is dead weight — 1.1 GB for the previous Qwen3-1.7B alone.
+ * The vendored model dirs a depot may contain: fetch-weights.mts SHIP, by
+ * name. An allow-list, not "any directory whose name contains `--`": a model
+ * dir that is merely still on the developer's disk — a dev-only comparison
+ * model (fetch-weights.mts OPTIONAL; ?npcllm is a debug param, so shipping it
+ * is dead weight), or a retired model whose licence the game no longer
+ * carries — must never reach the depot by accident. Adding a model here means
+ * adding its licence to THIRD_PARTY_NOTICES.md and LICENSES/ first.
  */
-const DEV_ONLY_MODEL_DIRS = new Set([
-  'unsloth--Qwen3-1.7B-GGUF',
-  'unsloth--Qwen3-4B-Instruct-2507-GGUF',
+const SHIP_MODEL_DIRS = new Set([
+  'unsloth--Qwen3.5-2B-GGUF',
+  'Xenova--whisper-base.en',
+  'rhasspy--piper-en-us-joe-medium',
+  'rhasspy--piper-en-us-ljspeech-medium',
+  MUSIC_DIR,
+  SFX_DIR,
 ]);
 const shipModels = fs.existsSync(MODELS)
   ? fs.readdirSync(MODELS).filter((d) => {
@@ -339,8 +347,9 @@ const shipModels = fs.existsSync(MODELS)
     // which are the playground's and are not on the game path at all.
     const p = path.join(MODELS, d);
     if (!fs.statSync(p).isDirectory()) return false;
-    if (DEV_ONLY_MODEL_DIRS.has(d)) return false;
-    return d.includes('--') || d === MUSIC_DIR || d === SFX_DIR;
+    if (SHIP_MODEL_DIRS.has(d)) return true;
+    if (d.includes('--')) console.log(`      models/${d} — not on the ship list, left out`);
+    return false;
   })
   : [];
 for (const d of SKIP_MODELS ? [] : shipModels) {
@@ -374,12 +383,12 @@ if (shipModels.length === 0 && !SKIP_MODELS) {
  * too even though their own model was present.
  */
 const REQUIRED_MODELS = [
-  ['LiquidAI--LFM3-1.7B-GGUF', 'LFM3-1.7B-Q4_K_M.gguf',
+  ['unsloth--Qwen3.5-2B-GGUF', 'Qwen3.5-2B-Q4_K_M.gguf',
     'the NPC dialogue + Dungeon Director model'],
-  ['LiquidAI--LFM3-1.7B-GGUF', 'tokenizer.json',
+  ['unsloth--Qwen3.5-2B-GGUF', 'tokenizer.json',
     'its tokenizer — without it the game would fetch one from huggingface.co'],
-  ['LiquidAI--LFM3-1.7B-GGUF', 'LICENSE',
-    'the LFM Open License v1.0, which must accompany the weights (§4a)'],
+  ['unsloth--Qwen3.5-2B-GGUF', 'LICENSE',
+    'the Apache-2.0 licence, which must accompany the weights (§4(a))'],
   ['rhasspy--piper-en-us-joe-medium', 'en_US-joe-medium.onnx',
     'male villager voices'],
   ['rhasspy--piper-en-us-joe-medium', 'lexicon-en-us.txt',
@@ -401,6 +410,20 @@ if (!SKIP_MODELS) {
   }
   console.log(`      required voice files present: `
     + `${REQUIRED_MODELS.length}/${REQUIRED_MODELS.length}`);
+}
+// --skip-models keeps the previous pack's models/, which may predate the
+// allow-list (e.g. a retired NPC model). Nothing off the list may ship.
+{
+  const depotModels = path.join(OUT, 'resources', 'models');
+  const stray = fs.existsSync(depotModels)
+    ? fs.readdirSync(depotModels).filter((d) => !SHIP_MODEL_DIRS.has(d))
+    : [];
+  if (stray.length) {
+    for (const d of stray) console.error(`      NOT ON THE SHIP LIST  resources/models/${d}`);
+    console.error('\npack-steam: refusing to build a depot with models it does not license.');
+    console.error('            pack again without --skip-models, or delete them from the depot.\n');
+    process.exit(1);
+  }
 }
 
 /**

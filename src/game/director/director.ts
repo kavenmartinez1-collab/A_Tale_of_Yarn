@@ -31,11 +31,11 @@ import {
 import { createSpecStore, type SpecStore } from './director-store';
 
 /**
- * The Director runs the SAME model as the NPCs (NPC_MODELS.fast): LiquidAI
- * LFM3-1.7B since 2026-10-28 (stock Qwen3-1.7B before that). Measured with
- * scripts/test-director-live.mts: 8/8 briefs produced a valid spec (7 on the
- * first try), ~10 s per dungeon in the background. Licence: LFM Open License
- * v1.0, see LICENSES/ and docs/AI_MODEL_LICENSING.md.
+ * The Director runs the SAME model as the NPCs (NPC_MODELS.fast): Qwen3.5-2B
+ * (unsloth/Qwen3.5-2B-GGUF, Apache-2.0) since 2026-11-23. Validate a model
+ * swap with scripts/test-director-live.mts (share of briefs that produce a
+ * valid spec, and seconds per dungeon). Licence: see LICENSES/ and
+ * docs/AI_MODEL_LICENSING.md.
  *
  * History of the choice (Qwen3-1.7B):
  *
@@ -62,8 +62,8 @@ import { createSpecStore, type SpecStore } from './director-store';
  * The flux2 checkpoint stays on disk — src/diffusion/flux2-image.ts still uses
  * it as an image text encoder, which is what it actually is.
  */
-export const DIRECTOR_MODEL_ID = 'LiquidAI/LFM3-1.7B-GGUF';
-export const DIRECTOR_GGUF_FILE = 'LFM3-1.7B-Q4_K_M.gguf';
+export const DIRECTOR_MODEL_ID = 'unsloth/Qwen3.5-2B-GGUF';
+export const DIRECTOR_GGUF_FILE = 'Qwen3.5-2B-Q4_K_M.gguf';
 
 /** Thrown when a generation is cut short because the Director was paused. */
 class PauseAbort extends Error {
@@ -350,8 +350,9 @@ export class DungeonDirector implements SpecProvider {
       this.chat = async (messages) => {
         const handle = ctx.chat(
           messages, DIRECTOR_SAMPLING, undefined,
-          // emptyThink: Qwen3 opens <think> on its own and burns the whole
-          // token budget unless the empty think block is pre-filled.
+          // emptyThink: Qwen3/3.5 open <think> on their own and burn the whole
+          // token budget unless the empty think block is pre-filled (Qwen's
+          // own non-thinking template does the same).
           // prefillChunk: small chunks keep frame hitches short for this
           // background consumer WITHOUT leaking into concurrent NPC chat
           // prefill (the old global override was racy across awaits).

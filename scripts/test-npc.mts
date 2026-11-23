@@ -926,7 +926,7 @@ ${JSON.stringify({ action: a.action, reason: a.reason })}`);
 }
 
 // ---------------------------------------------------------------------------
-// Lenient control JSON (small models botch the format; measured on LFM3-1.7B)
+// Lenient control JSON (small models botch the format; measured on a 1.7B model)
 // ---------------------------------------------------------------------------
 {
   const unquoted = 'So tell me, what do you want?\n{action: "invite_home"}';

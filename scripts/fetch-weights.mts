@@ -2,7 +2,7 @@
  * Vendor every model the game needs into `models/`, once, on a machine with
  * internet — so the packaged Steam build can run fully offline.
  *
- *   npx tsx scripts/fetch-weights.mts            # the ship set (~1.11 GB)
+ *   npx tsx scripts/fetch-weights.mts            # the ship set (~1.29 GB)
  *   npx tsx scripts/fetch-weights.mts --all      # + the ?npcllm=large 4B
  *   npx tsx scripts/fetch-weights.mts --check    # report only, download nothing
  *
@@ -14,11 +14,12 @@
  *
  * ON-DISK LAYOUT — `models/<org>--<repo>/<file>`, e.g.
  *
- *   models/LiquidAI--LFM3-1.7B-GGUF/LFM3-1.7B-Q4_K_M.gguf
- *   models/LiquidAI--LFM3-1.7B-GGUF/tokenizer.json
- *   models/LiquidAI--LFM3-1.7B-GGUF/tokenizer_config.json
+ *   models/unsloth--Qwen3.5-2B-GGUF/Qwen3.5-2B-Q4_K_M.gguf
+ *   models/unsloth--Qwen3.5-2B-GGUF/tokenizer.json
+ *   models/unsloth--Qwen3.5-2B-GGUF/tokenizer_config.json
+ *   models/unsloth--Qwen3.5-2B-GGUF/LICENSE
  *
- * which `app/steam/local-server.cjs` resolves for repo id `LiquidAI/LFM3-1.7B-GGUF`.
+ * which `app/steam/local-server.cjs` resolves for repo id `unsloth/Qwen3.5-2B-GGUF`.
  *
  * THE TOKENIZER IS A SECOND, INDEPENDENT NETWORK DEPENDENCY and the easiest
  * thing to miss. `src/model/tokenizer.ts:88` fetches
@@ -27,8 +28,8 @@
  * misses, it falls to `AutoTokenizer.from_pretrained`, which goes straight to
  * huggingface.co and would keep the shipped game online-only.
  *
- * Neither GGUF repo ships tokenizer files. For LFM3 the tokenizer comes from
- * the base repo `LiquidAI/LFM3-1.7B` (pinned commit + SHA-256 below); for the
+ * Neither GGUF repo ships tokenizer files. For Qwen3.5-2B the tokenizer comes
+ * from the base repo `Qwen/Qwen3.5-2B` (pinned commit + SHA-256 below); for the
  * optional Qwen3-1.7B, `baseTokenizerRepo()` (tokenizer.ts) resolves
  * `Qwen/Qwen3-8B` and we copy that. Either way the copy sits in the GGUF repo's
  * directory so the local probe hits and nothing is fetched at runtime.
@@ -62,40 +63,41 @@ interface Want {
 
 /** The shipping set — what a default build actually loads. */
 const SHIP: Want[] = [
-  // LFM3 is the NPC + Director model since 2026-10-28 (NPC_MODELS.fast,
-  // DIRECTOR_MODEL_ID). Both files are pinned to a commit and a SHA-256:
-  // the GGUF repo's own, and the tokenizer from the base repo (the GGUF repo
-  // ships none; tokenizer.ts would otherwise fetch it from huggingface.co at
-  // runtime). Same pins as the Artifex installer's catalog.json.
+  // Qwen3.5-2B is the NPC + Director model since 2026-11-23 (NPC_MODELS.fast,
+  // DIRECTOR_MODEL_ID), Apache-2.0. Every file is pinned to a commit and a
+  // SHA-256: the GGUF repo's own, and the tokenizer + licence from the base
+  // repo (the GGUF repo ships no tokenizer; tokenizer.ts would otherwise fetch
+  // it from huggingface.co at runtime). Same pins as Artifex's helper bench.
   {
-    repo: 'LiquidAI/LFM3-1.7B-GGUF',
-    file: 'LFM3-1.7B-Q4_K_M.gguf',
-    revision: '4b423c332fd97961416f2e8b69467758fd27370d',
-    sha256: '3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4',
+    repo: 'unsloth/Qwen3.5-2B-GGUF',
+    file: 'Qwen3.5-2B-Q4_K_M.gguf',
+    revision: 'f6d5376be1edb4d416d56da11e5397a961aca8ae',
+    sha256: 'aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223',
     why: 'NPC dialogue (NPC_MODELS.fast + .default) and the Dungeon Director — one download, one resident copy',
   },
   {
-    repo: 'LiquidAI/LFM3-1.7B-GGUF',
+    repo: 'unsloth/Qwen3.5-2B-GGUF',
     file: 'tokenizer.json',
-    from: 'LiquidAI/LFM3-1.7B',
-    revision: 'ac2586a34f1a1c03329dbdcdefabd8b6478ddaa7',
-    sha256: '7e226e34bface23ccf6e495d157bf77186c1c30a7659880e1a8994db528c3701',
-    why: 'LFM3 tokenizer from the base repo; placing it here makes the local probe hit',
+    from: 'Qwen/Qwen3.5-2B',
+    revision: '15852e8c16360a2fea060d615a32b45270f8a8fc',
+    sha256: '5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42',
+    why: 'Qwen3.5 tokenizer from the base repo; placing it here makes the local probe hit',
   },
   {
-    repo: 'LiquidAI/LFM3-1.7B-GGUF',
+    repo: 'unsloth/Qwen3.5-2B-GGUF',
     file: 'tokenizer_config.json',
-    from: 'LiquidAI/LFM3-1.7B',
-    revision: 'ac2586a34f1a1c03329dbdcdefabd8b6478ddaa7',
-    sha256: 'bf028f813efc6137bc07ed045cafe71820df9a5e26a38e39954706ed1e30a457',
-    why: 'special tokens (bos <|startoftext|>, eos <|im_end|>), same source as the tokenizer',
+    from: 'Qwen/Qwen3.5-2B',
+    revision: '15852e8c16360a2fea060d615a32b45270f8a8fc',
+    sha256: '49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c',
+    why: 'special tokens (eos <|im_end|>) + chat template, same source as the tokenizer',
   },
   {
-    repo: 'LiquidAI/LFM3-1.7B-GGUF',
+    repo: 'unsloth/Qwen3.5-2B-GGUF',
     file: 'LICENSE',
-    revision: '4b423c332fd97961416f2e8b69467758fd27370d',
-    sha256: '4d28ca14dedc0b3d0fcc2b3339f0e79931faa33874f3d24f522183a8fc70068c',
-    why: 'LFM Open License v1.0 — must ship with the weights (§4a); also in LICENSES/',
+    from: 'Qwen/Qwen3.5-2B',
+    revision: '15852e8c16360a2fea060d615a32b45270f8a8fc',
+    sha256: 'bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a',
+    why: 'Apache-2.0 — shipped beside the weights (§4(a)); also in LICENSES/',
   },
 
   // ---- Voice input (push-to-talk STT) --------------------------------------
@@ -233,7 +235,7 @@ const BUILT: Array<{ repo: string; file: string; build: string; why: string }> =
 ];
 
 /**
- * Only with --all. `?npcllm=qwen` (the previous default) and `?npcllm=large`
+ * Only with --all. `?npcllm=qwen` (Qwen3-1.7B, an earlier default) and `?npcllm=large`
  * are dev comparison paths. `large` is 2.5 GB and
  * the release build cannot select it (see src/game/release-flags.ts).
  *
@@ -243,11 +245,11 @@ const BUILT: Array<{ repo: string; file: string; build: string; why: string }> =
  * docs/AI_MODEL_LICENSING.md). It is never vendored, so it can never ship.
  */
 const OPTIONAL: Want[] = [
-  // The previous default (?npcllm=qwen), kept for comparison.
+  // Qwen3-1.7B, the default until 2026-10-28 (?npcllm=qwen), kept for comparison.
   {
     repo: 'unsloth/Qwen3-1.7B-GGUF',
     file: 'Qwen3-1.7B-Q4_K_M.gguf',
-    why: 'NPC dialogue (NPC_MODELS.fast + .default) and the Dungeon Director — one download, one resident copy',
+    why: 'dev-only ?npcllm=qwen comparison model',
   },
   {
     repo: 'unsloth/Qwen3-1.7B-GGUF',
@@ -476,7 +478,7 @@ async function main() {
   if (!checkOnly) console.log(`${fmt(downloaded).padStart(12)}  downloaded this run`);
   console.log('');
   console.log('Depot estimate: these bytes + ~24 MB dist + ~350 MB Electron runtime.');
-  console.log('LLM weights: LFM Open License v1.0 (LiquidAI/LFM3-1.7B-GGUF, licence shipped beside them). See THIRD_PARTY_NOTICES.md.');
+  console.log('LLM weights: Apache-2.0 (unsloth/Qwen3.5-2B-GGUF, licence shipped beside them). See THIRD_PARTY_NOTICES.md.');
 }
 
 main().catch((err) => {

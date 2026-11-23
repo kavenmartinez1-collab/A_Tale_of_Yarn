@@ -17,7 +17,8 @@
  *   6. speed — TTFT and decode rate vs the 20 s watchdog
  *
  * Run:  npx tsx scripts/test-npc-live.mts [--model=fast|qwen|large|abliterated|oldfast]
- *       [--temp=0.3] [--topk=50]   (override the model's sampling for A/B runs)
+ *       [--temp=0.7] [--topk=20] [--topp=0.8] [--pp=1.5] [--rp=1.0]
+ *       [--emptythink=0|1]   (override the model's sampling/template for A/B runs)
  *       npx tsx scripts/test-npc-live.mts --headed
  */
 import { chromium } from '@playwright/test';
@@ -30,11 +31,17 @@ const headed = process.argv.includes('--headed');
 // a model the panel does not currently default to.
 // `emptyThink` must mirror NPC_MODELS — it is not cosmetic. A non-thinking
 // checkpoint fed the empty <think> block emits EOS immediately (measured).
-type Sampling = { temperature: number; topP: number; topK?: number; repetitionPenalty: number; maxNewTokens: number };
+type Sampling = {
+  temperature: number; topP: number; topK?: number; repetitionPenalty: number;
+  presencePenalty?: number; maxNewTokens: number;
+};
 const MODELS: Record<string, { repo: string; file: string; emptyThink: boolean; sampling?: Sampling }> = {
   fast: {
-    repo: 'LiquidAI/LFM3-1.7B-GGUF', file: 'LFM3-1.7B-Q4_K_M.gguf', emptyThink: false,
-    sampling: { temperature: 0.3, topK: 50, topP: 0.95, repetitionPenalty: 1.1, maxNewTokens: 320 },
+    repo: 'unsloth/Qwen3.5-2B-GGUF', file: 'Qwen3.5-2B-Q4_K_M.gguf', emptyThink: true,
+    sampling: {
+      temperature: 0.7, topK: 20, topP: 0.8, repetitionPenalty: 1.0, presencePenalty: 1.5,
+      maxNewTokens: 320,
+    },
   },
   qwen: { repo: 'unsloth/Qwen3-1.7B-GGUF', file: 'Qwen3-1.7B-Q4_K_M.gguf', emptyThink: true },
   large: { repo: 'unsloth/Qwen3-4B-Instruct-2507-GGUF', file: 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf', emptyThink: false },
@@ -54,9 +61,13 @@ const sampling: Sampling = {
   ...(base.sampling ?? { temperature: 0.9, topP: 0.95, repetitionPenalty: 1.1, maxNewTokens: 320 }),
   ...(argNum('temp') !== undefined ? { temperature: argNum('temp')! } : {}),
   ...(argNum('topk') !== undefined ? { topK: argNum('topk')! } : {}),
+  ...(argNum('topp') !== undefined ? { topP: argNum('topp')! } : {}),
+  ...(argNum('pp') !== undefined ? { presencePenalty: argNum('pp')! } : {}),
+  ...(argNum('rp') !== undefined ? { repetitionPenalty: argNum('rp')! } : {}),
 };
-const model = { ...base, sampling };
-console.log(`model ${argModel}: ${base.repo}  sampling ${JSON.stringify(sampling)}`);
+const emptyThink = argNum('emptythink') !== undefined ? argNum('emptythink') === 1 : base.emptyThink;
+const model = { ...base, sampling, emptyThink };
+console.log(`model ${argModel}: ${base.repo}  sampling ${JSON.stringify(sampling)}  emptyThink ${emptyThink}`);
 
 /**
  * Conversation script. `expectAction` / `expectTrade` say what the control-JSON

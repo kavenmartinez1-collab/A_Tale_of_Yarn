@@ -45,13 +45,17 @@ saying "the blacksmith declined to discuss my divorce."
 
 ### 1. Model selection (strongest lever)
 
-**Update 2026-10-28:** the default is now stock **LiquidAI `LFM3-1.7B`**
-(`LiquidAI/LFM3-1.7B-GGUF`, LFM Open License v1.0; the game is free, see
-`AI_MODEL_LICENSING.md` §0) — also stock instruction-tuned, so this layer is
-unchanged in kind. It passes `scripts/test-npc-live.mts` (guardrail probes
-8/8, no over-blocking). One gap it showed is closed by a new deterministic
-check, `src/game/npc/persona-guard.ts`: a reply that talks about being an
-AI/model/prompt is replaced by an in-world reaction and kept out of history.
+**Update 2026-11-23:** the default is now stock **`Qwen3.5-2B`**
+(`unsloth/Qwen3.5-2B-GGUF`, Apache-2.0, see `AI_MODEL_LICENSING.md` §0) —
+stock instruction-tuned, so this layer is unchanged in kind. It passes
+`scripts/test-npc-live.mts` (guardrail probes 8/8, no over-blocking, 0
+false-positive action verbs). `src/game/npc/persona-guard.ts` (added
+2026-10-28, when an earlier 1.7B model named its vendor under a
+prompt-injection) stays: Qwen3.5-2B also steps out of character on that
+probe ("I am an AI assistant designed to follow safety guidelines…"), and
+the guard replaces the reply with an in-world reaction and keeps it out of
+history. The guard now also knows Qwen's own name for itself (Tongyi
+Qianwen).
 
 **Done — 2026-07-25.** The default became stock **`Qwen3-1.7B` Q4_K_M**
 (`unsloth/Qwen3-1.7B-GGUF`, Apache-2.0), replacing an **abliterated** build

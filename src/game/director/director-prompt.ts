@@ -7,7 +7,8 @@
  * validator. Few-shots are reused from DUNGEON_FIXTURES (guaranteed valid).
  *
  * All brief inputs are seed-derived (mix32) so the same (seed, dcx, dcz)
- * always produces the same prompt — with greedy decoding, the same dungeon.
+ * always produces the same prompt (the dungeon itself is sampled since the
+ * Qwen3.5-2B switch; see DIRECTOR_SAMPLING — specs are persisted per cell).
  */
 
 import { KNOWN_ITEMS, type DungeonTheme } from '../dungeon/dungeon-spec';
@@ -28,7 +29,7 @@ export interface DungeonBrief {
   dcz: number;
   /** Seed-derived theme suggestion (the model may keep or change it). */
   themeHint: DungeonTheme;
-  /** 2 seed-derived inspiration words for variety under greedy decoding. */
+  /** 2 seed-derived inspiration words, the main source of variety. */
   flavorWords: string[];
   /** Terrain height at the entrance (meters above sea level). */
   entranceHeight: number;

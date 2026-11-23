@@ -10,17 +10,28 @@
  * decides whether players ever see a generated dungeon. A model swap must
  * not quietly turn the Director into a fixture server.
  *
- * Run:  npx tsx scripts/test-director-live.mts [--model=lfm3|qwen] [--n=8]
+ * Run:  npx tsx scripts/test-director-live.mts [--model=qwen35|qwen] [--n=8]
+ *       [--temp=0.7] [--topk=20] [--topp=0.8] [--pp=0] [--emptythink=0|1]
+ *       (override DIRECTOR_SAMPLING / the template for A/B runs)
  */
 import { chromium } from '@playwright/test';
 
 const BASE = 'http://127.0.0.1:5173';
-const argModel = process.argv.find((a) => a.startsWith('--model='))?.split('=')[1] ?? 'lfm3';
+const argModel = process.argv.find((a) => a.startsWith('--model='))?.split('=')[1] ?? 'qwen35';
 const n = Number(process.argv.find((a) => a.startsWith('--n='))?.split('=')[1] ?? 8);
 const headed = process.argv.includes('--headed');
+const argNum = (k: string) => {
+  const v = process.argv.find((a) => a.startsWith(`--${k}=`))?.split('=')[1];
+  return v === undefined ? undefined : Number(v);
+};
+const override: Record<string, number> = {};
+for (const [k, key] of [['temp', 'temperature'], ['topk', 'topK'], ['topp', 'topP'], ['pp', 'presencePenalty']] as const) {
+  if (argNum(k) !== undefined) override[key] = argNum(k)!;
+}
+const emptyThink = argNum('emptythink') === undefined ? true : argNum('emptythink') === 1;
 
 const MODELS: Record<string, { repo: string; file: string }> = {
-  lfm3: { repo: 'LiquidAI/LFM3-1.7B-GGUF', file: 'LFM3-1.7B-Q4_K_M.gguf' },
+  qwen35: { repo: 'unsloth/Qwen3.5-2B-GGUF', file: 'Qwen3.5-2B-Q4_K_M.gguf' },
   qwen: { repo: 'unsloth/Qwen3-1.7B-GGUF', file: 'Qwen3-1.7B-Q4_K_M.gguf' },
 };
 const model = MODELS[argModel];
@@ -46,7 +57,7 @@ try {
   await page.addInitScript('globalThis.__name = (f) => f;');
   await page.goto(`${BASE}/__dirblank.html`);
 
-  const out = await page.evaluate(async ({ model, n }) => {
+  const out = await page.evaluate(async ({ model, n, override, emptyThink }) => {
     const log = (m: string) => console.log(`[director-live] ${m}`);
     const { createGGUFInferenceSession } = await import('/src/engine/gguf-session.ts');
     const { useLocalCache } = await import('/src/model/hf-hub.ts');
@@ -59,11 +70,11 @@ try {
     const ctx: any = session.forkKV !== undefined ? session.forkKV() : session;
     // Exactly director.ts's chat adapter options.
     const chat = async (messages: any[]) => {
-      const r = await ctx.chat(messages, DIRECTOR_SAMPLING, undefined,
-        { enableThinking: false, emptyThink: true, prefillChunk: 64 }).result;
+      const r = await ctx.chat(messages, { ...DIRECTOR_SAMPLING, ...override }, undefined,
+        { enableThinking: false, emptyThink, prefillChunk: 64 }).result;
       return { text: r.text, stopReason: r.stopReason };
     };
-    const rows: Array<{ seed: number; source: string; attempts: number; ms: number; name?: string; rooms?: number; errors?: string[] }> = [];
+    const rows: Array<{ seed: number; source: string; attempts: number; ms: number; name?: string; rooms?: number; errors?: string[]; json?: string }> = [];
     for (let i = 0; i < n; i++) {
       const seed = 1000 + i * 7919;
       const brief = buildBrief(seed, i - 3, 2 * i - 5, 4 + (i % 5) * 9);
@@ -76,19 +87,24 @@ try {
         name: r.source === 'llm' ? spec.name : undefined,
         rooms: r.source === 'llm' ? spec.rooms?.length : undefined,
         errors: r.errors,
+        json: r.source === 'llm' ? JSON.stringify(spec) : undefined,
       });
       log(`seed ${seed}: ${r.source} after ${r.attempts} attempt(s), ${(ms / 1000).toFixed(1)}s`
         + (r.source === 'llm' ? ` — "${spec.name}", ${spec.rooms?.length} rooms` : ` — ${r.errors?.join('; ')}`));
     }
     session.destroy();
     return rows;
-  }, { model, n });
+  }, { model, n, override, emptyThink });
 
   const llm = out.filter((r) => r.source === 'llm').length;
   const firstTry = out.filter((r) => r.source === 'llm' && r.attempts === 1).length;
   const avg = out.reduce((s, r) => s + r.ms, 0) / out.length / 1000;
-  console.log(`\nmodel ${argModel} (${model.repo})`);
+  console.log(`\nmodel ${argModel} (${model.repo})  overrides ${JSON.stringify(override)} emptyThink ${emptyThink}`);
   console.log(`valid specs from the model: ${llm}/${out.length} (first try ${firstTry}), avg ${avg.toFixed(1)}s per dungeon`);
+  // A few specs verbatim, so a model swap can be judged on content too.
+  for (const r of out.filter((x) => x.json !== undefined).slice(0, 3)) {
+    console.log(`\nspec (seed ${r.seed}): ${r.json!.length > 700 ? `${r.json!.slice(0, 700)}…` : r.json}`);
+  }
   ok = llm / out.length >= MIN_LLM_RATE;
   console.log(`RESULT: ${ok ? 'PASS' : 'FAIL'} (need >= ${MIN_LLM_RATE * 100}% valid)`);
 } finally {

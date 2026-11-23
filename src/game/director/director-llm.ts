@@ -20,9 +20,24 @@ export type DirectorChatFn = (
   messages: ChatMessage[],
 ) => Promise<{ text: string; stopReason: string }>;
 
-/** Greedy: deterministic per prompt + GPU-argmax fast path. Variety comes
- *  from the seed-derived brief, not sampling temperature. */
-export const DIRECTOR_SAMPLING = { temperature: 0, maxNewTokens: 600 } as const;
+/**
+ * Qwen3.5's recommended non-thinking preset (temperature 0.7, top-p 0.8,
+ * top-k 20), without its presence penalty: JSON repeats its keys and
+ * punctuation by design. Variety still comes mainly from the seed-derived
+ * brief; specs are persisted per cell, so nothing depends on a prompt always
+ * producing the same dungeon.
+ *
+ * Was greedy (temperature 0) for the 1.7B models. Measured with
+ * scripts/test-director-live.mts on Qwen3.5-2B (8 briefs): greedy 4/8 valid
+ * specs, greedy without the empty think block 4/8, temperature 0.3 6/8, this
+ * preset 6/8; with the bounded retry context below, this preset 14/16 (13 on
+ * the first try) while greedy stayed at 4/8. Greedy failures were mostly
+ * self-repeating JSON (duplicate room ids, self-loop edges) that a
+ * deterministic retry repeats verbatim.
+ */
+export const DIRECTOR_SAMPLING = {
+  temperature: 0.7, topP: 0.8, topK: 20, maxNewTokens: 600,
+} as const;
 
 export const MAX_RETRIES = 2;
 
@@ -40,7 +55,8 @@ export interface SpecGenResult {
 export async function generateSpecWithRetries(
   chat: DirectorChatFn, brief: DungeonBrief,
 ): Promise<SpecGenResult> {
-  const messages = buildDirectorMessages(brief);
+  const base = buildDirectorMessages(brief);
+  let messages = base;
   let lastErrors: string[] = [];
   let attempts = 0;
   let chatError = false;
@@ -76,8 +92,16 @@ export async function generateSpecWithRetries(
 
     lastErrors = errors;
     if (attempt <= MAX_RETRIES) {
-      messages.push({ role: 'assistant', content: text });
-      messages.push({ role: 'user', content: buildRetryMessage(errors) });
+      // Only the LATEST failed attempt goes back to the model. Each one can be
+      // a full maxNewTokens long, and stacking two of them pushed the third
+      // attempt past the engine's 2,047-token prompt limit (measured with
+      // Qwen3.5-2B: 2,055) — the chat call then throws, which reads as "model
+      // unavailable" and disables the Director for the rest of the session.
+      messages = [
+        ...base,
+        { role: 'assistant', content: text },
+        { role: 'user', content: buildRetryMessage(errors) },
+      ];
     }
   }
 

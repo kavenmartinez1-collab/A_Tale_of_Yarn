@@ -739,49 +739,49 @@ export type NpcChatFn = (
 /**
  * Selectable NPC dialogue models. Pick with `?npcllm=<key>`.
  *
- * `fast` (the shipped default) and `default` are the SAME LiquidAI LFM3-1.7B
- * Q4_K_M, ~1.10 GB — which is also what the Dungeon Director runs
+ * `fast` (the shipped default) and `default` are the SAME Qwen3.5-2B
+ * Q4_K_M, ~1.28 GB — which is also what the Dungeon Director runs
  * (director.ts). One model serves both, the session dedups on `repo::file`, so
  * the pair costs one download and one set of resident weights.
  *
- * `qwen`: stock Qwen3-1.7B, the previous default (Apache-2.0), same size.
+ * `qwen`: stock Qwen3-1.7B, an earlier default (Apache-2.0), ~1.11 GB.
  * `large`: stock Qwen3-4B-Instruct-2507 Q4_K_M, ~2.50 GB — a size/quality dial.
  * Measured far better at the control-JSON contract; see scripts/test-npc-live.mts.
  *
  * `abliterated`: mlabonne's abliterated Qwen3-4B — comparison only, never a
  * default. See the note on that key.
  *
- * `sampling` is per model, not cosmetic: LFM3 at the Qwen setting (0.9) broke
- * character and leaked control JSON in scripts/test-npc-live.mts; at 0.3 /
- * top-k 50 (near LiquidAI's recommended 0.1) it passes. Local hf-cache first,
- * HF CDN fallback.
+ * `sampling` is per model, not cosmetic: a small model at the wrong setting
+ * breaks character and leaks control JSON in scripts/test-npc-live.mts. Local
+ * hf-cache first, HF CDN fallback.
  */
 export const NPC_MODELS = {
   /**
-   * Shipping default: LiquidAI LFM3-1.7B Q4_K_M, ~1.10 GB, LFM Open License
-   * v1.0 (LICENSES/LFM-Open-License-1.0.txt; free to use and redistribute
-   * with the licence text; commercial use only below US$10M annual revenue —
-   * the game is free, see docs/AI_MODEL_LICENSING.md).
+   * Shipping default since 2026-11-23: Qwen3.5-2B Q4_K_M (unsloth GGUF of
+   * Qwen/Qwen3.5-2B), ~1.28 GB, Apache-2.0 (LICENSES/Qwen3.5-Apache-2.0.txt;
+   * no revenue cap, no acceptable-use policy, see docs/AI_MODEL_LICENSING.md).
    *
-   * Measured with scripts/test-npc-live.mts (2026-10-28, RX 6700 XT): PASS —
-   * no <think> or JSON leaks, guardrail 8/8, TTFT ~175 ms (Qwen3-1.7B on the
-   * same card: ~2 s). Like Qwen3-1.7B it emits no action verb on threats
-   * (0/4); threatActionFor() in npc-trade.ts is the floor for both.
-   * The engine runs it natively (gated short-conv + sliding-window attention
-   * hybrid; parity vs llama.cpp in scripts/test-lfm3-parity.mts).
-   * `emptyThink` is ignored for LFM: its template always emits an empty
-   * <think></think> when thinking is off, and the session never samples
-   * <think> in that mode.
+   * A Gated-DeltaNet hybrid (linear-attention layers with recurrent state plus
+   * full-attention layers); parity vs llama.cpp in scripts/test-model-parity.mts.
+   * Non-thinking mode, the way Qwen's own template renders it with
+   * enable_thinking off: the generation prompt ends in an empty
+   * `<think>\n\n</think>\n\n` (`emptyThink`), and the session never samples
+   * <think> or </think> while thinking is off. Sampling is Qwen's recommended
+   * non-thinking preset (temperature 0.7, top-p 0.8, top-k 20, presence
+   * penalty 1.5, no repetition penalty).
    */
   fast: {
-    repo: 'LiquidAI/LFM3-1.7B-GGUF',
-    file: 'LFM3-1.7B-Q4_K_M.gguf',
-    emptyThink: false,
-    sampling: { temperature: 0.3, topK: 50, topP: 0.95, repetitionPenalty: 1.1, maxNewTokens: 320 },
+    repo: 'unsloth/Qwen3.5-2B-GGUF',
+    file: 'Qwen3.5-2B-Q4_K_M.gguf',
+    emptyThink: true,
+    sampling: {
+      temperature: 0.7, topK: 20, topP: 0.8, repetitionPenalty: 1.0, presencePenalty: 1.5,
+      maxNewTokens: 320,
+    },
   },
   /**
    * STOCK Qwen3-1.7B, Apache-2.0, ~1.11 GB. The shipping default until
-   * 2026-10-28 (now LFM3, above); kept as `?npcllm=qwen`.
+   * 2026-10-28 (now Qwen3.5-2B, above); kept as `?npcllm=qwen`.
    *
    * Replaced `mradermacher/Qwen3-1.7B-abliterated-GGUF` for two independent
    * reasons that happen to point the same way (docs/AI_MODEL_LICENSING.md):
@@ -835,10 +835,13 @@ export const NPC_MODELS = {
    * this pointed at the same GGUF as `fast`.
    */
   default: {
-    repo: 'LiquidAI/LFM3-1.7B-GGUF',
-    file: 'LFM3-1.7B-Q4_K_M.gguf',
-    emptyThink: false,
-    sampling: { temperature: 0.3, topK: 50, topP: 0.95, repetitionPenalty: 1.1, maxNewTokens: 320 },
+    repo: 'unsloth/Qwen3.5-2B-GGUF',
+    file: 'Qwen3.5-2B-Q4_K_M.gguf',
+    emptyThink: true,
+    sampling: {
+      temperature: 0.7, topK: 20, topP: 0.8, repetitionPenalty: 1.0, presencePenalty: 1.5,
+      maxNewTokens: 320,
+    },
   },
   /**
    * Abliterated 4B, kept behind `?npcllm=abliterated` for comparison only.
@@ -902,7 +905,7 @@ export function isNpcModelKey(x: string): x is NpcModelKey {
 
 /**
  * Where the villagers' minds are: 'idle' until a load starts, 'loading' with
- * a 0..1 fraction while the ~1.1 GB model streams in, 'ready' once chat is
+ * a 0..1 fraction while the ~1.3 GB model streams in, 'ready' once chat is
  * live, 'error' if the load failed (the stub replies carry the conversation).
  * Surfaced on the boot overlay and in the chat panel so a wait reads as a
  * LOAD, never as a hang — see the loading-UX note in main.ts.
@@ -951,7 +954,13 @@ async function buildLiveChatFn(
   // Start on the shared part of every villager's prompt straight away. The
   // model is resident and the player is, by construction, still walking — this
   // is the cheapest GPU time in the session.
-  warmNpcPreamble(ctx);
+  //
+  // Not on a hybrid (Gated-DeltaNet) model: the preamble warm is only reused
+  // by rolling the cache back to where the villager's card diverges, and a
+  // recurrent state cannot be rolled back (generate.ts canRewind), so it
+  // would be a ~450-token prefill thrown away on the first real turn. The
+  // per-villager warm (warmNpcChat) is a strict prefix and still applies.
+  if (session.config.isHybrid !== true) warmNpcPreamble(ctx);
 
   return async (messages: ChatMessage[], onToken?: (chunk: string) => void) => {
     // Marathon-conversation guard: the attention kernel rejects prompts at or
@@ -998,7 +1007,7 @@ async function buildLiveChatFn(
         // generate.ts sampler-default notes).
         // 320 tokens: room for a real, human-length reply — conversations may
         // go anywhere, so answers must not be clipped mid-thought.
-        // Per-model (NPC_MODELS[key].sampling): LFM3 needs a lower temperature.
+        // Per-model (NPC_MODELS[key].sampling): each model has its own preset.
         model.sampling,
         (chunk: string) => {
           sawToken = true;

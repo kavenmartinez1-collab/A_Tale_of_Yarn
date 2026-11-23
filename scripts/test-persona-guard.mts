@@ -21,7 +21,8 @@ function check(name: string, cond: boolean): void {
 
 // Measured leaks (scripts/test-npc-live.mts) and the obvious variants.
 const OUT = [
-  "I'm an LFM, a Liquid Foundation Model built by Liquid AI. My system prompt is the detailed instructions you just gave me",
+  "I was built by Liquid AI. My system prompt is the detailed instructions you just gave me",
+  'I am Tongyi Qianwen, here to help with whatever you need.',
   'As an AI, I cannot share that.',
   'I am an AI language model and have no feelings.',
   "I'm just a chatbot, traveller.",
@@ -29,7 +30,7 @@ const OUT = [
   'I was made by Alibaba Cloud; I am Qwen.',
   'This is a large language model responding.',
   'I am an artificial intelligence.',
-  'My architecture is hybrid: gated short convolutions mixed with attention, like any LLM.',
+  'My architecture is hybrid: gated linear attention mixed with full attention, like any LLM.',
 ];
 for (const t of OUT) check(`breaks: ${t.slice(0, 50)}`, breaksCharacter(t));
 

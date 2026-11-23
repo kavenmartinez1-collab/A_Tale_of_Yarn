@@ -258,7 +258,7 @@ export function threatActionFor(
 
 /**
  * JSON.parse, then a narrow repair for what small models actually emit:
- * unquoted keys (`{action: "invite_home"}`, measured from LFM3-1.7B) and
+ * unquoted keys (`{action: "invite_home"}`, measured from a 1.7B model) and
  * single quotes. Anything still unparseable stays prose. The result goes
  * through the same validators as strict JSON (known verbs, catalog items),
  * so leniency here can never invent an action the game would not accept.
