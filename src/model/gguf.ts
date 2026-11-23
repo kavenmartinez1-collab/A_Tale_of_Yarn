@@ -203,7 +203,7 @@ class HeaderCursor {
    * null (caller falls back to str()). Vocabulary arrays hold ~100k-250k
    * strings; awaiting each one and building a TextDecoder per string cost
    * 2 x 283 ms of main-thread time on the game's boot (scripts/perf-harness.mjs
-   * --llm, LFM3 GGUF). Same bytes, same decoder settings — identical values.
+   * --llm, the NPC GGUF). Same bytes, same decoder settings — identical values.
    */
   strIfBuffered(): string | null {
     if (this.pos + 8 > this.bytes.byteLength) return null;

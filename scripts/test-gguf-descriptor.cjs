@@ -65,7 +65,6 @@ function coverageCheck(label, file, desc) {
     'moeRouter', 'moeExpertGate', 'moeExpertUp', 'moeExpertDown',
     'moeSharedGateProj', 'moeSharedUpProj', 'moeSharedDownProj', 'moeSharedExpertGate',
     'pleInpGate', 'pleProj', 'plePostNorm',
-    'shortConvInProj', 'shortConvWeight', 'shortConvOutProj', 'attnHeadGate',
   ];
   const located = new Set();
   for (const role of globalRoles) {
@@ -223,57 +222,29 @@ function coverageCheck(label, file, desc) {
 
     coverageCheck('E4B', f4, d4);
   });
-  await section('LFM3', async () => {
-    // ── LFM3 1.7B (short conv + SWA + global attention) ──────────────────
-    // The Artifex Web model folder the installer's webgpu pack fills.
-    // Artifex Web's installer folder, or the game's vendored one.
-    const pL = [
-      path.join(__dirname, '../models/lfm3-1.7b/LFM3-1.7B-Q4_K_M.gguf'),
-      path.join(__dirname, '../models/LiquidAI--LFM3-1.7B-GGUF/LFM3-1.7B-Q4_K_M.gguf'),
-    ].find((p) => require('node:fs').existsSync(p)) ?? path.join(__dirname, '../models/lfm3-1.7b/LFM3-1.7B-Q4_K_M.gguf');
-    const fL = await parseFile(pL);
-    const dL = descriptorFromGGUF(fL);
-    eq(dL.modelType, 'lfm3', 'LFM3 modelType');
-    eq(dL.numLayers, 24, 'LFM3 numLayers');
-    eq(dL.hiddenSize, 2048, 'LFM3 hiddenSize');
-    eq(dL.intermediateSize, 7680, 'LFM3 ffnDim');
-    eq(dL.numAttentionHeads, 16, 'LFM3 heads');
-    eq(dL.numKVHeads, 4, 'LFM3 kvHeads');
-    eq(dL.headDim, 128, 'LFM3 headDim');
-    eq(dL.vocabSize, 128000, 'LFM3 vocabSize (padded)');
-    eq(dL.tieWordEmbeddings, true, 'LFM3 tied');
-    eq(dL.isHybrid, false, 'LFM3 isHybrid (DeltaNet flag)');
-    eq(dL.attnHeadGate, true, 'LFM3 attnHeadGate');
-    eq(dL.shortConvKernel, 7, 'LFM3 shortConvKernel');
-    eq(dL.partialRotaryFactor, undefined, 'LFM3 partialRotary');
-    check(Math.abs(dL.rmsNormEps - 1e-5) < 1e-9, 'LFM3 rmsNormEps 1e-5');
-    const SWA_L = new Set([4, 8, 12, 16, 20]);
-    const GLOBAL_L = new Set([2, 6, 10, 14, 18, 22]);
-    const freqL = new Float32Array(await readTensorBytes(pL, fL, 'rope_freqs.weight'));
-    applyRopeFreqFactors(dL, freqL);
+  await section('Qwen3.5-2B', async () => {
+    // ── The game's NPC + Director model (Gated-DeltaNet hybrid) ─────────
+    // models/<org>--<repo>/, as scripts/fetch-weights.mts lays it out.
+    const p2 = path.join(__dirname, '../models/unsloth--Qwen3.5-2B-GGUF/Qwen3.5-2B-Q4_K_M.gguf');
+    const f2 = await parseFile(p2);
+    const d2 = descriptorFromGGUF(f2);
+    eq(ggufArchitecture(f2), 'qwen35', '2B arch');
+    eq(d2.modelType, 'qwen3_5', '2B modelType');
+    eq(d2.numLayers, 24, '2B numLayers');
+    eq(d2.hiddenSize, 2048, '2B hiddenSize');
+    eq(d2.intermediateSize, 6144, '2B ffnDim');
+    eq(d2.numAttentionHeads, 8, '2B heads');
+    eq(d2.numKVHeads, 2, '2B kvHeads');
+    eq(d2.headDim, 256, '2B headDim');
+    eq(d2.vocabSize, 248320, '2B vocabSize');
+    eq(d2.tieWordEmbeddings, true, '2B tied');
+    eq(d2.isHybrid, true, '2B isHybrid');
+    eq(d2.partialRotaryFactor, 0.25, '2B partialRotary');
+    // Every 4th layer is full attention, the rest Gated DeltaNet.
     for (let l = 0; l < 24; l++) {
-      const layer = dL.layers[l];
-      const kind = SWA_L.has(l) ? 'sliding_attention' : GLOBAL_L.has(l) ? 'full_attention' : 'short_conv';
-      eq(layer.kind, kind, `LFM3 layer ${l} kind`);
-      eq(layer.slidingWindow, kind === 'sliding_attention' ? 256 : undefined, `LFM3 layer ${l} window`);
-      eq(layer.rope?.theta, kind === 'short_conv' ? undefined : kind === 'sliding_attention' ? 10000 : 1000000,
-        `LFM3 layer ${l} rope theta`);
-      // Global layers: rope_freqs keeps pairs 0..31 rotating (partial NEOX)
-      eq(layer.rope?.rotatedPairs, kind === 'full_attention' ? 32 : undefined, `LFM3 layer ${l} rotatedPairs`);
+      eq(d2.layers[l].kind, l % 4 === 3 ? 'full_attention' : 'linear_attention', `2B layer ${l} kind`);
     }
-    const locL = createGGUFLocator(fL.tensors, ggufArchitecture(fL));
-    eq(locL.locate('postAttnNorm', 2), 'blk.2.ffn_norm.weight', 'LFM3 postAttnNorm (pre-FFN)');
-    eq(locL.locate('attnPostNorm', 2), 'blk.2.post_attention_norm.weight', 'LFM3 attnPostNorm (sandwich)');
-    eq(locL.locate('ffnPostNorm', 0), 'blk.0.post_ffw_norm.weight', 'LFM3 ffnPostNorm');
-    eq(locL.locate('shortConvInProj', 0), 'blk.0.shortconv.in_proj.weight', 'LFM3 shortConvInProj');
-    eq(locL.locate('shortConvWeight', 0), 'blk.0.shortconv.conv.weight', 'LFM3 shortConvWeight');
-    eq(locL.locate('shortConvOutProj', 0), 'blk.0.shortconv.out_proj.weight', 'LFM3 shortConvOutProj');
-    eq(locL.locate('attnHeadGate', 2), 'blk.2.attn_gate.weight', 'LFM3 attnHeadGate');
-    eq(locL.locate('lmHead'), 'token_embd.weight', 'LFM3 lmHead tied');
-    eq(fL.tensors.get('blk.0.shortconv.in_proj.weight').ne, [2048, 6144], 'LFM3 in_proj shape');
-    eq(fL.tensors.get('blk.0.shortconv.conv.weight').ne, [7, 2048], 'LFM3 conv shape');
-    eq(fL.tensors.get('blk.2.attn_gate.weight').ne, [2048, 16], 'LFM3 attn_gate shape');
-    coverageCheck('LFM3', fL, dL);
+    coverageCheck('Qwen3.5-2B', f2, d2);
   });
 
   if (failures > 0) {

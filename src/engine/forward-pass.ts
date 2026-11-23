@@ -62,7 +62,6 @@ import hadamardWGSL from '../shaders/hadamard.wgsl?raw';
 import dequantQ4BF16WGSL from '../shaders/dequant_q4_bf16.wgsl?raw';
 import matmulGgufWGSL from '../shaders/matmul_gguf.wgsl?raw';
 import repackQ2kWGSL from '../shaders/repack_q2k.wgsl?raw';
-import shortConvWGSL from '../shaders/short_conv.wgsl?raw';
 import { GGML_TYPES, ggmlTypeTraits } from '../model/gguf';
 import { dequantGGML, GGUF_GPU_LAYOUT } from '../model/gguf-dequant';
 import { topKSoftmax, MOE_MAX_TOKENS, type MoEBackend } from './moe-cpu';
@@ -169,16 +168,6 @@ export interface LayerWeights {
   linearInProjB_gg?: GGUFWeight;
   linearInProjZ_gg?: GGUFWeight;
   linearOutProj_gg?: GGUFWeight;
-
-  // LFM3 gated short conv (layer kind 'short_conv')
-  shortConvInProj?: GPUBuffer;      // [3*hidden, hidden] → B | C | X
-  shortConvInProj_gg?: GGUFWeight;
-  shortConvWeight?: GPUBuffer;      // [hidden, kernel] f32 depthwise taps
-  shortConvOutProj?: GPUBuffer;     // [hidden, hidden]
-  shortConvOutProj_gg?: GGUFWeight;
-  // LFM3 per-head attention gate: [num_heads, hidden]
-  attnHeadGate?: GPUBuffer;
-  attnHeadGate_gg?: GGUFWeight;
 
   // Linear attention (Gated DeltaNet) weights — only for hybrid models
   linearInProjQKV?: GPUBuffer;
@@ -332,6 +321,11 @@ export interface KVCache {
   compressed?: CompressedKVData;
   /** SSM state for hybrid models with linear attention layers */
   ssmState?: SSMState;
+  /** A saved copy of `ssmState` at `position` (checkpointSSM). Lets a hybrid
+   *  model roll back to a stable prompt prefix (e.g. the end of a system
+   *  prompt) — the KV rows below `position` stay valid as for any rewind.
+   *  Owned by this cache; allocated on first checkpoint. */
+  ssmCheckpoint?: { hidden: GPUBuffer[]; conv: GPUBuffer[]; position: number };
   /** MTP head's own 1-layer KV cache (Qwen3.5/3.6 kv_only_nextn). Allocated
    *  only when the engine has an MTP head. Advanced/rolled-back by the spec
    *  drafter in lockstep with `position` (mtpDraft writes at mtpPosition). */
@@ -423,6 +417,14 @@ export interface ForwardPassEngine {
   /** Spec decode: restore SSM state from the last snapshot. KV rollback is
    *  caller-side via kvCache.position. */
   restoreSSMState(kvCache: KVCache): void;
+
+  /** Save this cache's SSM state at its current position into its own
+   *  checkpoint (kvCache.ssmCheckpoint). No-op for non-hybrid models. Queue
+   *  order makes it capture the state after every forward() already issued. */
+  checkpointSSM(kvCache: KVCache): void;
+  /** Restore the checkpoint and set kvCache.position to where it was taken.
+   *  False (and nothing changed) when the cache has no checkpoint. */
+  restoreSSMCheckpoint(kvCache: KVCache): boolean;
 
   /** True when the model carries an MTP / next-token-prediction head and it
    *  was loaded (?spec=1 / ?mtpHead=1). The speculative drafter in generate.ts
@@ -906,16 +908,6 @@ export function createForwardPassEngine(
     ? createComputePipeline(device, elementwiseWGSL, 'decay_compute', 'decay') : null;
   const l2NormPipeline = isHybrid
     ? createComputePipeline(device, l2normWGSL, 'l2_normalize', 'l2-norm') : null;
-  // LFM3: gated short conv (whole chunk per dispatch) + per-head attn gate.
-  const hasShortConv = config.layers.some(d => d.kind === 'short_conv');
-  const shortConvK = config.shortConvKernel ?? 0;
-  if (hasShortConv && !(shortConvK >= 2 && shortConvK <= 16)) {
-    throw new Error(`[forward-pass] short conv kernel ${shortConvK} outside 2..16 (short_conv.wgsl MAX_K)`);
-  }
-  const shortConvPipeline = hasShortConv
-    ? createComputePipeline(device, shortConvWGSL, 'short_conv', 'short-conv') : null;
-  const headGatePipeline = config.attnHeadGate
-    ? createComputePipeline(device, elementwiseWGSL, 'head_gate_sigmoid', 'head-gate-sigmoid') : null;
   // Fusion lever F7: attn output gate a*sigmoid(b) in one dispatch. A/B: ?fuseGate=0.
   const gateSigmoidPipeline = config.attnOutputGate && gemvSearch?.get('fuseGate') !== '0'
     ? createComputePipeline(device, elementwiseWGSL, 'gate_sigmoid', 'gate-sigmoid') : null;
@@ -1254,15 +1246,6 @@ export function createForwardPassEngine(
   const tokenIdBuf = createStorageBuffer(device, null, MAX_PREFILL * 4, 'token-ids', true);
   // Small buffer for extracting last token's hidden state (for LM head after batch prefill)
   const lastHiddenBuf = createStorageBuffer(device, null, H * 4, 'last-hidden', true);
-
-  // LFM3 short conv: in_proj output [B | C | X] and the gated conv output.
-  const convProjBuf = hasShortConv
-    ? createStorageBuffer(device, null, MAX_PREFILL * 3 * H * 4, 'shortconv-bcx', true) : null;
-  const convOutBuf = hasShortConv
-    ? createStorageBuffer(device, null, MAX_PREFILL * H * 4, 'shortconv-out', true) : null;
-  // LFM3 per-head attention gate logits [seq, nHeads].
-  const headGateBuf = config.attnHeadGate
-    ? createStorageBuffer(device, null, MAX_PREFILL * nHeads * 4, 'attn-head-gate', true) : null;
 
   // DeepStack feature staging buffers — one per tap layer, lazily created.
   const dsFeatBufs: GPUBuffer[] = [];
@@ -2389,29 +2372,7 @@ export function createForwardPassEngine(
         dispatchHadamard(ffnTempBuf, normedBuf, seqLen, H, 0, `L${l}-had1`);
       }
 
-      if (config.layers[l].kind === 'short_conv') {
-        // ── LFM3 GATED SHORT CONV ────────────────────────────────────
-        // in_proj → [B | C | X]; y = C ⊙ conv(B ⊙ X) over the carried
-        // (K-1)-token state; out_proj → attnProjBuf (shared residual path).
-        const convState = kvCache.ssmState?.convStates[kvCache.ssmState.layerToSSMIndex[l]];
-        if (!convState || !shortConvPipeline || !lw.shortConvWeight) {
-          throw new Error(`[forward-pass] L${l}: short_conv layer without conv state/weights`);
-        }
-        dispatchProjection(normedBuf, lw, 'shortConvInProj', convProjBuf!, seqLen, 3 * H, H, `L${l}-sc-in`);
-        await maybeAudit(l, convProjBuf!, `L${l}-sc-in-out`, seqLen, 3 * H);
-        const scParams = getCachedUniform(
-          new Uint32Array([seqLen, H, shortConvK, 0]), `L${l}-sc-p`);
-        const scBG = cachedBindGroup(shortConvPipeline, 0, [
-          { binding: 0, resource: { buffer: convProjBuf! } },
-          { binding: 1, resource: { buffer: lw.shortConvWeight } },
-          { binding: 2, resource: { buffer: convState } },
-          { binding: 3, resource: { buffer: convOutBuf! } },
-          { binding: 4, resource: { buffer: scParams } },
-        ], `L${l}-sc`);
-        bd(shortConvPipeline, [scBG], [workgroupCount(H, 256)], `L${l}-sc`);
-        dispatchProjection(convOutBuf!, lw, 'shortConvOutProj', attnProjBuf, seqLen, H, H, `L${l}-sc-out`);
-        await maybeAudit(l, attnProjBuf, `L${l}-sc-out-out`, seqLen, H);
-      } else if (isLinearLayer && kvCache.ssmState) {
+      if (isLinearLayer && kvCache.ssmState) {
         // ── GATED DELTANET LINEAR ATTENTION ──────────────────────────
         const ssmIdx = kvCache.ssmState.layerToSSMIndex[l];
         const hBuf = kvCache.ssmState.hiddenStates[ssmIdx];
@@ -2979,11 +2940,6 @@ export function createForwardPassEngine(
           dispatchProjection(normedBuf, lw, 'vProj', vBuf, seqLen, kvDimL, H, `L${l}-v`);
           await maybeAudit(l, vBuf, `L${l}-v-out`, seqLen, kvDimL);
         }
-        // LFM3 per-head gate logits, from the same normed input as Q/K/V
-        // (projected now, while normedBuf is known intact).
-        if (config.attnHeadGate) {
-          dispatchProjection(normedBuf, lw, 'attnHeadGate', headGateBuf!, seqLen, nHeads, H, `L${l}-hgate`);
-        }
 
         // Per-head RMSNorm on Q and K (q_norm, k_norm) — Qwen3.5, Gemma 4.
         // Weight convention follows useResidualWeight (same as input layernorm).
@@ -3190,12 +3146,7 @@ export function createForwardPassEngine(
         // reads it from there. Skipped under useHadamard (it scratches
         // ffnTempBuf) — that path keeps the legacy 3-command sequence.
         let attnGated = attnOutBuf;
-        if (config.attnHeadGate && headGatePipeline) {
-          // LFM3: attn_out[s, h, :] *= sigmoid(gate[s, h]) → ffnTempBuf
-          dispatchElementwise(headGatePipeline, attnOutBuf, ffnTempBuf, seqLen * nHeads * dHeadL,
-            `L${l}-attn-hgate`, headGateBuf!, dHeadL);
-          attnGated = ffnTempBuf;
-        } else if (config.attnOutputGate && attnGateBuf && gateSigmoidPipeline && !useHadamard) {
+        if (config.attnOutputGate && attnGateBuf && gateSigmoidPipeline && !useHadamard) {
           const gateDim = seqLen * nHeads * dHead;
           dispatchElementwise(gateSigmoidPipeline, attnOutBuf, ffnTempBuf, gateDim, `L${l}-attn-gate`, attnGateBuf);
           attnGated = ffnTempBuf;
@@ -3889,21 +3840,8 @@ export function createForwardPassEngine(
       mtpValues = createStorageBuffer(device, null, maxSeqLen * kvDim * 4, 'mtp-kv-v', true);
     }
 
-    // LFM3 short conv: one [K-1, hidden] conv state per conv layer, carried
-    // in ssmState.convStates (so spec-decode snapshot/restore covers it).
-    // These models have no DeltaNet layers, so hiddenStates stays empty.
-    let ssmState: SSMState | undefined;
-    if (hasShortConv) {
-      const convStates: GPUBuffer[] = [];
-      const layerToSSMIndex: number[] = new Array(L).fill(-1);
-      for (let l = 0; l < L; l++) {
-        if (config.layers[l].kind !== 'short_conv') continue;
-        layerToSSMIndex[l] = convStates.length;
-        convStates.push(createStorageBuffer(device, null, (shortConvK - 1) * H * 4, `shortconv-state-${l}`, true));
-      }
-      ssmState = { hiddenStates: [], convStates, layerToSSMIndex };
-    }
     // For hybrid models, allocate SSM state for linear attention layers
+    let ssmState: SSMState | undefined;
     if (config.isHybrid) {
       const hiddenStates: GPUBuffer[] = [];
       const convStates: GPUBuffer[] = [];
@@ -3941,9 +3879,8 @@ export function createForwardPassEngine(
       const values: GPUBuffer[] = [];
       for (let l = 0; l < L; l++) {
         // For hybrid models, only full attention layers need KV cache
-        if ((config.isHybrid && config.layers[l].kind === 'linear_attention')
-            || config.layers[l].kind === 'short_conv') {
-          keys.push(null as any);   // placeholder — not used for linear/conv layers
+        if (config.isHybrid && config.layers[l].kind === 'linear_attention') {
+          keys.push(null as any);   // placeholder — not used for linear layers
           values.push(null as any);
         } else if (config.layers[l].kvSourceLayer !== undefined) {
           // KV sharing (Gemma 4 layers 24-41): alias the source layer's
@@ -3983,8 +3920,7 @@ export function createForwardPassEngine(
     // the 27B's 64 layers are linear).
     let tqLayers = 0;
     for (let l = 0; l < L; l++) {
-      const usesKV = config.layers[l].kind !== 'linear_attention'
-        && config.layers[l].kind !== 'short_conv';
+      const usesKV = config.layers[l].kind !== 'linear_attention';
       const sz = (bytes: number) => usesKV ? bytes : 4;
       quantizedK.push(createStorageBuffer(device, null, sz(quantBufSize), `tq-qk-${l}`, false));
       quantizedV.push(createStorageBuffer(device, null, sz(quantBufSize), `tq-qv-${l}`, false));
@@ -4047,6 +3983,10 @@ export function createForwardPassEngine(
       for (const b of kvCache.ssmState.hiddenStates) b.destroy();
       for (const b of kvCache.ssmState.convStates) b.destroy();
     }
+    if (kvCache.ssmCheckpoint) {
+      for (const b of [...kvCache.ssmCheckpoint.hidden, ...kvCache.ssmCheckpoint.conv]) b.destroy();
+      kvCache.ssmCheckpoint = undefined;
+    }
     if (kvCache.mtpKeys) kvCache.mtpKeys.destroy();
     if (kvCache.mtpValues) kvCache.mtpValues.destroy();
     if (ssmShadow) {
@@ -4089,6 +4029,35 @@ export function createForwardPassEngine(
     if (!ssm) return;
     if (!ssmShadow) throw new Error('[ssm] restoreSSMState called before snapshotSSMState');
     copySSM(ssmShadow.hidden, ssmShadow.conv, ssm.hiddenStates, ssm.convStates);
+  }
+
+  // ── Per-cache SSM checkpoint (prefix rollback for hybrid models) ────────
+  // Unlike the spec-decode shadow above (one per engine), each cache owns its
+  // checkpoint, so KV forks (NPC chat, Director) never overwrite each other's.
+  function checkpointSSM(kvCache: KVCache): void {
+    const ssm = kvCache.ssmState;
+    if (!ssm) return;
+    if (!kvCache.ssmCheckpoint) {
+      const mk = (b: GPUBuffer, label: string) => device.createBuffer({
+        size: b.size, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, label,
+      });
+      kvCache.ssmCheckpoint = {
+        hidden: ssm.hiddenStates.map((b, i) => mk(b, `ssm-ckpt-h-${i}`)),
+        conv: ssm.convStates.map((b, i) => mk(b, `ssm-ckpt-c-${i}`)),
+        position: 0,
+      };
+    }
+    copySSM(ssm.hiddenStates, ssm.convStates, kvCache.ssmCheckpoint.hidden, kvCache.ssmCheckpoint.conv);
+    kvCache.ssmCheckpoint.position = kvCache.position;
+  }
+
+  function restoreSSMCheckpoint(kvCache: KVCache): boolean {
+    const ssm = kvCache.ssmState;
+    const ck = kvCache.ssmCheckpoint;
+    if (!ssm || !ck) return false;
+    copySSM(ck.hidden, ck.conv, ssm.hiddenStates, ssm.convStates);
+    kvCache.position = ck.position;
+    return true;
   }
 
   /**
@@ -4229,5 +4198,8 @@ export function createForwardPassEngine(
     return { logits: logitsBuf };
   }
 
-  return { forward, createKVCache, destroyKVCache, snapshotSSMState, restoreSSMState, hasMtpHead, mtpDraft, config, maxPrefillRows: MAX_PREFILL };
+  return {
+    forward, createKVCache, destroyKVCache, snapshotSSMState, restoreSSMState,
+    checkpointSSM, restoreSSMCheckpoint, hasMtpHead, mtpDraft, config, maxPrefillRows: MAX_PREFILL,
+  };
 }

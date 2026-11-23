@@ -35,6 +35,13 @@ export interface SamplingConfig {
   /** Repetition penalty. 1.0 = disabled. Default: 1.0 */
   repetitionPenalty?: number;
   /**
+   * Presence penalty (OpenAI / llama.cpp semantics): subtracted once from the
+   * logit of every token already generated in this reply, however often it
+   * appeared. 0 = disabled. Default: 0. Qwen3.5's recommended non-thinking
+   * setting is 1.5 with repetitionPenalty 1.0.
+   */
+  presencePenalty?: number;
+  /**
    * Min-p: keep tokens whose prob >= topProb * minP. Dynamic nucleus —
    * adapts to model confidence. 2026 canonical setting is 0.02-0.1.
    * 0 = disabled. Default: 0.05.
@@ -113,10 +120,14 @@ export interface KVSessionState {
   capacity: number;
   /** TurboQuant flag the current cache was created with. */
   compressed: boolean;
+  /** Hybrid models only: the prompt prefix whose SSM state is saved in
+   *  kvCache.ssmCheckpoint (see GenerateOptions.ssmCheckpointAt). Null when
+   *  there is none. Cleared whenever the cache is recreated. */
+  ssmCheckpointIds?: number[] | null;
 }
 
 export function createKVSession(capacity: number): KVSessionState {
-  return { kvCache: null, cachedTokenIds: [], capacity, compressed: false };
+  return { kvCache: null, cachedTokenIds: [], capacity, compressed: false, ssmCheckpointIds: null };
 }
 
 export interface GenerateOptions {
@@ -129,6 +140,16 @@ export interface GenerateOptions {
    *  set/restore-around-await pattern, which leaked the small chunk into
    *  concurrent generations (NPC chat prefill ran 4x slower). */
   prefillChunk?: number;
+  /**
+   * Hybrid (SSM) models with a kvSession: save the recurrent state once the
+   * prefill reaches this many prompt tokens — a prefix the caller expects to
+   * recur, such as the end of the system prompt. A hybrid cannot rewind to an
+   * arbitrary point, so without it every prompt that diverges from the cache
+   * (a chat whose oldest turns were trimmed) pays a full re-prefill; with it,
+   * any later prompt that starts with the same prefix restores the saved state
+   * and prefills only what follows. Ignored for dense models (they rewind).
+   */
+  ssmCheckpointAt?: number;
 }
 
 // ── Multimodal prompts ───────────────────────────────────────────────────
@@ -343,6 +364,14 @@ function sampleFromLogits(
           logits[id] *= scaledPenalty;
         }
       }
+    }
+  }
+
+  // Presence penalty — flat, once per distinct generated token.
+  if (config.presencePenalty !== 0) {
+    const seen = new Set(generatedIds);
+    for (const id of seen) {
+      if (id < vocabSize) logits[id] -= config.presencePenalty;
     }
   }
 
@@ -573,6 +602,7 @@ export function generate(
     topP: sampling.topP ?? 0.9,
     maxNewTokens: sampling.maxNewTokens ?? 512,
     repetitionPenalty: sampling.repetitionPenalty ?? 1.0,
+    presencePenalty: sampling.presencePenalty ?? 0,
     // Sampler defaults are NEUTRAL (off) — the caller (UI / preset layer) is
     // responsible for opting into any aggressive sampler. Aggressive defaults
     // here were previously invisible from the chat UI and caused word-chain
@@ -608,7 +638,7 @@ export function generate(
 
     // ── GPU argmax eligibility (lever: 4-byte readback instead of 600 KB) ──
     // Only when sampling is exactly the greedy strict-`>` scan with NO logit
-    // mutation beforehand: temp 0, no repetition penalty, no DRY, and no
+    // mutation beforehand: temp 0, no repetition/presence penalty, no DRY, and no
     // debug probe that needs the full logits on the CPU. Toggle ?gpuArgmax=0.
     const __argmaxSearch = typeof window === 'undefined'
       ? null : new URLSearchParams(window.location.search);
@@ -616,6 +646,7 @@ export function generate(
       __argmaxSearch?.get('gpuArgmax') !== '0'
       && config.temperature === 0
       && config.repetitionPenalty === 1.0
+      && config.presencePenalty === 0
       && config.dryMultiplier <= 0
       && !parityLog
       && !((globalThis as any).__DEBUG_LOGIT_TOPK__ > 0);
@@ -740,9 +771,28 @@ export function generate(
         : prefixLen === sess.cachedTokenIds.length ? prefixLen        // extension
         : canRewind ? prefixLen                                       // rewind
         : 0;                                                          // must reset
-      const usable = Math.min(keep, promptTokens - 1);
       const hadTokens = sess.cachedTokenIds.length;
-      if (usable > 0) {
+      // The one-token step-back above is itself a rewind. A model that cannot
+      // rewind (a hybrid's SSM state already holds that token) must start
+      // over instead of re-feeding it — e.g. the same warm prompt sent twice.
+      const stepBack = Math.min(keep, promptTokens - 1);
+      const usable = stepBack < hadTokens && !canRewind ? 0 : stepBack;
+      // Hybrid fallback: a saved state at a longer shared prefix beats what
+      // plain reuse can keep (see GenerateOptions.ssmCheckpointAt).
+      const ck = sess.ssmCheckpointIds ?? null;
+      const useCheckpoint = cacheOk && ck !== null
+        && engine.config.isHybrid === true && !engine.hasMtpHead && !hasImages
+        && ck.length > usable && ck.length <= promptTokens - 1
+        && sess.kvCache!.ssmCheckpoint?.position === ck.length
+        && ck.every((id, i) => promptIds[i] === id);
+      if (useCheckpoint) {
+        kvCache = sess.kvCache!;
+        engine.restoreSSMCheckpoint(kvCache);
+        sess.cachedTokenIds = ck.slice();
+        prefillIds = promptIds.slice(ck.length);
+        console.log(`[Generate] SSM checkpoint restore: ${hadTokens} cached -> kept ${ck.length}, `
+          + `prefilling ${promptTokens - ck.length} new`);
+      } else if (usable > 0) {
         kvCache = sess.kvCache!;
         if (usable < hadTokens) {
           kvCache.position = usable;
@@ -759,6 +809,7 @@ export function generate(
         sess.kvCache = kvCache;
         sess.compressed = config.useCompressedKV;
         sess.cachedTokenIds = [];
+        sess.ssmCheckpointIds = null;
         if (hadTokens > 0) {
           console.log(`[Generate] KV reset: prefix match ${prefixLen}/${hadTokens} — full prefill`);
         }
@@ -878,11 +929,18 @@ export function generate(
     let prefillAborted = false;
     /** Tokens of `prefillIds` actually forwarded, so an abort can keep them. */
     let prefilledSoFar = 0;
+    // SSM checkpoint target, as an index into prefillIds (text-only prompts:
+    // a single segment). A chunk is cut to end exactly there.
+    const ckAt = opts?.ssmCheckpointAt;
+    const ckStart = promptTokens - prefillIds.length;
+    const ckCut = sess !== null && isHybrid && !hasImages && !engine.hasMtpHead
+      && ckAt !== undefined && ckAt > ckStart && ckAt <= promptTokens
+      ? ckAt - ckStart : -1;
     for (let s = 0; s < segments.length && !prefillAborted; s++) {
       const seg = segments[s];
-      for (let i = 0; i < seg.ids.length; i += PREFILL_CHUNK) {
+      for (let i = 0; i < seg.ids.length;) {
         if (aborted) { prefillAborted = true; break; }
-        const chunkEnd = Math.min(i + PREFILL_CHUNK, seg.ids.length);
+        const chunkEnd = Math.min(i + PREFILL_CHUNK, seg.ids.length, i < ckCut ? ckCut : Infinity);
         const chunk = new Uint32Array(seg.ids.slice(i, chunkEnd));
         const isLastChunk = s === segments.length - 1 && chunkEnd >= seg.ids.length;
         if (probeEnabled && isLastChunk) {
@@ -907,6 +965,11 @@ export function generate(
         const __posBefore = kvCache.position;
         prefillOutput = await engine.forward(chunk, kvCache, fwdOpts);
         prefilledSoFar += chunk.length;
+        i = chunkEnd;
+        if (i === ckCut && sess) {
+          engine.checkpointSSM(kvCache);
+          sess.ssmCheckpointIds = promptIds.slice(0, ckAt);
+        }
         // Per-chunk timing. Prefill wall-clock is dominated by chunks that run
         // against a NON-EMPTY cache (see the first-chunk note below), and a
         // single aggregate tok/s hides that completely — the aggregate looked

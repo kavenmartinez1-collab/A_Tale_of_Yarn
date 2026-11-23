@@ -6,9 +6,9 @@
  * extras. This module is the lean DENSE-ONLY subset (full-attention trunk,
  * k-quant matrices via matmul_gguf, CPU row-gather embed) packaged behind the
  * same InferenceSession interface, for consumers like the DungeonDirector
- * that load a plain Qwen3-style GGUF, or LFM3 (its gated short-conv layers
- * are a per-layer op with a small carried state, no MoE/PLE/DeltaNet
- * machinery). Unsupported archs throw at load.
+ * and NPC chat that load a plain Qwen3-style GGUF or a Qwen3.5 Gated-DeltaNet
+ * hybrid (its linear-attention layers carry their recurrent state in the KV
+ * cache object, so forks stay independent). MoE / PLE trunks throw at load.
  */
 
 import { initWebGPU, type GPUContext } from './gpu-device';
@@ -118,11 +118,10 @@ async function buildGGUFSession(
       ropeFreqsT.data.buffer, ropeFreqsT.data.byteOffset, ropeFreqsT.data.byteLength / 4));
   }
 
-  // Guard: MoE / PLE / DeltaNet-hybrid trunks need the chat app's full path.
-  // LFM3's short-conv layers are handled here (see the layer loop).
-  if (config.layers.some((d) => d.moe) || config.perLayerEmbed
-      || config.layers.some((d) => d.kind === 'linear_attention')) {
-    throw new Error(`GGUF session: ${cfg.repo} needs MoE/PLE/DeltaNet support — not in this session type`);
+  // Guard: MoE / PLE trunks need the chat app's full path. Gated-DeltaNet
+  // linear-attention layers (Qwen3.5 hybrids) are wired in the layer loop.
+  if (config.layers.some((d) => d.moe) || config.perLayerEmbed) {
+    throw new Error(`GGUF session: ${cfg.repo} needs MoE/PLE support — not in this session type`);
   }
 
   const loc = createGGUFLocator(model.file.tensors, ggufArchitecture(model.file));
@@ -177,11 +176,17 @@ async function buildGGUFSession(
       attnPostNorm: roleBuf('attnPostNorm', l),
       ffnPostNorm: roleBuf('ffnPostNorm', l),
     };
-    if (config.layers[l].kind === 'short_conv') {
-      // LFM3 gated short conv: in_proj -> B|C|X, depthwise conv, out_proj.
-      assignProj(lw, 'shortConvInProj', 'shortConvInProj', l);
-      assignProj(lw, 'shortConvOutProj', 'shortConvOutProj', l);
-      lw.shortConvWeight = requireBuf('shortConvWeight', l);
+    if (config.layers[l].kind === 'linear_attention') {
+      // Gated DeltaNet (Qwen3.5 hybrid) — same wiring as src/main.ts.
+      assignProj(lw, 'linearInProjQKV', 'linInProjQKV', l);
+      assignProj(lw, 'linearInProjA', 'linInProjA', l);
+      assignProj(lw, 'linearInProjB', 'linInProjB', l);
+      assignProj(lw, 'linearInProjZ', 'linInProjZ', l);
+      assignProj(lw, 'linearOutProj', 'linOutProj', l);
+      lw.linearALog = requireBuf('linALog', l);
+      lw.linearConv1dWeight = requireBuf('linConv1dWeight', l);
+      lw.linearDtBias = requireBuf('linDtBias', l);
+      lw.linearNormWeight = requireBuf('linNormWeight', l);
     } else {
       assignProj(lw, 'qProj', 'qProj', l);
       if (config.layers[l].kvSourceLayer === undefined) {
@@ -191,7 +196,6 @@ async function buildGGUFSession(
       assignProj(lw, 'oProj', 'oProj', l);
       lw.qNorm = roleBuf('qNorm', l);
       lw.kNorm = roleBuf('kNorm', l);
-      if (config.attnHeadGate) assignProj(lw, 'attnHeadGate', 'attnHeadGate', l);
       if (config.attentionBias) {
         lw.qBias = roleBuf('qBias', l);
         lw.kBias = roleBuf('kBias', l);
@@ -211,8 +215,8 @@ async function buildGGUFSession(
   console.info(`[GGUF session] ${cfg.repo}: engine built in ${(performance.now() - tEngine).toFixed(0)} ms`);
   const tokenizer = await createTokenizer({ modelId: cfg.repo });
   // Wrong-family tokenizer fallback silently produces garbage — hard-fail.
-  // The embedding table may be padded past the real vocab (LFM3: 125033
-  // tokens, 128000 rows); a tokenizer LARGER than the table never is.
+  // The embedding table may be padded past the real vocab (some GGUFs round
+  // the row count up); a tokenizer LARGER than the table never is.
   const vocabSlack = tokenizer.vocabSize - config.vocabSize;
   if (tokenizer.vocabSize && (vocabSlack > 1024 || vocabSlack < -4096)) {
     throw new Error(
@@ -221,9 +225,9 @@ async function buildGGUFSession(
   }
 
   // With thinking off, a model that reasons anyway leaks it into an NPC's
-  // mouth: LFM3 opens <think> on hard prompts even after the empty
-  // <think></think> preamble, and sometimes writes a draft, then </think>,
-  // then the answer. Never sample either tag in that mode.
+  // mouth: a small model can open <think> on a hard prompt even when the
+  // generation prompt already closed an empty think block, or write a draft,
+  // then </think>, then the answer. Never sample either tag in that mode.
   const thinkTags = ['<think>', '</think>']
     .map((t) => tokenizer.encode(t))
     .filter((ids) => ids.length === 1)
@@ -233,12 +237,30 @@ async function buildGGUFSession(
       ? { ...sampling, suppressTokens: [...(sampling?.suppressTokens ?? []), ...thinkTags] }
       : sampling;
 
+  /**
+   * Hybrid models: where to save the SSM state — the end of a leading system
+   * message. A recurrent state cannot be rewound, so a chat whose oldest turns
+   * get trimmed (npc-chat-panel's prompt budget) would otherwise re-prefill
+   * the whole ~1,500-token villager card on every turn; with the checkpoint it
+   * prefills only the turns. Dense models rewind and need none of this.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const ssmCheckpointFor = (messages: any[], tokenIds: number[], opts?: any): number | undefined => {
+    if (config.isHybrid !== true || messages.length === 0 || messages[0].role !== 'system') return undefined;
+    const sys = applyChatTemplate(tokenizer, [messages[0]], { ...opts, addGenerationPrompt: false });
+    // Only when the system turn tokenizes as a true prefix of the prompt.
+    if (sys.length === 0 || sys.length > tokenIds.length) return undefined;
+    for (let i = 0; i < sys.length; i++) if (sys[i] !== tokenIds[i]) return undefined;
+    return sys.length;
+  };
+
   const kvSession = createKVSession(
     Math.min(config.maxPositionEmbeddings || 8192, 8192, MAX_ATTN_SEQ_LEN));
   const resetKV = () => {
     if (kvSession.kvCache) engine.destroyKVCache(kvSession.kvCache);
     kvSession.kvCache = null;
     kvSession.cachedTokenIds = [];
+    kvSession.ssmCheckpointIds = null;
   };
 
   let m: LoadedGGUFModel | null = model;
@@ -284,12 +306,14 @@ async function buildGGUFSession(
       chat: (messages, sampling, onToken, opts) => chainGen(() => {
         const tokenIds = applyChatTemplate(tokenizer, messages, opts);
         return generate(gpu.device, engine, tokenizer, tokenIds, noThink(sampling, opts), onToken,
-          { kvSession: kv, prefillChunk: opts?.prefillChunk });
+          { kvSession: kv, prefillChunk: opts?.prefillChunk,
+            ssmCheckpointAt: ssmCheckpointFor(messages, tokenIds, opts) });
       }),
       resetKV: () => {
         if (kv.kvCache) engine.destroyKVCache(kv.kvCache);
         kv.kvCache = null;
         kv.cachedTokenIds = [];
+        kv.ssmCheckpointIds = null;
       },
     };
   };
@@ -300,7 +324,8 @@ async function buildGGUFSession(
     chat: (messages, sampling, onToken, opts) => chainGen(() => {
       const tokenIds = applyChatTemplate(tokenizer, messages, opts);
       return generate(gpu.device, engine, tokenizer, tokenIds, noThink(sampling, opts), onToken,
-        { kvSession, prefillChunk: opts?.prefillChunk });
+        { kvSession, prefillChunk: opts?.prefillChunk,
+          ssmCheckpointAt: ssmCheckpointFor(messages, tokenIds, opts) });
     }),
     forkKV,
     kvSession,
